@@ -110,7 +110,7 @@ struct mavc {
     pic_t q[QMAX]; int nq;
     uint8_t *au; size_t aucap, aulen;
 };
-mavc *mavc_new(void) { mavc *a = calloc(1, sizeof *a); if (!a) die("movie: AVC decoder allocation failed"); return a; }
+mavc *mavc_new(struct movie_vt_control *control) { (void)control; mavc *a = calloc(1, sizeof *a); if (!a) die("movie: AVC decoder allocation failed"); return a; }   // control: VideoToolbox's session waits (Apple)
 static void q_free(mavc *a) { for (int i = 0; i < a->nq; i++) free(a->q[i].nv12); a->nq = 0; }
 void mavc_drop(mavc *a) { q_free(a); if (a->t) a->flush_pending = 1; }   // the transform is flushed on the decoder's thread, at its next call
 void mavc_free(mavc *a) {
@@ -119,6 +119,8 @@ void mavc_free(mavc *a) {
     com_leave(&a->com); q_free(a); free(a->au); free(a);
 }
 int mavc_queued(const mavc *a) { return a->nq; }
+int mavc_ready(const mavc *a) { return a->nq > (a->failed && a->profile != 66 ? 4 : 0); }   // a picture would leave without flush (mavc_take's rule: the transform's order, or the stopgap's)
+int mavc_bt709(const mavc *a, int h) { return a->matrix == 1 || (a->matrix != 5 && a->matrix != 6 && h >= 720); }   // as nv12_rgba decides: the VUI's BT.709 (1) or BT.601 (5, 6), else from 720 lines up
 void mavc_set_rgba(mavc *a) { a->rgba = 1; }
 int mavc_constant(const mavc *a) { return a->failed; }   // without a decoder every picture is black: hle_movie.c md_out_tex writes a texture once
 

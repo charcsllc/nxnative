@@ -38,6 +38,9 @@ static int same(const struct dm_game_profile *a, const struct dm_game_profile *b
 #define CMP_OPTINT CMP_INT
 #define CMP_MODULES(f) CMP_INT(nmod) for (int i = 0; i < a->nmod; i++) CMP_STR(f[i])
 #define CMP_VERSIONS(f) CMP_INT(nversions) for (int i = 0; i < a->nversions; i++) { CMP_STR(f[i].build) CMP_STR(f[i].ver) }
+#define CMP_FPSMAX CMP_INT
+#define CMP_TRI CMP_INT
+#define CMP_BUILDMODS(f) CMP_INT(nbuild_modules) for (int i = 0; i < a->nbuild_modules; i++) { CMP_STR(f[i].build) CMP_STR(f[i].mods) }
 #define X(name, kind) CMP_##kind(name)
     DM_GAME_FIELDS(X)
 #undef X
@@ -145,6 +148,20 @@ int main(int argc, char **argv) {
     }
     expect("a build row without its display version", with_row(base, "display_versions", "display_versions\tcd6e42aee7934f4d8393cd43893ae25e"), 0, "key 'display_versions'");
     expect("no build row", with_row(base, "display_versions", "display_versions\t"), 1, NULL);
+    expect("mem_map_limit -1 (not set)", with_row(base, "mem_map_limit", "mem_map_limit\t-1"), 1, NULL);
+    expect("mem_map_limit -2", with_row(base, "mem_map_limit", "mem_map_limit\t-2"), 0, "key 'mem_map_limit'|-1 (not set), 0 or 1");
+    expect("fps_max 90", with_row(base, "fps_max", "fps_max\t90"), 0, "key 'fps_max'|60 or 120");
+    expect("fps_max 120", with_row(base, "fps_max", "fps_max\t120"), 1, NULL);
+    expect("ue_texture_pool in hex", with_row(base, "ue_texture_pool", "ue_texture_pool\t0x10"), 0, "key 'ue_texture_pool'|below 2^31");
+    expect("ue_texture_pool 2^31", with_row(base, "ue_texture_pool", "ue_texture_pool\t2147483648"), 0, "key 'ue_texture_pool'");
+    expect("a build's modules without its build ID", with_row(base, "build_modules", "build_modules\t=main,sdk"), 0, "key 'build_modules'");
+    {   // a build's own modules, the commas as spaces (main.c's rows); a display version with a blank, written %20 (game.py pct)
+        struct dm_game_profile p; char err[1200];
+        int r = dm_game_profile_read(write_file("rows.tsv", with_row(with_row(base, "build_modules", "build_modules\t6c16aa06a25504cee9cf0f4f7b5e615c=main,subsdk0,sdk"),
+                                                                   "display_versions", "display_versions\t6c16aa06a25504cee9cf0f4f7b5e615c=1.0.2%20b723")), &p, err, sizeof err);
+        check(!r && p.nbuild_modules == 1 && !strcmp(p.build_modules[0].mods, "main subsdk0 sdk") && p.nversions == 1 && !strcmp(p.display_versions[0].ver, "1.0.2 b723"),
+              "a build_modules row and a display version with %%20: %s", r ? err : "read as main.c's row and the version with its blank");
+    }
     expect("an id that is no title ID", with_row(base, "id", "id\tmario"), 0, "key 'id'");
     expect("tex_dirty_upload without tex_flush_upload", with_row(with_row(base, "tex_dirty_upload", "tex_dirty_upload\t1"), "tex_flush_upload", "tex_flush_upload\t0"), 0, "tex_dirty_upload");
     expect("pad_layout touch in console mode", with_row(with_row(base, "pad_layout", "pad_layout\t2"), "opmode", "opmode\t1"), 0, "pad_layout");

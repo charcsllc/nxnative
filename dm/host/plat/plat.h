@@ -188,6 +188,15 @@ time_t timegm(struct tm *tm);
 int setenv(const char *name, const char *value, int overwrite);
 int unsetenv(const char *name);
 char *mkdtemp(char *tmpl);
+int getpagesize(void);
+int pause(void);                                     // waits for ever (no signals to end it on Windows)
+int fsync(int fd);                                   // _commit
+int plat_win32_link(const char *from, const char *to);   // POSIX link (a hard link, CreateHardLink; UTF-8 paths): a file that calls link maps it itself, as the name is common
+int mkstemps(char *tmpl, int suffixlen);             // the XXXXXX before the last suffixlen bytes replaced; the file made exclusively, read-write
+int fchmod(int fd, int mode);                        // no POSIX modes on Windows: 0, nothing changed
+#ifndef EDQUOT
+#define EDQUOT 122                                   // never set on Windows; compared with errno where POSIX can set it
+#endif   // the page size of plat_vm_protect (plat_page_size); dm.h dm_alias_size_for rounds by it
 #ifndef ENODATA
 #define ENODATA 96
 #endif

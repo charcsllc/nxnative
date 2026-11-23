@@ -60,8 +60,10 @@ PLATFORMS = {'linux': {'exe': '', 'archive': '.tar.gz'}, 'windows': {'exe': '.ex
 # the packer's find_repo stops at the bundle's root and its defaults find the bundle's nxaot and host (bin/). dm/games: every profile and its tables; dm/tools:
 # patch_nso.py and the rewriter, nx_extract's sources (built with .NET at the first pack); dm/gfx: the shader tools and the chain headers, whose versions follow from those files
 # (dmsh_chain.py, dmsh_chain_vk.py), with dm/ios/tools/ios_metal.py and Ryujinx's shader sources among their inputs; dm/host: the host's sources, which the survey of a game without
-# a profile reads (nso_syms.py)
-PACKER_TREES = ('scripts/build_ipa_from_nsp.py', 'dm/tools', 'dm/games', 'dm/gfx', 'dm/host', 'dm/ios/tools', 'dm/third_party/ryujinx')
+# a profile reads (nso_syms.py); scripts/pack_nup.py and scripts/pack_dump.py: the readers of a NUP container and of a dump folder, which the packer imports at its start;
+# dm/mac/min_os.mk: the Mac libraries' deployment target, a file dmsh_chain.py hashes into the chain version (FILES), so the bundle's chain header checks against it
+PACKER_TREES = ('scripts/build_ipa_from_nsp.py', 'scripts/pack_nup.py', 'scripts/pack_dump.py', 'dm/tools', 'dm/games', 'dm/gfx', 'dm/host', 'dm/ios/tools', 'dm/third_party/ryujinx',
+                'dm/mac/min_os.mk')
 PACKER_SKIP = ('dm/tools/aot/', 'dm/tools/tests/', 'dm/host/tests/', 'dm/gfx/tests/', 'dm/ios/tests/')   # the recompiler's C++ sources (bin/nxaot is built) and the tests
 TEXT_SUFFIXES = {'.sh', '.cmd', '.txt', '.md', '.tsv', '.json', '.py'}   # scanned by --check for the paths of the build trees and this checkout
 MARKER = 'VERSION'

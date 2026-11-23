@@ -44,6 +44,14 @@ void dm_guest_frame_tick(void) {}
 module_t *module_of(const void *p) { (void)p; return NULL; }
 void dm_backtrace(uint64_t fp) { (void)fp; }
 int front_screen_max_fps(void) { return 60; }
+// The host functions upstream's frontend added calls to, as the harness has them: hle_svc.c's device sharing, hle_vi.c's layer crop and frame history, the front end's focus
+// clock and capable frame rate, hle_cheats.c's per-frame cheats; none is linked here
+void dm_device_share(const void *p, uint64_t size, int share) { (void)p; (void)size; (void)share; }
+void dm_vi_layer_crop(int c[4]) { c[0] = c[1] = c[2] = c[3] = 0; }
+void dm_vi_frame_queued(uint64_t frame) { (void)frame; }
+uint64_t dm_focus_in_since(void) { return 0; }
+int front_screen_capable_fps(void) { return 60; }
+void dm_cheats_present(void) {}
 static void (*g_prep)(void *, size_t);
 void dm_guest_write_prep_register(void (*fn)(void *, size_t)) { g_prep = fn; }
 void dm_guest_write_prepare(void *addr, size_t len) { if (g_prep) g_prep(addr, len); }

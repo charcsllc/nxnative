@@ -9,6 +9,7 @@
 // Built only where there is no Metal (dm/host/CMakeLists.txt); the Apple Makefiles leave it out, and on Apple the file is empty, since nvn_be.h's functions are the Metal backend's
 #if !defined(__APPLE__)
 #include "nvn_be.h"
+#include "nvn_capture.h"
 #include "nvn_pools.h"
 #include "nvn_replay.h"
 #include "nvn_resolve.h"
@@ -69,6 +70,22 @@ int be_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
     pthread_mutex_unlock(&g_mu);
     return ok;
 }
+int be_addr_known(uint64_t addr, uint64_t len) {
+    RED();
+    nvn_pool_ref r; pthread_mutex_lock(&g_mu); int ok = nvn_pool_lookup(addr, len, &r); pthread_mutex_unlock(&g_mu);
+    return ok;
+}
+void be_pool_addressed(const void *mem, uint64_t size) { RED(); (void)mem; (void)size; }   // no shader reaches memory here
+// The runs a sparse pool's request changed, in one step: the same table changes as be_pool_del and be_pool_add make them, under the lock once
+void be_pool_replace(const void *const *del, int ndel, const void *const *add, const uint64_t *size, int nadd, uint32_t nvn_flags) {
+    RED();
+    pthread_mutex_lock(&g_mu);
+    for (int i = 0; i < ndel; i++) nvn_pool_del(del[i]);
+    for (int i = 0; i < nadd; i++) nvn_pool_add(add[i], size[i], nvn_flags, (uintptr_t)add[i], NULL, (uint64_t)(uintptr_t)add[i]);
+    pthread_mutex_unlock(&g_mu);
+}
+void be_sparse_alias_delta(int delta) { RED(); (void)delta; }
+void be_sp_phys_gone(const void *mem, uint64_t size) { RED(); (void)mem; (void)size; }   // no sparse tiles are placed
 void nvn_pool_hook_use(nvn_pool *p) { RED(); (void)p; }   // no residency to make
 void nvn_pool_hook_del(nvn_pool *p) { RED(); (void)p; }   // no object to release
 
@@ -76,12 +93,28 @@ void nvn_pool_hook_del(nvn_pool *p) { RED(); (void)p; }   // no object to releas
 void be_tex_init(const tex_t *t) { RED(); (void)t; }
 void be_tex_release(tex_t *t) { RED(); (void)t; }
 void be_tex_cpu_written(const tex_t *t) { RED(); (void)t; }
+int be_tex_cpu_rewritten(const tex_t *t) { RED(); (void)t; return 0; }   // no texture made: nothing to rewrite
+void be_tex_linear_cpu_written(const tex_t *t) { RED(); (void)t; }
+void be_tex_gpu_written(const tex_t *t) { RED(); (void)t; }
+void be_tex_pin(uint64_t serial) { RED(); (void)serial; }
+void be_tex_unpin(uint64_t serial) { RED(); (void)serial; }
 int be_tex_gpu_owned(uint64_t serial) { RED(); (void)serial; return 0; }
 void be_reg_tex(int tid, const tex_t *t, const view_t *v) { RED(); (void)tid; (void)t; (void)v; }
 void be_reg_image(int tid, const tex_t *t, const view_t *v) { RED(); (void)tid; (void)t; (void)v; }
 void be_reg_samp(int sid, const samp_par *sp) { RED(); (void)sid; (void)sp; }
 void be_set_tex_pool_n(int n) { RED(); (void)n; }
+void be_set_samp_pool_n(int n) { RED(); (void)n; }
 void be_prog_release(prog_t *p) { RED(); (void)p; }
+void be_prog_forget(const prog_t *p) { RED(); (void)p; }
+void be_prog_prefetch(const prog_t *p) { RED(); (void)p; }
+void be_prog_snapshot(prog_t *copy, const prog_t *source) { RED(); *copy = *source; }   // a queued job's copy of the program (nvn_queue.inc), as the Metal backend makes it; no backend object to keep
+void be_prog_snapshot_pin(prog_t *copy, const prog_t *source) { RED(); *copy = *source; }
+void be_prog_unpin(prog_t *p) { RED(); (void)p; }
+int be_rt_program_set(prog_t *program, int count, const NVNshaderData *modules, uint32_t trace_depth, uint32_t callable_depth, uint32_t flags) {
+    RED(); (void)program; (void)count; (void)modules; (void)trace_depth; (void)callable_depth; (void)flags; return 0;   // no ray tracing pipeline
+}
+void be_rt_group_handle(const prog_t *program, const int32_t indices[3], void *out16) { RED(); (void)program; (void)indices; memset(out16, 0, 16); }
+void be_as_sizes(const nvn_as_build *b, uint64_t *storage, uint64_t *scratch, uint64_t *update) { RED(); (void)b; *storage = *scratch = *update = 0; }
 // No texture holds GPU content: the texels read are zero (only the region's rows are written, each image's at its stride)
 void be_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
     RED(); (void)level; (void)layer0;
@@ -97,19 +130,32 @@ void be_set_queue_origin_lower_left(int on) { RED(); (void)on; }
 // ---------- Submission and sync (hle_nvn.c holds its submission lock) ----------
 void be_queue_activate(uint64_t serial) { RED(); (void)nvn_state_queue_activate(serial); }   // the frontend's per-queue state, as the Metal backend switches it (no flags to set)
 void be_queue_forget(uint64_t serial) { RED(); (void)nvn_state_queue_forget(serial); }
+void be_prepare(void) { RED(); }
 void be_sub_begin(void) { RED(); }
-void be_sub_index(const uint64_t *h, int n) { RED(); (void)h; (void)n; }
+void be_sub_ready(uint64_t guest_ns) { RED(); (void)guest_ns; }
+int be_sub_stream_on(void) { RED(); return 0; }
 void be_exec_rest(const uint64_t *h, int n) { RED(); (void)h; (void)n; }
 void be_exec(const uint8_t *handle) { RED(); nvn_replay_exec(handle); }   // the frontend's decoder hands every record to the functions below
-uint64_t be_sub_commit(void) { RED(); return atomic_fetch_add(&g_fence, 1) + 1; }
+uint64_t be_sub_commit(void) { RED(); uint64_t f = atomic_fetch_add(&g_fence, 1) + 1; (void)nvn_state_preserve(); return f; }   // the bindings past the job kept (nvn_state.h)
 uint64_t be_last_fence(void) { RED(); return atomic_load(&g_fence); }
+uint64_t be_completed_fence(void) { RED(); return atomic_load(&g_fence); }   // every submission is complete when it is given
 int be_wait(uint64_t fence, uint64_t timeout_ns) { RED(); (void)fence; (void)timeout_ns; return 1; }       // complete: nothing runs
 int be_wait_acq(uint64_t fence, uint64_t timeout_ns) { RED(); (void)fence; (void)timeout_ns; return 1; }
 void be_finish(void) { RED(); }
 void be_drain(void) { RED(); }
+void be_set_present_suspended(int on) { RED(); (void)on; }
+void be_drop_queued_presents(void) { RED(); }
+void be_suspend_drain(void) { RED(); }
+void be_arch_save(int wait_ms, int ending) { RED(); (void)wait_ms; (void)ending; }   // no pipeline archive
+void be_warm_stop(void) { RED(); }
 
 // ---------- Presentation and pacing: no window, no display link ----------
-uint64_t be_present(const tex_t *t, double period_s, const int crop[4]) { RED(); (void)t; (void)period_s; (void)crop; return 0; }   // no ticket to wait for
+uint64_t be_present(const tex_t *t, double period_s, const int crop[4], uint64_t *copy) { RED(); (void)t; (void)period_s; (void)crop; if (copy) *copy = 0; return 0; }   // no ticket to wait for
+void be_present_wait_texture(uint64_t ticket, uint64_t copy) { RED(); (void)ticket; (void)copy; }
+int be_present_texture_ready(uint64_t ticket, uint64_t copy) { RED(); (void)ticket; (void)copy; return 1; }
+void be_present_recorded(uint64_t frame) { RED(); (void)frame; }
+int be_present_screen_ready(void) { RED(); return 1; }
+uint64_t be_present_screen_wait(double period) { RED(); (void)period; return 0; }   // no screen to catch up with
 void be_present_flush(void) { RED(); }
 int be_has_window(void) { RED(); return 0; }
 int be_display_hz(void) { RED(); return 0; }
@@ -117,9 +163,15 @@ int be_vsync_wait_ticks(int ticks, uint64_t timeout_ns) { RED(); (void)ticks; (v
 int be_vsync_rate(void) { RED(); return 0; }
 int be_vsync_stalled(void) { RED(); return 0; }
 int be_vsync_tick(uint64_t n, double *target, double *lead_ms, int *ticks, double *gap_ms) { RED(); (void)n; (void)target; (void)lead_ms; (void)ticks; (void)gap_ms; return 0; }
-double be_presented_time(uint64_t n) { RED(); (void)n; return 0; }   // 0: not shown yet
+int be_vsync_ready_tick(int vsyncs) { RED(); (void)vsyncs; return 1; }   // no display link to wait for
+int be_vsync_ready_ticks(int ticks) { RED(); (void)ticks; return 1; }
+void be_vsync_mode_set(int mode) { RED(); (void)mode; }
+uint64_t be_vsync_drain_take_ns(void) { RED(); return 0; }
 int be_snap_on(void) { RED(); return 0; }
 uint64_t be_snap_acquire_wait(void) { RED(); return 0; }
+int be_snap_acquire_ready(void) { RED(); return 1; }
+void be_set_fstep_fine(int on) { RED(); (void)on; }
+int be_probe_ramp_on(void) { RED(); return 0; }
 // nvn_be_ext.h: also called by the guest Vulkan and GL layers
 void be_set_origin_lower_left(int on) { RED(); (void)on; }
 void be_present_wait(uint64_t ticket) { RED(); (void)ticket; }
@@ -129,6 +181,9 @@ int be_vsync_wait(int vsyncs, uint64_t timeout_ns) { RED(); (void)vsyncs; (void)
 void *be_native_device(void) { RED(); return NULL; }
 uint64_t be_ext_tex(void *tex) { RED(); (void)tex; return 0; }
 uint64_t be_present_ext(uint64_t serial, double period, void *ev, uint64_t ev_val, const int crop[4]) { RED(); (void)serial; (void)period; (void)ev; (void)ev_val; (void)crop; return 0; }
+double be_presented_time(uint64_t n) { RED(); (void)n; return 0; }   // 0: not shown yet
+void be_present_progress(uint64_t *queued, uint64_t *done) { RED(); *queued = *done = 0; }
+void be_present_layer(uint32_t w, uint32_t h) { RED(); (void)w; (void)h; }
 
 // ---------- Frames and measurements ----------
 void be_set_frame(uint64_t f) { RED(); (void)f; }
@@ -140,14 +195,16 @@ void be_ub_present(double iv_ms) { RED(); (void)iv_ms; }
 // ---------- Statistics: zero ----------
 void be_mem_stat(unsigned long long frame, unsigned long long rss_mb) { RED(); (void)frame; (void)rss_mb; }
 void be_stats(uint64_t *passes, uint64_t *draws) { RED(); *passes = *draws = 0; }
-void be_args_stats(uint64_t *enc, uint64_t *reuse) { RED(); *enc = *reuse = 0; }
+void be_args_stats(uint64_t *enc, uint64_t *reuse, uint64_t *patch) { RED(); *enc = *reuse = *patch = 0; }
 void be_use_stats(uint64_t *call, uint64_t *skip) { RED(); *call = *skip = 0; }
 void be_vbuf_stats(uint64_t *resolve, uint64_t *reuse, uint64_t *set, uint64_t *skip, uint64_t *copies, uint64_t *copy_bytes) { RED(); *resolve = *reuse = *set = *skip = *copies = *copy_bytes = 0; }
-uint64_t be_ds_omit(void) { RED(); return 0; }
 uint64_t be_drawable_ns_take(void) { RED(); return 0; }
 void be_bw(uint64_t *load, uint64_t *store, uint64_t *full_rw_passes) { RED(); *load = *store = *full_rw_passes = 0; }
 uint64_t be_udc_saved_bytes(void) { RED(); return 0; }
 void be_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { RED(); *uploads = *reuploads = 0; }
+void be_pkg_edge_stats(uint64_t *allocs, uint64_t *bytes, uint64_t *peak_bytes, uint64_t *fails, uint64_t *fail_bytes) { RED(); *allocs = *bytes = *peak_bytes = *fails = *fail_bytes = 0; }
+void be_spare_stats(uint64_t *held, uint64_t *trimmed, uint64_t *trimmed_mb) { RED(); *held = *trimmed = *trimmed_mb = 0; }
+void be_pool_stats(uint64_t s[POOL_STATS]) { RED(); memset(s, 0, POOL_STATS * sizeof *s); }
 unsigned be_cpu_tex_count(void) { RED(); return 0; }
 uint64_t be_pkg_edge_skips(void) { RED(); return 0; }
 uint64_t be_pkg_miss(void) { RED(); return 0; }
@@ -165,12 +222,25 @@ uint64_t be_copy_cut_count(void) { RED(); return 0; }
 uint64_t be_blit_splits(void) { RED(); return 0; }
 void be_ubd_stats(uint64_t *deferred, uint64_t *conflicts) { RED(); *deferred = *conflicts = 0; }
 void be_ubp_stats(uint64_t *made, uint64_t *reused, uint64_t *refused) { RED(); *made = *reused = *refused = 0; }
-void be_ubp_why(uint64_t w[5]) { RED(); memset(w, 0, 5 * sizeof *w); }
+void be_ubp_why(uint64_t w[6]) { RED(); memset(w, 0, 6 * sizeof *w); }
 void be_lc_stats(uint64_t *taken, uint64_t *landed) { RED(); *taken = *landed = 0; }
 void be_sm_stats(uint64_t *np, uint64_t *nc, uint64_t *nw) { RED(); *np = *nc = *nw = 0; }
 void be_cshoist_stats(uint64_t *moved, uint64_t *depth, uint64_t *stops) { RED(); *moved = *depth = 0; memset(stops, 0, 8 * sizeof *stops); }   // stops: 8 counters, as hle_nvn.c reads them
 void be_pso_line(char *o, size_t n) { RED(); if (n) snprintf(o, n, "null backend: no pipelines"); }
 void be_alloc_stats(uint64_t *waits, uint64_t *grown, int *n) { RED(); *waits = *grown = 0; *n = 0; }
+void be_dispatch_barrier_stats(uint64_t *game, uint64_t *copy, uint64_t *unranged, uint64_t *none) { RED(); *game = *copy = *unranged = *none = 0; }
+void be_tf_stats(uint64_t v[4]) { RED(); memset(v, 0, 4 * sizeof *v); }
+void be_geohoist_stats(uint64_t *hoisted, uint64_t *refused, uint64_t *stops) { RED(); *hoisted = *refused = 0; memset(stops, 0, 6 * sizeof *stops); }   // stops: 6 counters, as hle_nvn.c reads them
+void be_geomesh_stats(uint64_t *draws, uint64_t *wide, uint64_t *redraws, uint64_t *refused, uint64_t *reasons) { RED(); *draws = *wide = *redraws = *refused = 0; memset(reasons, 0, 5 * sizeof *reasons); }   // reasons: 5
+uint64_t be_geocomp_stats(char *out, size_t n) { RED(); if (n) out[0] = 0; return 0; }
+void be_fb_stats(uint64_t *same, uint64_t *redirected, uint64_t *tile, uint64_t *whole) { RED(); *same = *redirected = *tile = *whole = 0; }
+void be_dbnd_stats(uint64_t *o, uint64_t *d, uint64_t *c, uint64_t *e) { RED(); *o = *d = *c = *e = 0; }
+void be_gsb_stats(uint64_t *n, uint64_t *bytes) { RED(); *n = *bytes = 0; }
+
+// ---------- DM_NVN_CAPTURE's hooks (nvn_capture.h; the Metal backend's nvn_capture.inc): no capture is written ----------
+void nvn_cap_submit(int n, const uint64_t *handles) { (void)n; (void)handles; }
+void nvn_cap_present(const tex_t *t, const int crop[4]) { (void)t; (void)crop; }
+void nvn_cap_queue(uint64_t serial, int waits) { (void)serial; (void)waits; }
 
 // ---------- Per operation (nvn_replay_exec, in record order): nothing is drawn, copied or cleared ----------
 int be_list_begin(void) { RED(); return 0; }
@@ -212,6 +282,13 @@ void be_copy_t2b(const uint8_t *rec, const op_hdr *h, const void *a) { RED(); (v
 void be_copy_t2t(const uint8_t *rec, const op_hdr *h, const void *a) { RED(); (void)rec; (void)h; (void)a; }
 void be_clear_tex(const uint8_t *rec, const op_hdr *h, const void *a) { RED(); (void)rec; (void)h; (void)a; }
 void be_dispatch(const uint8_t *rec, const op_hdr *h, const void *a) { RED(); (void)rec; (void)h; (void)a; }
+void be_multi_draw(const uint8_t *rec, const op_hdr *h, const void *a) { RED(); (void)rec; (void)h; (void)a; }
+void be_draw_tex(const uint8_t *rec, const op_hdr *h, const void *a) { RED(); (void)rec; (void)h; (void)a; }
+void be_dlss(const uint8_t *rec, const op_hdr *h, const void *a) { RED(); (void)rec; (void)h; (void)a; }
+void be_as_build(const uint8_t *rec, const op_hdr *h, const void *a) { RED(); (void)rec; (void)h; (void)a; }
+void be_as_copy(const uint8_t *rec, const op_hdr *h, const void *a) { RED(); (void)rec; (void)h; (void)a; }
+void be_bind_as(const uint8_t *rec, const op_hdr *h, const void *a) { RED(); (void)rec; (void)h; (void)a; }
+void be_rt_dispatch(const uint8_t *rec, const op_hdr *h, const void *a) { RED(); (void)rec; (void)h; (void)a; }
 void be_barrier(const uint8_t *rec, const op_hdr *h, const void *a) { RED(); (void)rec; (void)h; (void)a; }
 
 // ---------- The frontend's hooks into its backend ----------
@@ -219,6 +296,11 @@ uint64_t nvn_state_hook_compose(uint64_t old_serial, const prog_t *const bst[5])
 void nvn_state_hook_bind(uint32_t op, const p_bind_handles *b) { RED(); (void)op; (void)b; }
 void nvn_state_hook_bind_bad(const void *rec, int n) { RED(); (void)rec; (void)n; }
 void nvn_state_hook_img_range(const p_bind_handles *b) { RED(); (void)b; }
+uint8_t nvn_state_hook_stage_mask(const prog_t *p) { RED(); (void)p; return 0; }   // no shaders loaded: not known, so a bind keeps NVN's per-stage rule as it was
+int nvn_state_hook_rt_program(const prog_t *p) { RED(); (void)p; return 0; }   // no ray tracing programs
+void nvn_state_hook_prog_keep(prog_t *copy, const prog_t *source) { be_prog_snapshot(copy, source); }   // the queue's copy of a program bound past its job (nvn_state_preserve)
+void nvn_state_hook_prog_drop(prog_t *p) { be_prog_unpin(p); }
+void nvn_state_hook_tex_keep(uint64_t serial, uint64_t old) { be_tex_pin(serial); be_tex_unpin(old); }
 int nvn_resolve_hook_ubo_copy(uint64_t a, size_t n, void *out) { RED(); (void)a; (void)n; (void)out; return 0; }   // no copies of inline updates
 void nvn_resolve_hook_ubo_stale(int stage, int reg, int off, int kind) { RED(); (void)stage; (void)reg; (void)off; (void)kind; }
 void nvn_resolve_hook_mem_read(uint64_t a, size_t n, void *out) { RED(); (void)a; (void)n; (void)out; }   // out is left as it is, as for an address in no pool

@@ -10,7 +10,7 @@
 // call more than the thunk's own; the table is the same 63 functions as hle_table.c, none variadic and none taking a structure by value (the generator refuses both).
 // struct tm is the guest's: glibc's has Apple's layout (nine ints, tm_gmtoff, tm_zone), so Linux reads and writes what Apple does; Windows' has the nine ints only, so
 // mktime, timegm, gmtime_r, localtime_r and strftime there neither read nor write tm_gmtoff and tm_zone (the guest's two fields keep what they held).
-// mktime and localtime_r are also hle_time.c's forced take-overs, which win at binding (loader.c bind_sym), as on Apple
+// mktime and localtime_r are timegm and gmtime_r, as hle_table.c's LA entries map them: the SDK's C library has no time zone, UTC on a Switch (hle_time.c)
 #include "hle.h"
 #include <math.h>
 #include <time.h>
@@ -112,8 +112,8 @@ static time_t guest_tm_call(time_t (*f)(struct tm *), struct tm *tm) {   // mkti
 #define GUEST_TM_ZONE(r) guest_tm_zone(r)
 #define GUEST_TM_CALL(f, tm) guest_tm_call(f, tm)
 #endif
-PASS(mktime, int64_t, struct tm *tm) { return (int64_t)GUEST_TM_CALL(mktime, tm); }
+PASS(mktime, int64_t, struct tm *tm) { return (int64_t)GUEST_TM_CALL(timegm, tm); }   // UTC, as a Switch's (hle_table.c LA)
 PASS(timegm, int64_t, struct tm *tm) { return (int64_t)GUEST_TM_CALL(timegm, tm); }
 PASS(gmtime_r, struct tm *, const int64_t *t, struct tm *out) { time_t v = (time_t)*t; return GUEST_TM_ZONE(gmtime_r(&v, out)); }
-PASS(localtime_r, struct tm *, const int64_t *t, struct tm *out) { time_t v = (time_t)*t; return GUEST_TM_ZONE(localtime_r(&v, out)); }
+PASS(localtime_r, struct tm *, const int64_t *t, struct tm *out) { time_t v = (time_t)*t; return GUEST_TM_ZONE(gmtime_r(&v, out)); }   // UTC, as a Switch's (hle_table.c LA)
 PASS(strftime, size_t, char *s, size_t max, const char *fmt, const struct tm *tm) { return strftime(s, max, fmt, tm); }

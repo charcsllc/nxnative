@@ -1,7 +1,8 @@
 // The memory SVCs announce guest memory to the graphics backend (docs/design/vulkan-backend.md 4.2; hle_svc.c, x86-64 only): SetHeapSize growing, MapMemory and
 // MapPhysicalMemory call be_guest_map with the host range they made accessible, once it is; SetHeapSize shrinking and UnmapPhysicalMemory call be_guest_unmap with the
-// range they are about to decommit, while it is still accessible, so that an import of it goes first; a request that commits or decommits nothing calls neither, and
-// UnmapMemory, which leaves its pages accessible, calls neither. The production dispatcher on the small layout of t_svc_memory (memory_profile/game_profile.h), with a stub
+// range they are about to decommit, while it is still accessible, so that an import of it goes first; a request that commits or decommits nothing calls neither.
+// UnmapMemory gives back the destination's whole host pages (hle_svc.c guest_release: a thread's stack leaves dirty pages), so it calls be_guest_unmap first too, and MapMemory
+// opens them again. The production dispatcher on the small layout of t_svc_memory (memory_profile/game_profile.h), with a stub
 // backend that records every call and whether its range was readable then (plat_mem_read, which a decommitted page fails)
 #include "../dm.h"
 #include <stdarg.h>
@@ -38,6 +39,12 @@ static void record(int unmap, void *mem, uint64_t size) {
     const uint64_t a = (uint64_t)(uintptr_t)mem;
     g_calls[g_ncalls++] = (call_t){unmap, a, size, size && readable(a), size && readable(a + size - 1)};
 }
+// What hle_svc.c reaches elsewhere in the host, which these cases do not (no SDK version, no system tick, no service memory)
+int dm_sdk_ounce(void) { return 0; }   // loader.c: a Switch 1 SDK
+uint64_t guest_ticks(void) { return 0; }   // hle_os.c
+const hle_readonly_shmem *hle_get_readonly_shmem(uint32_t handle) { (void)handle; return NULL; }   // hle_thread.c: no service shared memory
+uint32_t hle_new_transfer_memory(hle_transfer_memory memory) { (void)memory; return 0; }
+int hle_get_transfer_memory(uint32_t handle, hle_transfer_memory *memory) { (void)handle; (void)memory; return 0; }
 void be_guest_map(void *mem, uint64_t size) { record(0, mem, size); }
 void be_guest_unmap(void *mem, uint64_t size) { record(1, mem, size); }
 
@@ -93,7 +100,12 @@ int main(void) {
     check(!call(0x04, stack, heap, 2 * P, NULL), "MapMemory stack <- heap, 2 pages");
     expect("  commits the destination: be_guest_map(stack, 2 pages), open", 1, 0, stack, (uint64_t)2 * P, 1);
     check(!call(0x05, stack, heap, 2 * P, NULL), "UnmapMemory stack <- heap, 2 pages");
-    expect("  leaves the pages open: no call", 0);
+    expect("  gives back the destination's pages: be_guest_unmap(stack, 2 pages) while they are readable", 1, 1, stack, (uint64_t)2 * P, 1);
+    check(!readable(stack) && !readable(stack + P), "  and then they are closed");
+    check(!call(0x04, stack, heap, 2 * P, NULL) && readable(stack) && readable(stack + P), "MapMemory stack <- heap again: the pages open again");
+    expect("  commits the destination: be_guest_map(stack, 2 pages), open", 1, 0, stack, (uint64_t)2 * P, 1);
+    check(!call(0x05, stack, heap, 2 * P, NULL), "UnmapMemory stack <- heap again");
+    expect("  gives the pages back again", 1, 1, stack, (uint64_t)2 * P, 1);
     check(call(0x2C, alias + 3, P, 0, NULL) == 0xD401 && call(0x01, 0, (uint64_t)1 << 40, 0, NULL) == 0xD001, "refused requests (unaligned, larger than the heap region)");
     expect("  no call", 0);
     check(!call(0x2D, alias + 4 * P, 6 * P, 0, NULL), "UnmapPhysicalMemory alias +4 pages, 6 pages (5 mapped)");

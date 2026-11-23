@@ -38,7 +38,7 @@ class Forms(unittest.TestCase):
         self.assertGreater(len(REGISTERED), 1)
         for g in REGISTERED:
             with self.subTest(profile=g.id):
-                m, f = macros(game.header(g)), file_rows(game.runtime(g))
+                m, f = macros(game.header_one(g)), file_rows(game.runtime(g))   # header_one: one profile's macros (header() of a multi-program profile is its table)
                 self.assertEqual(list(f), [k for k, _ in game.RUNTIME_FIELDS])   # every constant, in order, once
                 for k, kind in game.RUNTIME_FIELDS:
                     v = f[k]
@@ -47,9 +47,12 @@ class Forms(unittest.TestCase):
                     elif kind == 'modules':
                         self.assertEqual(v.split(' '), [c_str(s.strip()) for s in m['MODULES'].strip('{}').split(',')], k)
                         self.assertEqual(len(v.split(' ')), int(m['NMOD']))
-                    elif kind == 'versions':
+                    elif kind == 'versions':   # a blank in a display version is %20 in the file (game.py pct)
                         pairs = re.findall(r'\{("[^"]*"), ("[^"]*")\}', m['DISPLAY_VERSIONS'])
-                        self.assertEqual(v, ' '.join(f'{c_str(b)}={c_str(d)}' for b, d in pairs), k)
+                        self.assertEqual(v, ' '.join(f'{c_str(b)}={game.pct(c_str(d))}' for b, d in pairs), k)
+                    elif kind == 'buildmods':   # Apple's rows {"<build>", "<module> <module>"}, the file's <build>=<module>,<module>
+                        pairs = re.findall(r'\{("[^"]*"), ("[^"]*")\}', m['BUILD_MODULES'])
+                        self.assertEqual(v, ' '.join(f'{c_str(b)}={",".join(c_str(ms).split())}' for b, ms in pairs), k)
                     elif kind.startswith('opt'): self.assertEqual(v, m.get(k.upper(), '-'), k)   # Apple's header leaves an unset one undefined
                     else: self.assertEqual(v, m[k.upper()], k)
 
@@ -57,7 +60,7 @@ class Forms(unittest.TestCase):
         """the port's header: a field, a DM_GAME_FIELDS entry and (but the optional ones) a macro reading the field for every constant; every macro of Apple's form is there"""
         h = game.runtime_header()
         self.assertIn('#define DM_GAME_RUNTIME 1', h)
-        apple = set().union(*(macros(game.header(g)) for g in REGISTERED))
+        apple = set().union(*(macros(game.header_one(g)) for g in REGISTERED))
         for k, kind in game.RUNTIME_FIELDS:
             self.assertIn(f'    X({k}, {kind.upper()}) \\', h)
             if kind.startswith('opt'): self.assertNotIn(f'#define DM_GAME_{k.upper()} ', h, 'an #ifdef site would take an unset one as set')
@@ -132,7 +135,7 @@ class Outside(unittest.TestCase):
         """what the port's file cannot carry stops game.py, naming the profile and the key"""
         cases = (('0100AA0900000000', {'name': 'Two\tcolumns'}, 'name holds a tab'),
                  ('0100AA0A00000000', {'modules': ' '.join(f'm{i}' for i in range(17))}, '17 modules'),
-                 ('0100AA0B00000000', {'build': '\t'.join(['v0', '1.0 beta', 'main=ab'])}, 'display version'))
+                 ('0100AA0B00000000', {'build': '\t'.join(['v0', '1.0', 'main=a=b'])}, 'display version'))   # a build ID with '=' (a blank in a display version is written %20 now)
         for pid, change, want in cases:
             with self.subTest(want=want):
                 self.profile(pid, change)

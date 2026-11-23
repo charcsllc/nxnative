@@ -27,6 +27,8 @@ import dmsh_chain  # noqa: E402
 import dmsh_build_vk  # noqa: E402
 import dmsh_chain_vk  # noqa: E402
 import dmsh_spv  # noqa: E402
+import tool_lock  # noqa: E402   the fingerprints and sha16 (moved out of dmsh_chain.py upstream)
+import shader_lib  # noqa: E402   read_stamp (dm/tools, on the path dmsh_build_vk puts it)
 spec = importlib.util.spec_from_file_location('test_image_atomic_bounds', ROOT / 'dm/tools/tests/test_image_atomic_bounds.py')
 atomic_tests = importlib.util.module_from_spec(spec); spec.loader.exec_module(atomic_tests)   # its synthetic_shader: the compute shapes
 
@@ -492,7 +494,7 @@ class Published(unittest.TestCase):
     """A published translator where it runs, with no dotnet and no SPIR-V tools (the Windows PC's runner: run_win64_tests.ps1 -PortTools): the lock's row of this platform, the
     source it embeds, and three shapes translated into SPIR-V modules and reflections, among them a 1D texel fetch, whose fetch1d slot a trimmed or AOT build once failed to write"""
     def test_lock_row_and_source(self):
-        self.assertEqual(dmsh_chain.sha16(str(XLATE)), dmsh_chain_vk.lock().get('dmsh_xlate_vk_' + dmsh_chain_vk.plat()), 'not the translator dmsh_chain_vk.lock fingerprints')
+        self.assertEqual(tool_lock.sha16(str(XLATE)), dmsh_chain_vk.lock().get('dmsh_xlate_vk_' + dmsh_chain_vk.plat()), 'not the translator dmsh_chain_vk.lock fingerprints')
         r = subprocess.run([*XLATE_CMD, '--source-sha'], capture_output=True, text=True, timeout=60)
         self.assertEqual(r.stdout.strip(), dmsh_chain_vk.xlate_source_sha())
 
@@ -608,7 +610,7 @@ class Build(unittest.TestCase):
 
     def test_stamp_and_tables(self):
         sys.path.insert(0, str(ROOT / 'dm/games')); import game
-        self.assertEqual(dmsh_chain.read_stamp(str(self.lib)), {'game': GAME_ID, 'inputs': dmsh_chain.inputs(game.load(str(self.profile)))})
+        self.assertEqual(shader_lib.read_stamp(str(self.lib)), {'game': GAME_ID, 'inputs': dmsh_chain.inputs(game.load(str(self.profile)))})
         for t in ('c1_full_vk.tsv', 'cb_extent_vk.tsv'):
             self.assertTrue((self.profile / t).read_text().startswith(f'# chain {self.lib.name} inputs '), t)
 

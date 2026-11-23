@@ -28,6 +28,14 @@ void nvn_state_hook_bind(uint32_t op, const p_bind_handles *b) {   // as the Met
 }
 void nvn_state_hook_bind_bad(const void *rec, int n) { (void)rec; (void)n; n_bind_bad++; }
 void nvn_state_hook_img_range(const p_bind_handles *b) { (void)b; n_img_range++; }
+static uint8_t g_stage_mask;          // what the backend says of the program bound (nvn_state_hook_stage_mask), set by a case
+static const prog_t *g_rt_prog;       // the program the backend calls a ray-tracing one
+uint8_t nvn_state_hook_stage_mask(const prog_t *p) { (void)p; return g_stage_mask; }
+int nvn_state_hook_rt_program(const prog_t *p) { return p && p == g_rt_prog; }
+static int n_keep, n_drop; static uint64_t tex_kept, tex_let;
+void nvn_state_hook_prog_keep(prog_t *copy, const prog_t *source) { *copy = *source; n_keep++; }
+void nvn_state_hook_prog_drop(prog_t *p) { (void)p; n_drop++; }
+void nvn_state_hook_tex_keep(uint64_t serial, uint64_t old) { if (serial) tex_kept = serial; if (old) tex_let = old; }
 
 static prog_t P[70];   // game programs (only the serial matters to the state)
 static uint32_t ap(uint32_t op, const void *a) { return nvn_state_apply(op, a); }
@@ -93,10 +101,10 @@ int main(void) {
     for (int i = 0; i < 62; i++) bind_prog(&P[3 + i], 2);
     t("ring full: A + B still cached", (bind_prog(pb, 2), S.prog == ab) && n_compose == 2 + 62);
     bind_prog(&P[65], 2);
-    t("65th combination reuses slot 0 and drops its object", S.prog == ab && n_compose == 65 && compose_old == 1001 && compose_bst[1] == &P[65]);
+    // Slot 0 is next, but S.prog names it (A + B): the bound slot is never reused (upstream 90edd532, PR #2249: OP_BIND_PROGRAM tells a change by the pointer), so slot 1 goes
+    t("65th combination takes slot 1, not the slot S.prog names, and drops slot 1's object", S.prog != ab && S.prog && n_compose == 65 && compose_old == 1002 && compose_bst[1] == &P[65]);
     d = nvn_state_restore(snap);
-    t("restore under a reused slot: A + B made again elsewhere (AI: THE SOMNIUM FILES)", d == NVN_DIRTY_PIPELINE && S.prog != ab && S.prog && n_compose == 66
-      && compose_old == 1002 && compose_bst[0] == pa && compose_bst[1] == pb && S.bst[0] == pa && S.bst[1] == pb);
+    t("restore: A + B still in slot 0, nothing to make", d == 0 && S.prog == ab && n_compose == 65 && S.bst[0] == pa && S.bst[1] == pb);
 
     // ---------- Fixed-function state ----------
     p_bind_state bs = {0}; blend_st bl = {.target = 2, .src_rgb = NVN_BLEND_FUNC_SRC_ALPHA, .dst_rgb = NVN_BLEND_FUNC_ONE, .src_a = 2, .dst_a = 1, .eq_rgb = 1, .eq_a = 1};
@@ -155,16 +163,19 @@ int main(void) {
     t("the same uniform buffer again: nothing dirty", ap(OP_BIND_UBO, &ub) == A);
     p_bind_ubo_small us = {.stage = 4, .index = 0, .size = 0x40, .addr = 0x8000};
     t("compact uniform record stage 4: as a full one", ap(OP_BIND_UBO_SMALL, &us) == (A | NVN_DIRTY_ARGS(4)) && S.ubo[4][0].addr == 0x8000 && S.ubo[4][0].size == 0x40 && S.ubo[4][0].stage == 4);
-    p_bind_buf u6 = {.stage = 6, .index = 0, .addr = 0x9000, .size = 16};
-    t("uniform buffer of stage 6: ignored", ap(OP_BIND_UBO, &u6) == A);
+    p_bind_buf u7 = {.stage = 7, .index = 0, .addr = 0x9000, .size = 16};
+    t("uniform buffer of stage 7 (past the seven resource stages since upstream 90edd532): ignored", ap(OP_BIND_UBO, &u7) == A);
     p_bind_buf sb = {.stage = 5, .index = 2, .addr = 0xa000, .size = 0x200};
     t("storage buffer stage 5: stage 5's arguments", ap(OP_BIND_SSBO, &sb) == (A | NVN_DIRTY_ARGS(5)) && S.ssbo[5][2].size == 0x200);
     p_bind_handles bt = {.stage = 0, .first = 2, .n = 2, .h = {0x00300005, 0x00400006}};
     n_bind = 0;
     t("textures stage 0 slots 2-3: stage 0's arguments, the bind hook first", ap(OP_BIND_TEX, &bt) == (A | NVN_DIRTY_ARGS(0)) && S.tex[0][2] == 0x00300005 && S.tex[0][3] == 0x00400006
       && n_bind == 1 && bind_op == OP_BIND_TEX);
-    p_bind_tex1 t1 = {.stage = 1, .slot = 7, .h = 5 | 3u << 20, .tbase = 10, .sbase = 20};
-    t("single texture record: IDs plus the pools' bases", ap(OP_BIND_TEX1, &t1) == (A | NVN_DIRTY_ARGS(1)) && S.tex[1][7] == ((5 + 10) | (uint64_t)(3 + 20) << 20) && bind_op == OP_BIND_TEX1);
+    p_bind_tex1 t1 = {.stage = 1, .slot = 7, .h = 5 | 3u << 20};
+    t("single texture record: the pool-relative IDs as recorded", ap(OP_BIND_TEX1, &t1) == (A | NVN_DIRTY_ARGS(1)) && S.tex[1][7] == (5 | (uint64_t)3 << 20) && bind_op == OP_BIND_TEX1);
+    S.tex_base = 10; S.samp_base = 20;
+    t("bound handle: the active pools' bases added at use", nvn_bound_handle(S.tex[1][7]) == ((5 + 10) | (uint64_t)(3 + 20) << 20) && nvn_bound_handle(0) == 0);
+    S.tex_base = S.samp_base = 0;
     uint64_t fresh[2] = {0x00500007, 0x00600008}; p_bind_handles bdf = {.stage = 2, .first = 0, .n = 2, .defer = 1, .src = (uint64_t)(uintptr_t)fresh, .h = {1, 2}};
     t("deferred textures: the handles the hook read again", ap(OP_BIND_TEX, &bdf) == (A | NVN_DIRTY_ARGS(2)) && S.tex[2][0] == 0x00500007 && S.tex[2][1] == 0x00600008);
     p_bind_handles bbad = {.stage = 3, .first = 0, .n = 33, .h = {9}};
@@ -209,6 +220,57 @@ int main(void) {
     nvn_state_queue_activate(2);
     t("a forgotten queue starts again from the defaults", !S.tex_base && !R.has_sc);
     free(snap);
+
+    // ---------- What upstream 90edd532 added to the state records ----------
+    nvn_state_reset();
+    t("reset: patch size 3, line width 1, depth bounds off", S.patch_size == 3 && S.line_width == 1.0f && !S.dbnd.on);
+    p_depth_bounds db = {1, 0.25f, 0.75f};
+    t("depth bounds: kept, nothing dirty", ap(OP_DEPTH_BOUNDS, &db) == A && S.dbnd.on == 1 && S.dbnd.lo == 0.25f && S.dbnd.hi == 0.75f);
+    p_patch_size ps_ = {4}; p_line_width lw = {2.5f}; p_alpha_ref ar = {0.5f};
+    t("patch size, line width, alpha reference: kept, nothing dirty", ap(OP_PATCH_SIZE, &ps_) == A && ap(OP_LINE_WIDTH, &lw) == A && ap(OP_ALPHA_REF, &ar) == A
+      && S.patch_size == 4 && S.line_width == 2.5f && S.alpha_ref == 0.5f);
+    uint32_t pcbuf[8] = {0}; p_push_const *pcr = (p_push_const *)pcbuf;   // the record with its bytes after it
+    pcr->compute = 0; pcr->offset = 8; pcr->size = 4; memcpy(pcr->data, "\x11\x22\x33\x44", 4);
+    t("graphics push constants: into the graphics group, the graphics stages' arguments", ap(OP_PUSH_CONST, pcr) == (A | NVN_DIRTY_ARGS(0) | NVN_DIRTY_ARGS(1) | NVN_DIRTY_ARGS(2) | NVN_DIRTY_ARGS(3) | NVN_DIRTY_ARGS(4))
+      && !memcmp(S.push[0] + 8, "\x11\x22\x33\x44", 4) && !S.push[1][8]);
+    pcr->compute = 1;
+    t("compute push constants: the compute group, the compute stage's arguments", ap(OP_PUSH_CONST, pcr) == (A | NVN_DIRTY_ARGS(5)) && !memcmp(S.push[1] + 8, "\x11\x22\x33\x44", 4));
+    p_viewports vpo; memset(&vpo, 0, sizeof vpo); vpo.first = 2; vpo.n = 1; vpo.origin = 2; vpo.v[0][2] = 64;
+    t("viewports: the device origin each was recorded with", ap(OP_VIEWPORTS, &vpo) == A && S.vp_origin[2] == 2 && S.vp[2][2] == 64 && S.has_vp);
+    p_bind_buf r6 = {.stage = 6, .index = 1, .addr = 0x9000, .size = 0x40};
+    t("uniform buffer of the ray-tracing stage (6): kept, its slot set", ap(OP_BIND_UBO, &r6) == (A | NVN_DIRTY_ARGS(6)) && S.ubo[6][1].addr == 0x9000 && S.ubo_set[6] == 2);
+    // a program with no vertex shader bound with the vertex bit keeps the vertex stage (Little Busters!), as the backend tells its stages
+    prog_t *pv = &P[66], *pf = &P[67], *pm = &P[68];
+    nvn_state_reset(); g_stage_mask = 0;
+    bind_prog(pv, 0x1f); g_stage_mask = 0x2;   // fragment only
+    bind_prog(pf, 0x1f);
+    t("fragment-only program bound with all graphics bits: the vertex stage stays", S.bst[0] == pv && S.bst[1] == pf);
+    g_stage_mask = 0x2 | NVN_PROG_ST_UNKNOWN; bind_prog(pv, 0x1f); bind_prog(pf, 0x1f);
+    t("a stage the backend could not tell: the bind replaces the vertex stage as before", S.bst[0] == pf);
+    g_stage_mask = 0;
+    nvn_state_reset(); bind_prog(pm, 0x80 | 0x2);
+    t("NVN2 mesh bit (0x80) with fragment: stage 4, and a mesh program is the program without a vertex stage", S.bst[4] == pm && S.bst[1] == pm && !S.bst[0] && S.prog == pm);
+    prog_t *prt = &P[69]; prt->nstage = 0; prt->serial = 4242; g_rt_prog = prt;
+    nvn_state_reset(); bind_prog(pa, 3);
+    t("ray-tracing program: bound apart (S.rprog), graphics and compute untouched", bind_prog(prt, 0x100) == (A | NVN_DIRTY_ARGS(NVN_RT_RESOURCE_STAGE)) && S.rprog == prt && S.prog == pa);
+    t("the same ray-tracing program again: nothing dirty", bind_prog(prt, 0x100) == A);
+    g_rt_prog = NULL;
+
+    // ---------- Bindings past a queued job (nvn_state_preserve): the job's snapshots go, the queue keeps copies ----------
+    nvn_state_queue_activate(77);
+    static prog_t job_prog; job_prog.magic = MAGIC('P', 'R', 'O', 'G'); job_prog.serial = 5151; job_prog.nstage = 2;
+    static tex_t job_tex; memset(&job_tex, 0, sizeof job_tex); job_tex.serial = 6161;
+    bind_prog(&job_prog, 3); p_set_rt srt; memset(&srt, 0, sizeof srt); srt.n = 1; srt.color[0] = &job_tex; R.rt = srt; R.has_rt = 1;   // as the backend's be_set_rt keeps it
+    n_keep = n_drop = 0;
+    uint32_t pd = nvn_state_preserve();
+    t("preserve: the programs and the target move into the queue's copies, every binding dirty", pd == (NVN_DIRTY_PIPELINE | NVN_DIRTY_ARGS_ALL) && n_keep == 1
+      && S.bst[0] && S.bst[0] != &job_prog && S.bst[0] == S.bst[1] && S.bst[0]->serial == 5151 && S.prog == S.bst[0]
+      && R.rt.color[0] && R.rt.color[0] != &job_tex && R.rt.color[0]->serial == 6161 && tex_kept == 6161 && tex_let == 0);
+    memset(&job_prog, 0xa5, sizeof job_prog); memset(&job_tex, 0xa5, sizeof job_tex);   // the job retires and its memory is reused
+    t("... and survive the job's memory", S.bst[1]->serial == 5151 && R.rt.color[0]->serial == 6161);
+    t("preserve again with nothing new: nothing moves", nvn_state_preserve() == 0 && n_keep == 1);
+    nvn_state_queue_forget(77);
+    t("the queue finalized: its copies let go", n_drop == 1 && tex_let == 6161);
     printf("== t_state: %d checks, %d failed ==\n", total, fail);
     return fail != 0;
 }

@@ -1,6 +1,7 @@
-// The NVN command replay's decoder (nvn_replay.h): the decode loop of the Metal replay layer's mtl_exec, moved with no change of logic (docs/design/vulkan-backend.md, step M3).
-// What each case arm did in the backend is the backend's per-operation function (nvn_be.h; the Metal backend's are mtl_exec's arms verbatim, nvn_mtl.m); the state records are
-// applied here, and their dirty mask is handed to be_state_dirty exactly where the Metal arm called state_op, before or after the arm's own work as it was
+// The NVN command replay's decoder (nvn_replay.h): the decode loop of the Metal replay layer's mtl_exec, moved in step M3 (docs/design/vulkan-backend.md), for the backends other
+// than Metal; since the merge of upstream 90edd532 the Metal backend replays with its own mtl_exec again (upstream's text), and this loop decodes what upstream's does: the new
+// records (multi-draw, draw texture, DLSS, acceleration structures, ray dispatch) go to the backend's per-operation functions (nvn_be.h), the new state records (depth bounds, patch
+// size, line width, alpha reference, push constants) are applied here. The state records' dirty mask is handed to be_state_dirty where the Metal arm called state_op
 #include <string.h>
 #include "nvn_replay.h"
 #include "nvn_be.h"
@@ -36,11 +37,13 @@ void nvn_replay_exec(const uint8_t *p) {
             case OP_CLEAR_DS: be_clear_ds(p, &h, a); break;
             case OP_DRAW: be_draw(p, &h, a); break;
             case OP_DRAW_IDX: be_draw_idx(p, &h, a); break;
+            case OP_MULTI_DRAW: be_multi_draw(p, &h, a); break;
             // Do not mark dirty if the state did not change (the game often re-sends the same program / state block / vertex format before each draw; the dirty flag only decides whether to re-fetch the pipeline / depth-stencil object, and equal values mean the same object)
             case OP_BIND_PROGRAM: be_state_dirty(nvn_state_apply(h.op, a)); be_bind_program(p, &h, a); break;
             case OP_SCISSOR: case OP_BIND_STATE: case OP_BIND_VATTR: case OP_BIND_VSTREAM: case OP_BIND_VBUF: case OP_BIND_VBUF1:
             case OP_BIND_UBO: case OP_BIND_UBO_SMALL: case OP_BIND_SSBO: case OP_BIND_TEX: case OP_BIND_TEX1: case OP_BIND_SAMP: case OP_BIND_IMG: case OP_STENCIL:
-            case OP_POLY_OFFSET: case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_DEPTH_CLAMP: case OP_VP_SWIZZLE: case OP_BLEND_COLOR: case OP_COPY_STRIDE:
+            case OP_POLY_OFFSET: case OP_VIEWPORTS: case OP_DEPTH_RANGE: case OP_DEPTH_CLAMP: case OP_DEPTH_BOUNDS: case OP_PATCH_SIZE: case OP_LINE_WIDTH: case OP_VP_SWIZZLE:
+            case OP_BLEND_COLOR: case OP_ALPHA_REF: case OP_PUSH_CONST: case OP_COPY_STRIDE:
                 be_state_dirty(nvn_state_apply(h.op, a)); break;
             case OP_TF_BIND: be_tf_bind(p, &h, a); be_state_dirty(nvn_state_apply(h.op, a)); break;
             case OP_TF_STATE: be_tf_state_note(p, &h, a); be_state_dirty(nvn_state_apply(h.op, a)); be_tf_state(p, &h, a); break;
@@ -49,7 +52,13 @@ void nvn_replay_exec(const uint8_t *p) {
             case OP_COPY_B2T: be_copy_b2t(p, &h, a); break;
             case OP_COPY_T2B: be_copy_t2b(p, &h, a); break;
             case OP_COPY_T2T: be_copy_t2t(p, &h, a); break;
+            case OP_DRAW_TEX: be_draw_tex(p, &h, a); break;
             case OP_CLEAR_TEX: be_clear_tex(p, &h, a); break;
+            case OP_DLSS: be_dlss(p, &h, a); break;
+            case OP_AS_BUILD: be_as_build(p, &h, a); break;
+            case OP_AS_COPY: be_as_copy(p, &h, a); break;
+            case OP_BIND_AS: be_bind_as(p, &h, a); break;
+            case OP_RT_DISPATCH: be_rt_dispatch(p, &h, a); break;
             case OP_DISPATCH: be_dispatch(p, &h, a); break;
             case OP_BARRIER: be_barrier(p, &h, a); break;
             case OP_SET_TEX_POOL: case OP_SET_SAMP_POOL: be_state_dirty(nvn_state_apply(h.op, a)); break;

@@ -1,5 +1,5 @@
 // Synthetic HLE entries for t_hle_thunks.c: one of every argument and return shape the generator supports (dm/host/tools/gen_hle_thunks.py), and the
-// ways sources spell entries (HLE, HLE_FORCE, HLE_FORCE_BIG, an alias as in hle_fs.c, a wrapper macro with # and ## as in hle_net.c / hle_hid.c, a typedef, #if 0).
+// ways sources spell entries (HLE, HLE_FORCE, HLE_FORCE_DIRECT, an alias of an entry macro, a wrapper macro with # and ## as in hle_net.c / hle_hid.c, a typedef, #if 0).
 // The test's CMake rule runs the generator over this file into gen/t_hle_thunks.c. Each entry records what it received in the globals below
 #include "../hle.h"
 #include <stdbool.h>
@@ -42,14 +42,14 @@ HLE_FORCE("t_long", "long: sign-extended from the C value", long, t_long, unsign
 HLE_FORCE("t_ptr_ret", "a pointer return; a struct pointer and a callback typedef", void *, t_ptr_ret, my_pair *p, my_cb cb) { g_calls++; g_rx[0] = (uint64_t)(uintptr_t)cb; return p; }
 HLE_FORCE("t_bool_ret", "a sub-32-bit return: zero-extended", bool, t_bool_ret, int v) { g_calls++; return v != 0; }
 HLE("t_hle_plain", int, t_hle_plain, int v) { g_calls++; return v + 1; }
-HLE_FORCE_BIG("t_big", "HLE_FORCE_BIG", int, t_big, int v) { g_calls++; return v * 2; }
+HLE_FORCE_DIRECT("t_big", "HLE_FORCE_DIRECT", int, t_big, int v) { g_calls++; return v * 2; }
 
-// hle_fs.c's alias
+// An alias of an entry macro
 #undef HLE_FORCE
-#define HLE_FORCE HLE_FORCE_BIG
-HLE_FORCE("t_aliased", "through #define HLE_FORCE HLE_FORCE_BIG", int, t_aliased, int v) { g_calls++; return v * 3; }
+#define HLE_FORCE HLE_FORCE_DIRECT
+HLE_FORCE("t_aliased", "through #define HLE_FORCE HLE_FORCE_DIRECT", int, t_aliased, int v) { g_calls++; return v * 3; }
 #undef HLE_FORCE
-#define HLE_FORCE(mangled, why, ret, cname, ...) HLE_FORCE_BIG(mangled, why, ret, cname, __VA_ARGS__)
+#define HLE_FORCE(mangled, why, ret, cname, ...) HLE_FORCE_DIRECT(mangled, why, ret, cname, __VA_ARGS__)
 
 // A wrapper with # and ##, as hle_hid.c's TOUCH
 #define NUMBERED(N) HLE_FORCE("t_numbered" #N "E", "wrapper macro", int, t_numbered_##N, int v) { g_calls++; return v + N; }

@@ -2,7 +2,8 @@
 """One nxhost-run for every game profile (CTest t_host_profile; dm/host/game_rt.c; dm/games/game.py header --runtime, table, runtime): this tree's nxhost-run, configured
 with one profile (cmake -DGAME, the default: host_tests.tsv's "# game:" line), runs t_host_program's synthetic module (dm/tools/tests/aot_synth.py, packed by
 dm/tools/aot/tests/build_packs.sh into <packs>/module; no SDK, so DM_AOT_RAW=1; SDL's dummy drivers, the headless Vulkan presenter) under three profiles, and its log shows
-each one's constants as game.py computes them: the profile line (id, name, where it came from), the guest address block's size (mem_reserve: hle_svc.c's "guest AS" line),
+each one's constants as game.py computes them: the profile line (id, name, where it came from), the guest address block's size (hle_svc.c's "guest AS" line: mem_reserve,
+its alias region mem_alias grown to a Switch's 64 GB as on the Mac, dm.h dm_alias_size_for; the synthetic module has no SDK, so never a Switch 2's 128 GB),
 the frame step (fps_target: loader.c's line for the module's state page), and the run's status 0:
   1. no option: the default;
   2. --game <title ID>: the first profile of dm/games whose mem_reserve and fps_target both differ from the default's, from the table built into the program;
@@ -28,6 +29,7 @@ sys.path.insert(0, str(REPO / 'dm/games'))
 import game   # noqa: E402
 
 NEW_ID = '0100AA0800000000'   # a title ID no game has (t_second_pack's is ...AA07...)
+SWITCH_ALIAS = 0x1000000000   # dm.h DM_SWITCH_ALIAS: the least alias region outside an iPhone
 checks = fails = 0
 
 
@@ -108,7 +110,8 @@ def main():
                     f'frame step in whole vsyncs decided by the host, capped at {c["fps_target"]} fps (game profile fps_target)'
             check(st == 0 and 'guest code ended: status 0 (the process ended)' in out, f'{what}: the synthetic module ran to its end, status {st}')
             check(f'game profile {c["id"]} ({c["name"]}): {source}' in out, f'{what}: the profile line names {c["id"]} ({c["name"]}) and its source')
-            check(f'+{c["mem_reserve"]:#x}  heap' in line_with(out, 'guest AS '), f'{what}: the guest address block is its mem_reserve, {c["mem_reserve"]:#x}')
+            block = c['mem_reserve'] - c['mem_alias'] + max(c['mem_alias'], SWITCH_ALIAS)
+            check(f'+{block:#x}  heap' in line_with(out, 'guest AS '), f'{what}: the guest address block is its mem_reserve with a Switch\'s alias region, {block:#x}')
             check(frame in out, f'{what}: the frame step follows its fps_target, {c["fps_target"]}')
             if not named: check('aot: 1 modules from' in out and 'main: base' in out, f'{what}: its module list ({" ".join(c["modules"])}) loaded with no module named')
 

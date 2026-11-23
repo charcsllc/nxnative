@@ -56,7 +56,7 @@ enum { NBUF = 40, FRAMES = 240 };   // 40 blocks of 5 ms: 200 ms of sound
 static int16_t pcm[NBUF][FRAMES * 6];
 // Open an output of ch channels, play NBUF blocks, stop and close it; real: an SDL device is expected (else the silent sink)
 static void cycle(int ch, int real, const char *what) {
-    uint8_t out[64] = {0}, ev[64], prm[16]; gbuf bufs[NBUF];
+    uint8_t out[64] = {0}, ev[64], prm[16]; aout_buf bufs[NBUF];   // nn::audio::AudioOutBuffer in the SDK's layout (hle.h)
     h_au_InitParam(prm); *(uint16_t *)(prm + 4) = (uint16_t)ch;
     CHECK(h_au_Open(out, ev, NULL, prm) == RES_OK, what);
     aout *a = ao(out);
@@ -68,14 +68,16 @@ static void cycle(int ch, int real, const char *what) {
     } else CHECK(a->au == NULL, "DM_AUDIO=0: no device, the silent sink");
     for (int i = 0; i < NBUF; i++) {
         for (int j = 0; j < FRAMES * ch; j++) pcm[i][j] = (int16_t)(i * 100 + j);
-        bufs[i] = (gbuf){pcm[i], (uint64_t)FRAMES * ch * 2, (uint64_t)FRAMES * ch * 2};
+        bufs[i] = (aout_buf){.ptr = pcm[i], .cap = (uint64_t)FRAMES * ch * 2, .size = (uint64_t)FRAMES * ch * 2};
         h_au_Append(out, &bufs[i]);
     }
     uint64_t calls = dm_audio_render_calls(); int ev0 = g_events;
-    CHECK(h_au_Start(out) == RES_OK && a->backend == (real ? BK_AU : BK_NULL), real ? "Start resumes the SDL device" : "Start runs the silent sink");
+    // Start plays on the silent sink at once and starts the device on a host thread; the watchdog hands the queue to the device at its first callback (hle_audio.c au_start_at,
+    // au_watchdog_output; a watchdog tick may already have done it), which the checks after the playback see
+    CHECK(h_au_Start(out) == RES_OK && (a->backend == BK_NULL || (real && a->backend == BK_AU)), real ? "Start: the silent sink plays until the SDL device calls back" : "Start runs the silent sink");
     int got = 0, order = 1;
     for (int t = 0; t < 3000 && got < NBUF; ) {
-        gbuf *b = h_au_Released(out);
+        aout_buf *b = h_au_Released(out);
         if (b) { order &= b == &bufs[got]; got++; continue; }
         sleep_ms(2); t += 2;
     }
@@ -110,8 +112,8 @@ static int bench(void) {
         for (int k = 0; k < REPS; k++) {
             aout *a = calloc(1, sizeof *a);
             if (!a) return 2;
-            gbuf b = {in, sizeof in, sizeof in};
-            a->ch = 6; atomic_store(&a->state, STATE_STARTED); uint32_t vb; memcpy(&vb, &vols[v], 4); atomic_store(&a->vol, vb);
+            aout_buf b = {.ptr = in, .cap = sizeof in, .size = sizeof in};
+            a->ch = 6; a->dev_ch = 2; atomic_store(&a->state, STATE_STARTED); uint32_t vb; memcpy(&vb, &vols[v], 4); atomic_store(&a->vol, vb);
             a->q[0] = &b; atomic_store(&a->q_tail, 1);
             uint64_t t0 = now_ns();
             for (int f = 0; f < FR; f += CB) pull_device(a, (uint8_t *)(out + 2 * f), (uint64_t)CB * 4);

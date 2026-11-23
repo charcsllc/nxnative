@@ -4,6 +4,7 @@
 // a fragment shader writing its second blend source at Location 1 without an Index comes out writing it at Location 0, Index 1, and every other output shape is left alone.
 // The same on glslang's modules of the GPU test (guest_ubo.vert made into Galaxy's form, guest_dual.frag). Where spirv-val is installed (the nxnative-build image), every module
 // the fix-ups produce passes it and Galaxy's form fails it (so the fix-up is what makes it valid); elsewhere that half is reported as not run.
+#define T_VK_LINKS_HLE_VI 1   // dm/gfx/hle_vi.c is linked (dm/host/CMakeLists.txt): its layer crop and frame history, not the harness's
 #include "t_vk_harness.h"
 #include "../../../host/hle.h"
 #include "../../hostvk/guest_vk.h"

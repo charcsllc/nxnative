@@ -19,7 +19,8 @@ def eh_frame_hdr(img):
 
 def _read(img, o, enc, ehs):
     fmt, app = enc & 0xF, enc & 0x70
-    if fmt == 0x3: v, sz = struct.unpack_from('<I', img, o)[0], 4
+    if fmt == 0x1: v, end = _uleb(img, o); sz = end - o
+    elif fmt == 0x3: v, sz = struct.unpack_from('<I', img, o)[0], 4
     elif fmt == 0xB: v, sz = struct.unpack_from('<i', img, o)[0], 4
     elif fmt in (0x0, 0x4): v, sz = struct.unpack_from('<Q', img, o)[0], 8
     elif fmt == 0xC: v, sz = struct.unpack_from('<q', img, o)[0], 8
@@ -37,7 +38,7 @@ def _uleb(img, o):
 
 
 def fde_table(img):
-    """[(function start, FDE offset)] from the eh_frame_hdr binary search table; empty when the module has no valid eh_frame_hdr (New Super Mario Bros. U Deluxe's MOD0 points elsewhere)"""
+    """[(function start, FDE offset)] from the eh_frame_hdr binary search table; empty when the module has no valid eh_frame_hdr (New Super Mario Bros. U Deluxe: a 32-bit module)"""
     ehs, ehe = eh_frame_hdr(img)
     if ehe - ehs < 12 or img[ehs] != 1 or img[ehs + 3] in (0xFF, 0): return []
     _, penc, cenc, tenc = img[ehs:ehs + 4]
@@ -85,6 +86,60 @@ def fde_ranges(img):
     return sorted(out)
 
 
+def landing_pads(img):
+    """{landing pad: [(start, end) of the calls it catches]} from every FDE's LSDA (.gcc_except_table, C++ exceptions): the unwinder enters a landing pad from one of those
+    calls, with the callee-saved registers as the call left them. Empty for a module without exception tables. Only a CIE with a personality routine ('P') has such an
+    LSDA: one with 'L' alone points at the runtime's own data (Absolum main, .NET NativeAOT: 'zLR'), and a table whose records leave its function is not one either"""
+    ehs, _ = eh_frame_hdr(img)
+    cies, out = {}, {}
+
+    def cie(c):   # (FDE pointer encoding, LSDA encoding or None, augmented)
+        if c not in cies:
+            p = c + 8; ver = img[p]; p += 1
+            aug = img[p:img.index(b'\0', p)]; p += len(aug) + 1
+            _, p = _uleb(img, p)
+            while img[p] & 0x80: p += 1
+            p += 1
+            p = p + 1 if ver == 1 else _uleb(img, p)[1]
+            enc, lenc = 0, None
+            if aug.startswith(b'z'):
+                _, p = _uleb(img, p)
+                for ch in aug[1:]:
+                    if ch == ord('R'): enc = img[p]; p += 1
+                    elif ch == ord('P'): pe = img[p]; p += 1; p += _read(img, p, pe, ehs)[1]
+                    elif ch == ord('L'): lenc = img[p]; p += 1
+            cies[c] = (enc, lenc, aug.startswith(b'z') and b'P' in aug)
+        return cies[c]
+
+    for _, f in fde_table(img):
+        try:
+            cptr = f + 4
+            enc, lenc, z = cie(cptr - struct.unpack_from('<I', img, cptr)[0])
+            if lenc is None or lenc == 0xFF or not z: continue
+            st, s = _read(img, f + 8, enc, ehs); p = f + 8 + s
+            ln, s = _read(img, p, enc & 0xF, ehs); p += s
+            _, p = _uleb(img, p)   # augmentation length
+            lsda, _ = _read(img, p, lenc, ehs)
+            if not lsda: continue
+            p = lsda; lpe = img[p]; p += 1
+            lpstart = st
+            if lpe != 0xFF: lpstart, s = _read(img, p, lpe, ehs); p += s
+            tte = img[p]; p += 1
+            if tte != 0xFF: _, p = _uleb(img, p)
+            cse = img[p]; p += 1
+            n, p = _uleb(img, p); end = p + n; got = []
+            while p < end:
+                cs, s = _read(img, p, cse & 0xF, ehs); p += s
+                cl, s = _read(img, p, cse & 0xF, ehs); p += s
+                lp, s = _read(img, p, cse & 0xF, ehs); p += s
+                _, p = _uleb(img, p)   # action
+                if cs + cl > ln or (lp and not st <= lpstart + lp < st + ln): raise ValueError('a call site outside its function')
+                if lp: got.append((lpstart + lp, (st + cs, st + cs + cl)))
+            for pad, r in got: out.setdefault(pad, []).append(r)
+        except (ValueError, IndexError, struct.error): continue   # a table this reader does not know: its pads stay unseen, as without exception tables
+    return out
+
+
 def data_blocks(img, text_end, md):
     """Sorted [(start, end)] of the data blocks in text [0, text_end) (see the module docstring). md: a capstone AArch64 disassembler"""
     # An NRO's text includes its header: the build ID at +0x40 is arbitrary bytes, not instructions. FFX/X-2's magic_0898_2015.nro has a literal ldr x18 there.
@@ -110,15 +165,10 @@ if __name__ == '__main__':
     from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
     p = sys.argv[1]; raw = open(p, 'rb').read()
     if raw[:4] == b'NSO0':
-        import lz4.block
-        flags = struct.unpack_from('<I', raw, 0xc)[0]
-        segs = [struct.unpack_from('<III', raw, 0x10 + i * 0x10) for i in range(3)]
-        csz = struct.unpack_from('<III', raw, 0x60)
-        img = bytearray(segs[2][1] + segs[2][2])
-        for i, (fo, mo, sz) in enumerate(segs):
-            seg = raw[fo:fo + csz[i]]
-            img[mo:mo + sz] = lz4.block.decompress(seg, uncompressed_size=sz) if flags >> i & 1 else seg
-        text_end = segs[0][2]
+        import nso
+        try: m = nso.load(raw, p)
+        except nso.Error as e: sys.exit(f'[RED] {e}')
+        img, text_end = m.image, m.text_end
     else:
         img = raw; text_end = int(sys.argv[2], 0)
     blocks = data_blocks(img, text_end, Cs(CS_ARCH_ARM64, CS_MODE_ARM))

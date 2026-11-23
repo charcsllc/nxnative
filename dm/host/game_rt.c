@@ -21,7 +21,7 @@ extern const struct dm_game_profile dm_game_profiles[];   // game.py table: the 
 extern const int dm_game_nprofiles, dm_game_default;
 extern const char dm_game_default_from[];                 // the default's folder when it is not in dm/games (cmake -DGAME of a DM_GAMES_DIR profile), else empty
 
-enum { K_STR, K_U64, K_FLAG, K_FPS, K_PAD, K_OPTFLAG, K_OPTINT, K_MODULES, K_VERSIONS };
+enum { K_STR, K_U64, K_FLAG, K_FPS, K_FPSMAX, K_PAD, K_TRI, K_INT, K_OPTFLAG, K_OPTINT, K_MODULES, K_VERSIONS, K_BUILDMODS };
 static const struct field { const char *key; int kind; size_t off; } k_fields[] = {
 #define F(name, kind) {#name, K_##kind, offsetof(struct dm_game_profile, name)},
     DM_GAME_FIELDS(F)
@@ -48,6 +48,14 @@ static int parse_small(const char *s, int *out) {   // a decimal number below 65
     long v = strtol(s, NULL, 10); if (v > 65535) return -1;
     *out = (int)v; return 0;
 }
+static void pct_decode(char *s) {   // a display version's %20 and %25 (game.py pct: the pairs are separated by spaces), in place
+    char *o = s;
+    for (; *s; s++) {
+        if (s[0] == '%' && isxdigit((unsigned char)s[1]) && isxdigit((unsigned char)s[2])) { char h[3] = {s[1], s[2], 0}; *o++ = (char)strtol(h, NULL, 16); s += 2; }
+        else *o++ = *s;
+    }
+    *o = 0;
+}
 static char *next_word(char **s) {   // the next space-separated word of *s (the string is cut), or NULL
     char *p = *s; while (*p == ' ') p++;
     if (!*p) { *s = p; return NULL; }
@@ -69,11 +77,21 @@ static int set_field(struct dm_game_profile *p, const struct field *f, char *v, 
     switch (f->kind) {
     case K_STR: *(const char **)at = v; return 0;
     case K_U64: if (parse_u64(v, (uint64_t *)at)) { *why = "a number: 0x<hex> or decimal digits, below 2^64"; return -1; } return 0;
-    case K_FLAG: case K_FPS: case K_PAD:
-        if (parse_small(v, &n) || (f->kind == K_FLAG && n > 1) || (f->kind == K_FPS && n != 0 && n != 30 && n != 60) || (f->kind == K_PAD && n > 2)) {
-            *why = f->kind == K_FLAG ? "0 or 1" : f->kind == K_FPS ? "0, 30 or 60" : "0, 1 or 2 (simple, full, touch)"; return -1;
+    case K_FLAG: case K_FPS: case K_FPSMAX: case K_PAD:
+        if (parse_small(v, &n) || (f->kind == K_FLAG && n > 1) || (f->kind == K_FPS && n != 0 && n != 30 && n != 60) || (f->kind == K_FPSMAX && n != 60 && n != 120) ||
+            (f->kind == K_PAD && n > 2)) {
+            *why = f->kind == K_FLAG ? "0 or 1" : f->kind == K_FPS ? "0, 30 or 60" : f->kind == K_FPSMAX ? "60 or 120" : "0, 1 or 2 (simple, full, touch)"; return -1;
         }
         *(int *)at = n; return 0;
+    case K_TRI:   // -1 (not set: the host decides), 0 or 1 (mem_map_limit)
+        if (!strcmp(v, "-1")) { *(int *)at = -1; return 0; }
+        if (parse_small(v, &n) || n > 1) { *why = "-1 (not set), 0 or 1"; return -1; }
+        *(int *)at = n; return 0;
+    case K_INT: {   // a decimal number below 2^31
+        uint64_t u;
+        if (!*v || (v[0] == '0' && (v[1] == 'x' || v[1] == 'X')) || parse_u64(v, &u) || u > INT32_MAX) { *why = "a decimal number below 2^31"; return -1; }
+        *(int *)at = (int)u; return 0;
+    }
     case K_OPTFLAG: case K_OPTINT:
         if (!strcmp(v, "-")) { *(int *)at = -1; return 0; }
         if (parse_small(v, &n) || (f->kind == K_OPTFLAG && n > 1)) { *why = f->kind == K_OPTFLAG ? "0, 1 or - (not set)" : "a decimal number below 65536, or - (not set)"; return -1; }
@@ -93,9 +111,20 @@ static int set_field(struct dm_game_profile *p, const struct field *f, char *v, 
             char *eq = strchr(w, '=');
             if (n == DM_GAME_MAX_VERSIONS) { *why = "at most " XSTR(DM_GAME_MAX_VERSIONS) " <main build ID>=<display version> pairs (game.py MAX_VERSIONS)"; return -1; }
             if (!eq || eq == w || !eq[1]) { *why = "<main build ID>=<display version> pairs, separated by spaces"; return -1; }
-            *eq = 0; ver[n].build = w; ver[n].ver = eq + 1;
+            *eq = 0; ver[n].build = w; ver[n].ver = eq + 1; pct_decode(eq + 1);
         }
         p->nversions = n; return 0;
+    }
+    case K_BUILDMODS: {   // <main build ID>=<module>,<module>... pairs: a build's own modules, kept as main.c's rows keep them (the names separated by spaces)
+        struct dm_game_build_modules *bm = at; n = 0;
+        for (char *w; (w = next_word(&v)); n++) {
+            char *eq = strchr(w, '=');
+            if (n == DM_GAME_MAX_VERSIONS) { *why = "at most " XSTR(DM_GAME_MAX_VERSIONS) " <main build ID>=<module>,... pairs (game.py MAX_VERSIONS)"; return -1; }
+            if (!eq || eq == w || !eq[1]) { *why = "<main build ID>=<module>,<module>... pairs, separated by spaces"; return -1; }
+            *eq = 0; bm[n].build = w; bm[n].mods = eq + 1;
+            for (char *c = eq + 1; *c; c++) if (*c == ',') *c = ' ';
+        }
+        p->nbuild_modules = n; return 0;
     }
     }
     *why = "?"; return -1;

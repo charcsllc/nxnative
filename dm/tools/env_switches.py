@@ -50,6 +50,21 @@ RETIRED = {
     'DM_NVN_ALPHA_RED': 'removed in c76f679 with the alpha_from_red profile key (the nvnTextureCompare mapping fix replaced them)',
     'DM_REFL_DIR': 'removed in ba3b91e (Vulkan port step M6) with t_refl_cmp, which compared the two reflection parsers',
     'DM_UPSCALE': 'never read by any code: a game note\'s record of a 2x run (010045C014650000) that names no real switch',
+    # Upstream's (merged at 90edd532): switches its later commits removed, which its docs still quote where they record what a switch did
+    'DM_NVN_TBDR': 'removed upstream in ad1ee5bf with the TBDR mode',
+    'DM_NVN_BLIT_ORDER': 'removed upstream in ad1ee5bf (a dead switch)',
+    'DM_NVN_DISPATCH_OWN': 'removed upstream in ad1ee5bf (a dead switch)',
+    'DM_NVN_COPY_ABSORB': 'removed upstream in ab41d6a1: GPU writes into a texture uploaded from its storage go into that storage on the GPU',
+    'DM_NVN_DUAL_WANT': 'removed upstream in c25a8670 with dual_want.tsv: dual-source blending moved into main0_u',
+    'DM_NVN_VC_KEEP': 'removed upstream in 87e258bb: one view cache keyed by the Metal texture',
+    'DM_NVN_VC_WAYS': 'removed upstream with the view cache\'s ways (87e258bb)',
+    'DM_FRAME_WG': 'not read by upstream\'s code at 90edd532: a diagnostic switch of a Switch 2 bring-up (0400486024DEC000) that was removed',
+    'DM_NVN_BAR_FRAG': 'not read by upstream\'s code at 90edd532: a removed barrier experiment',
+    'DM_NVN_CUT_FIRST': 'not read by upstream\'s code at 90edd532: a removed diagnostic switch (01007EF00011E000)',
+    'DM_NVN_ISOLATE_TASK': 'not read by upstream\'s code at 90edd532: a removed diagnostic switch (0400486024DEC000)',
+    'DM_NVN_RT_RECLAIM': 'not read by upstream\'s code at 90edd532: a removed render-target experiment',
+    'DM_NVN_VIS_ALL': 'not read by upstream\'s code at 90edd532: a removed diagnostic switch',
+    'DM_RT_PRESENT': 'not read by upstream\'s code at 90edd532: a removed diagnostic switch (0400486024DEC000)',
 }
 RETIRED_WORDS = r'removed|retired|replaced|renamed|gone|never read|no longer'
 
@@ -71,6 +86,7 @@ def file_reads(p, text):
     macros = set(re.findall(r'#\s*define\s+(' + NAME + r')', text))
     # an enum entry (the comma or brace after it a lookahead: consumed, it hid every second entry of a one-line enum from the next match)
     if p.endswith(C_FAMILY): macros |= set(re.findall(r'(?:^|[{,])\s*(' + NAME + r')\s*=\s*-?(?:0x)?[0-9A-Fa-f]+(?=\s*[,}])', text, re.M))
+    for body in re.findall(r'\benum\s*\w*\s*\{([^}]*)\}', text): macros |= set(re.findall(r'\b(' + NAME + r')\s*=', body))   # an entry of any value, in an enum's body (dm.h DM_QUIT_ARCH_MS)
     if '/tests/' in p:   # a test's own switches only; the names in its fixtures are data
         found = re.findall(READ, text)
     elif p.endswith('.sh'): found = re.findall(r'\$\{?(' + NAME + r')\b', text) + re.findall(r'["\'](' + NAME + r')["\']', text)

@@ -402,6 +402,9 @@ static void *control9(void *arg) {
 }
 
 static void timeout(int sig) { (void)sig; const char m[] = "[RED] t_detclock: timed out: a thread waits on the guest clock and nothing moves it\n"; write(2, m, sizeof m - 1); _exit(99); }
+__attribute__((weak)) int dm_sdk_ounce(void) { return 0; }   // loader.c: a Switch 1 SDK
+__attribute__((weak)) void guest_thread_set_id(uint64_t id) { (void)id; }   // thread.c: no TLR here
+__attribute__((weak)) void guest_gate_stack(int own_stack) { (void)own_stack; }
 int main(int argc, char **argv) {
     int only = argc > 1 ? atoi(argv[1]) : 0;   // one scenario (3, 1, 2, 4, 5 to 9) after the common start; all by default
 #if !defined(_WIN32)

@@ -7,6 +7,7 @@
 // struct member), their draws read back pixel for pixel; occlusion and timestamp queries; DM_VK_CAPTURE's files; a swapchain over a VK_NN_vi_surface surface, acquired and
 // presented four times, with a layer crop and without, read back through the backend's headless presenter. Every validation message fails the test. Without a Vulkan device it
 // skips as the other GPU tests do (t_vk_harness.h).
+#define T_VK_LINKS_HLE_VI 1   // dm/gfx/hle_vi.c is linked (dm/host/CMakeLists.txt): its layer crop and frame history, not the harness's
 #include "t_vk_harness.h"
 #include "../../../host/hle.h"
 #include "../../hostvk/guest_vk.h"

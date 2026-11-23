@@ -4,15 +4,23 @@ struct dm_flags g_flag;
 uint64_t g_t0_ns;
 void crash_thread_init(void) {}
 void guest_thread_init(void) {}
+void guest_thread_set_id(uint64_t id) { (void)id; }
+void guest_gate_stack(int own_stack) { (void)own_stack; }
 // The notification scheduler test supplies a C entry for real thread SVCs.
 #ifndef DM_TEST_THREAD_ENTER
 void dm_thread_enter(uint64_t entry, uint64_t arg, uint64_t sp) { (void)entry; (void)arg; (void)sp; abort(); }
 #endif
 void *guest_sym(const char *name) { (void)name; return NULL; }
+// The pause tests supply a module_of that reports guest code per thread (the SIGUSR2 handler declines to stop host code).
+#ifndef DM_TEST_MODULE_OF
 module_t *module_of(const void *p) { (void)p; return NULL; }
+#endif
+#ifndef DM_TEST_GUEST_CLOCK
 uint64_t now_ns(void) { return plat_now_ns(); }   // hle_os.c's, the host's monotonic clock
 uint64_t guest_ns(void) { return now_ns(); }
 int dm_detclock_enabled(void) { return 0; }
+__thread uint64_t dm_clock_reads;   // guest clock reads per thread (hle_os.c in the host; thr_yield reads it)
+#endif
 __thread _Atomic int dm_host_work;   // referenced by hle_thread.c; in the host it is defined in hle_nvn.c
 pthread_key_t g_key18;   // read by hle_thread.c's SVC entry and pause signal; in the host it is defined in loader.c (never created here: those paths do not run)
 #if !DM_NATIVE_EXEC

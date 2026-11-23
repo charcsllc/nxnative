@@ -38,10 +38,12 @@ set(GEN ${CMAKE_BINARY_DIR}/gen/profile)
 set(GAME_H ${GEN}/game_profile.h)
 set(GAME_TABLE_C ${GEN}/game_profiles.c)
 file(GLOB GAME_TSVS CONFIGURE_DEPENDS ${REPO}/dm/games/*/game.tsv)
+# The shader maps too: a constant comes from them (game.py upscaler_keys: DM_GAME_UPSCALER_KEYS, the game's own upscaler shaders)
+file(GLOB GAME_MAPS CONFIGURE_DEPENDS ${REPO}/dm/games/*/shader_map.tsv)
 add_custom_command(OUTPUT ${GAME_H} ${GAME_TABLE_C}
     COMMAND ${Python3_EXECUTABLE} ${REPO}/dm/games/game.py header --runtime ${GAME_H}
     COMMAND ${Python3_EXECUTABLE} ${REPO}/dm/games/game.py table ${GAME_TABLE_C} ${GAME_DIR}
-    DEPENDS ${REPO}/dm/games/game.py ${GAME_TSVS} ${GAME_DIR}/game.tsv
+    DEPENDS ${REPO}/dm/games/game.py ${GAME_TSVS} ${GAME_MAPS} ${GAME_DIR}/game.tsv
     COMMENT "game profiles: game_profile.h's runtime form and the table of every profile (default ${GAME})" VERBATIM)
 add_custom_target(game_profile DEPENDS ${GAME_H} ${GAME_TABLE_C})
 
@@ -150,8 +152,15 @@ endif()
 # dm/gfx's wildcard on Apple: plain C, part of nxhost as of every Apple host (the guest Vulkan and GL layers read the layer crop and size from hle_vi.c)
 file(GLOB HLE_SRC CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/hle_*.c)
 list(FILTER HLE_SRC EXCLUDE REGEX "/hle_(bigstack|table)\\.c$")
+# Apple's own by nature, so not built here; apple_null.c gives the rest of the host what it calls in them, as declared [RED] null forms: hle_exl.c (exlaunch plugins write the
+# game's code through a writable alias of its pages, which a recompiled pack does not read), hle_cheats.c (the cheat VM's code writes and the Mac Cheats panel: mach_vm_remap,
+# libdispatch), hle_jit.c (nn::jit: runs the JIT plugin's ARM64 output natively or serves a captured image at fixed distances), hle_movie_av1.c (AV1 on VideoToolbox, and dav1d
+# built for arm64 only). Their guest entries are then unimplemented imports, as before the merge that brought them (docs/design/migration-status.md)
+list(FILTER HLE_SRC EXCLUDE REGEX "/hle_(exl|cheats|jit|movie_av1)\\.c$")
 file(GLOB GFX_HLE_SRC CONFIGURE_DEPENDS ${REPO}/dm/gfx/hle_*.c)
-set(NXHOST_SRC hle.c loader.c thread.c front_sdl.c libc_pass.c)
+# audio_input.c: the microphone streams' shared part (its platform backend is Apple's audio_input_mac.m; audio_input.h gives the others a backend with no device).
+# apple_null.c: the declared null forms of the Apple-only sources above and of save_sync.c (iCloud Drive save sync), which is not built here either
+set(NXHOST_SRC hle.c loader.c thread.c front_sdl.c libc_pass.c audio_input.c apple_null.c)
 list(TRANSFORM NXHOST_SRC PREPEND ${CMAKE_CURRENT_SOURCE_DIR}/)
 list(APPEND NXHOST_SRC ${HLE_SRC} ${GFX_HLE_SRC})
 # The host-call thunks of the x86-64 execution engine (docs/design/aot-recompiler.md 2.4): generated from the HLE entries of exactly the sources nxhost compiles,
@@ -170,7 +179,7 @@ file(GLOB HOST_H CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*.h ${CMAKE_CURRE
 set(NVN_FRONTEND_SRC
     ${REPO}/dm/gfx/nvn/hle_nvn.c ${REPO}/dm/gfx/nvn/nvn_dirty.c ${REPO}/dm/gfx/nvn/nvn_tex.c ${REPO}/dm/gfx/nvn/nvn_state.c ${REPO}/dm/gfx/nvn/nvn_gpuwrite.c
     ${REPO}/dm/gfx/nvn/nvn_resolve.c ${REPO}/dm/gfx/nvn/nvn_pools.c ${REPO}/dm/gfx/nvn/nvn_replay.c ${REPO}/dm/gfx/nvn/nvn_refl.c ${REPO}/dm/gfx/nvn/nvn_pipe.c
-    ${REPO}/dm/gfx/tex/nvn_fmt_mtl.c ${REPO}/dm/gfx/tex/nvn_deswizzle.c ${REPO}/dm/third_party/cjson/cJSON.c)
+    ${REPO}/dm/gfx/nvn/nvn_capture.c ${REPO}/dm/gfx/tex/nvn_fmt_mtl.c ${REPO}/dm/gfx/tex/nvn_deswizzle.c ${REPO}/dm/third_party/cjson/cJSON.c)
 set_source_files_properties(${NVN_FRONTEND_SRC} PROPERTIES INCLUDE_DIRECTORIES ${REPO}/dm/gfx/nvn/include)
 set(NVN_NAMES_C ${CMAKE_BINARY_DIR}/gen/nvn_names.c)
 file(STRINGS ${REPO}/dm/gfx/nvn/names.txt NVN_NAMES REGEX "^nvn")
@@ -464,16 +473,18 @@ host_test(t_env_rule SOURCES t_env_rule.c)   # an empty value is unset on every 
 host_test(t_timed_wait SOURCES t_timed_wait.c)   # a short timed wait ends on time (Windows: the system timer at 1 ms, plat_win32.c timer_period_1ms)
 host_test(t_swkbd SOURCES t_swkbd.c ../hle_swkbd.c PROFILE DEFS DM_TEST_GUEST_C)   # its keyboard callbacks are C functions
 host_test(t_pctl SOURCES t_pctl.c PROFILE DEFS DM_TEST_GUEST_C)   # DM_TEST_GUEST_C: the host files a test includes take their native form (hle_misc.c, hle_ro.c, hle_guestthread.c, and every GUEST_CALL site)
-host_test(t_time SOURCES t_time.c PROFILE DEFS DM_TEST_GUEST_C)   # DM_TEST_GUEST_C here and below: the included host file's native form (no arena: aot.h, "Host memory the guest sees")
+host_test(t_time SOURCES t_time.c ../libc_pass.c PROFILE DEFS DM_TEST_GUEST_C)   # DM_TEST_GUEST_C here and below: the included host file's native form (no arena: aot.h, "Host memory the guest sees").
+# libc_pass.c: the C library passthrough whose mktime / localtime_r the test reads from the swhle table (hle_table.c in Apple's Makefile)
 host_test(t_hid SOURCES t_hid.c ../hle_haptics.c PROFILE)
-host_test(t_audio_spsc SOURCES t_audio_spsc.c PROFILE SDL DEFS DM_TEST_GUEST_C)
-host_test(t_audio_sdl SOURCES t_audio_sdl.c PROFILE SDL DEFS DM_TEST_GUEST_C)
+host_test(t_audio_spsc SOURCES t_audio_spsc.c ../audio_input.c PROFILE SDL DEFS DM_TEST_GUEST_C)
+host_test(t_audio_sdl SOURCES t_audio_sdl.c ../audio_input.c PROFILE SDL DEFS DM_TEST_GUEST_C)
 host_test(t_front_sdl SOURCES t_front_sdl.c ../hle_haptics.c PROFILE SDL)
 host_test(t_audren_work SOURCES t_audren_work.c PROFILE DEFS DM_TEST_GUEST_C)
 host_test(t_nro SOURCES t_nro.c PROFILE DEFS DM_TEST_GUEST_C)
-host_test(t_fs SOURCES t_fs.c t_fs_stub.c PROFILE TMPDIR)
-host_test(t_fs_commit_list SOURCES t_fs_commit_list.c t_fs_stub.c PROFILE TMPDIR)
-host_test(t_fs_case SOURCES t_fs_case.c PROFILE TMPDIR)
+# hle_fs.c takes the local profiles (hle_account_users.c) and the cloud save sync (save_sync.c on Apple, its null form in apple_null.c here); DM_TEST_GUEST_C: its SDK calls are C calls
+host_test(t_fs SOURCES t_fs.c t_fs_stub.c ../hle_account_users.c ../apple_null.c PROFILE TMPDIR DEFS DM_TEST_GUEST_C)
+host_test(t_fs_commit_list SOURCES t_fs_commit_list.c t_fs_stub.c ../hle_account_users.c ../apple_null.c PROFILE TMPDIR DEFS DM_TEST_GUEST_C)
+host_test(t_fs_case SOURCES t_fs_case.c ../hle_account_users.c ../apple_null.c PROFILE TMPDIR DEFS DM_TEST_GUEST_C)
 host_test(t_condvar SOURCES t_condvar.c t_condvar_stub.c ../hle_thread.c PROFILE DEFS DM_TEST_HOOKS DM_TEST_GUEST_C INCLUDES ${REPO}/dm/tools/aot/include)
 host_test(t_condvar_old SOURCES t_condvar.c t_condvar_stub.c ../hle_thread.c PROFILE DEFS DM_TEST_HOOKS DM_TEST_CV_OLD_ORDER DM_TEST_GUEST_C INCLUDES ${REPO}/dm/tools/aot/include)
 host_test(t_preempt SOURCES t_preempt.c t_condvar_stub.c PROFILE DEFS DM_TEST_GUEST_C RUNS - --all-peers INCLUDES ${REPO}/dm/tools/aot/include)
@@ -735,7 +746,7 @@ target_link_libraries(t_vk_present PRIVATE nvn_front_obj nvn_vk)
 # The NVN frontend linked over the null backend (step M6): its entry points called as C functions, a device, a queue and a memory pool made, a command list recorded, submitted and
 # handed by the decoder to the null backend (dm/gfx/tests/t_frontend.c). Here only: on Apple nvn_be.h's functions are the Metal backend's
 host_test(t_frontend SOURCES ../../gfx/tests/t_frontend.c ../../gfx/nvn/hle_nvn.c ../../gfx/nvn/nvn_dirty.c ../../gfx/nvn/nvn_tex.c ../../gfx/nvn/nvn_state.c ../../gfx/nvn/nvn_pools.c
-          ../../gfx/nvn/nvn_replay.c ../../gfx/tex/nvn_deswizzle.c PROFILE DEFS DM_TEST_GUEST_C INCLUDES ${REPO}/dm/gfx/nvn ${REPO}/dm/gfx/nvn/include)
+          ../../gfx/nvn/nvn_replay.c ../../gfx/nvn/nvn_capture.c ../../gfx/tex/nvn_deswizzle.c PROFILE DEFS DM_TEST_GUEST_C INCLUDES ${REPO}/dm/gfx/nvn ${REPO}/dm/gfx/nvn/include)
 target_sources(t_frontend PRIVATE ${NVN_NAMES_C})
 target_link_libraries(t_frontend PRIVATE nvn_null)
 # The host-call thunks and the host-function page: the generator's output for the synthetic entries of t_hle_thunks_entries.c, which t_hle_thunks.c includes
@@ -768,7 +779,7 @@ set(AOT_TEST_SRC)
 foreach(f IN LISTS AOT_SRC ITEMS hle_svc.c hle_thread.c thread.c loader.c)
     list(APPEND AOT_TEST_SRC ../${f})
 endforeach()
-host_test(t_aot_host SOURCES t_aot_host.c t_aot_host_entries.c t_aot_host_stub.c ${AOT_TEST_SRC} PROFILE INCLUDES ${REPO}/dm/tools/aot/include)
+host_test(t_aot_host SOURCES t_aot_host.c ../apple_null.c t_aot_host_entries.c t_aot_host_stub.c ${AOT_TEST_SRC} PROFILE INCLUDES ${REPO}/dm/tools/aot/include)
 target_sources(t_aot_host PRIVATE ${T_AOT_HOST_THUNKS_C})
 target_compile_definitions(t_aot_host PRIVATE "T_AOT_CORPUS=\"${REPO}/dm/tools/aot/corpus\"" "T_AOT_PACKS=\"${NXAOT_PACKS}\"")
 set_target_properties(t_aot_host PROPERTIES ENABLE_EXPORTS ON)   # a pack's library resolves dm_aot_svc, nxaot_rt_* and the floating-point helpers against it
@@ -781,7 +792,7 @@ set_tests_properties(t_aot_host PROPERTIES TIMEOUT 600)
 # and the target it was bound to, as the program's source says (with_cleanup's calls through work_ptr, the vtables, the init and fini arrays), merged across sessions of the
 # image; a host function's target is no row; with nxaot (the environment variable NXAOT) the file round-trips through nxaot build --profile into guarded direct calls that
 # print the program's lines and bind nothing at their sites. The same packs as t_aot_host (without them, a note and a pass); its one host function has a thunk of its own
-host_test(t_aot_targets SOURCES t_aot_targets.c t_aot_host_stub.c ${AOT_TEST_SRC} PROFILE INCLUDES ${REPO}/dm/tools/aot/include)
+host_test(t_aot_targets SOURCES t_aot_targets.c ../apple_null.c t_aot_host_stub.c ${AOT_TEST_SRC} PROFILE INCLUDES ${REPO}/dm/tools/aot/include)
 target_compile_definitions(t_aot_targets PRIVATE "T_AOT_CORPUS=\"${REPO}/dm/tools/aot/corpus\"" "T_AOT_PACKS=\"${NXAOT_PACKS}\"")
 set_target_properties(t_aot_targets PROPERTIES ENABLE_EXPORTS ON)   # a pack's library resolves its imports against it
 if(NXHOST_JIT)
@@ -798,7 +809,7 @@ add_custom_command(OUTPUT ${T_AOT_MODULE_THUNKS_C}
     COMMAND ${Python3_EXECUTABLE} ${GEN_HLE_THUNKS} -o ${T_AOT_MODULE_THUNKS_C} ${TESTS}/t_aot_module_entries.c
     DEPENDS ${GEN_HLE_THUNKS} ${TESTS}/t_aot_module_entries.c ${HOST_H}
     COMMENT "host-call thunks of t_aot_module's entries" VERBATIM)
-host_test(t_aot_module SOURCES t_aot_module.c t_aot_module_entries.c t_aot_module_stub.c ${AOT_TEST_SRC} ../hle.c PROFILE INCLUDES ${REPO}/dm/tools/aot/include)
+host_test(t_aot_module SOURCES t_aot_module.c ../apple_null.c t_aot_module_entries.c t_aot_module_stub.c ${AOT_TEST_SRC} ../hle.c PROFILE INCLUDES ${REPO}/dm/tools/aot/include)
 target_sources(t_aot_module PRIVATE ${T_AOT_MODULE_THUNKS_C})
 target_compile_definitions(t_aot_module PRIVATE "T_AOT_PACKS=\"${NXAOT_PACKS}\"")
 set_target_properties(t_aot_module PROPERTIES ENABLE_EXPORTS ON)   # the pack's imports resolve against it, as against nxhost
@@ -818,7 +829,7 @@ add_custom_command(OUTPUT ${T_AOT_HOSTFN_THUNKS_C}
     COMMAND ${Python3_EXECUTABLE} ${GEN_HLE_THUNKS} -o ${T_AOT_HOSTFN_THUNKS_C} ${T_AOT_HOSTFN_GEN_SRC}
     DEPENDS ${GEN_HLE_THUNKS} ${T_AOT_HOSTFN_GEN_SRC} ${HOST_H}
     COMMENT "host-call thunks of t_aot_hostfn's entries" VERBATIM)
-host_test(t_aot_hostfn SOURCES t_aot_hostfn.c t_aot_hostfn_entries.c t_aot_module_stub.c ../libc_pass.c ../hle_ro.c ../hle_guestthread.c ${AOT_TEST_SRC} ../hle.c
+host_test(t_aot_hostfn SOURCES t_aot_hostfn.c ../apple_null.c t_aot_hostfn_entries.c t_aot_module_stub.c ../libc_pass.c ../hle_ro.c ../hle_guestthread.c ${AOT_TEST_SRC} ../hle.c
           PROFILE INCLUDES ${REPO}/dm/tools/aot/include)
 target_sources(t_aot_hostfn PRIVATE ${T_AOT_HOSTFN_THUNKS_C})
 target_compile_definitions(t_aot_hostfn PRIVATE "T_AOT_PACKS=\"${NXAOT_PACKS}\"")
@@ -831,6 +842,11 @@ set_tests_properties(t_aot_hostfn PROPERTIES TIMEOUT 300)
 # The host program itself (t_host_program.c): nxhost-run, found beside the test, run as a child process on t_aot_module's synthetic module (DM_AOT_RAW=1: it has no SDK) with
 # SDL's dummy drivers and the headless Vulkan presenter, through its window path (DM_WINDOW=1) and its windowless one; its exit status and its log lines checked; the SDK start's
 # refusal of a module set without nnMain; the usage. Without the packs only the usage and the refusal run (a note says so), as on the Windows runner
+if(NXHOST_PROGRAM)
+    # The linked forced take-over table, checked as Apple's Makefile checks dmhost after its link (nxhost-run --check-tables, loader.c dm_check_tables). Here only: a cross-built
+    # nxhost-run.exe does not run where it is built
+    add_test(NAME nxhost_check_tables COMMAND nxhost-run --check-tables)
+endif()
 if(NXHOST_PROGRAM)
     host_test(t_host_program SOURCES t_host_program.c DEFS "T_AOT_PACKS=\"${NXAOT_PACKS}\"")
     add_dependencies(t_host_program nxhost-run)
@@ -849,7 +865,7 @@ foreach(tsv IN LISTS GAME_TSVS)
 endforeach()
 add_custom_command(OUTPUT ${GAME_FILES}
     COMMAND ${Python3_EXECUTABLE} ${REPO}/dm/games/game.py runtime --all ${GEN}/files
-    DEPENDS ${REPO}/dm/games/game.py ${GAME_TSVS}
+    DEPENDS ${REPO}/dm/games/game.py ${GAME_TSVS} ${GAME_MAPS}
     COMMENT "every game profile's file (game.py runtime --all), for t_game_profile" VERBATIM)
 add_custom_target(game_profile_files DEPENDS ${GAME_FILES})
 host_test(t_game_profile SOURCES t_game_profile.c PROFILE TMPDIR)
@@ -860,7 +876,7 @@ if(NXHOST_PROGRAM)
 endif()
 # The memory SVCs' announcements to the graphics backend (hle_svc.c be_guest_map / be_guest_unmap; docs/design/vulkan-backend.md 4.2), recorded by a stub backend on
 # the small layout of t_svc_memory: which SVCs commit and decommit, the ranges, and that an unmapped range was still readable when announced
-host_test(t_guest_map SOURCES t_guest_map.c INCLUDES ${TESTS}/memory_profile)
+host_test(t_guest_map SOURCES t_guest_map.c ../apple_null.c INCLUDES ${TESTS}/memory_profile)
 
 # ---- The launcher: nxlauncher (dm/launcher; docs/settings.md, "On Windows and Linux") ----
 # Dear ImGui (dm/third_party/imgui) over SDL3's 2D renderer, so it opens on a PC without Vulkan: the games packed on this PC, each game's settings, its pack mode, Play. This file
@@ -898,13 +914,13 @@ else()
 endif()
 
 # fork() death tests
-host_test(t_heap_size SOURCES t_heap_size.c PROFILE POSIX)
+host_test(t_heap_size SOURCES t_heap_size.c PROFILE POSIX)   # its own stand-ins for hle_svc.c's exlaunch calls (upstream's, as on Apple)
 host_test(t_oe SOURCES t_oe.c PROFILE POSIX DEFS DM_TEST_GUEST_C)   # hle_oe.c's native form: its event object a plain static (no arena)
 host_test(t_fpslock SOURCES t_fpslock.c PROFILE POSIX)
 host_test(t_audren_layout SOURCES t_audren_layout.c PROFILE POSIX DEFS DM_TEST_GUEST_C)
 host_test(t_shared_font SOURCES t_shared_font.c PROFILE POSIX DEFS DM_TEST_GUEST_C)
-host_test(t_lifecycle SOURCES t_lifecycle.c PROFILE POSIX)   # the graceful exit writes the session's files in full before its suspend's bound (hle_lifecycle.c)
-host_test(t_system_event SOURCES t_system_event.c PROFILE POSIX DEFS DM_TEST_GUEST_C INCLUDES ${REPO}/dm/tools/aot/include)
+host_test(t_lifecycle SOURCES t_lifecycle.c ../apple_null.c PROFILE POSIX)   # the graceful exit writes the session's files in full before its suspend's bound (hle_lifecycle.c)
+host_test(t_system_event SOURCES t_system_event.c ../hle_misc.c PROFILE POSIX DEFS DM_TEST_GUEST_C INCLUDES ${REPO}/dm/tools/aot/include)   # hle_misc.c: the ec purchased-item take-overs it calls (as Apple's Makefile links it)
 host_test(t_symbols SOURCES t_symbols.c PROFILE POSIX)
 host_test(t_svc_memory SOURCES t_svc_memory.c POSIX INCLUDES ${TESTS}/memory_profile DEFS DM_TEST_GUEST_C)
 host_test(t_svc_memory_unlimited SOURCES t_svc_memory.c POSIX INCLUDES ${TESTS}/memory_profile DEFS DM_GAME_MEM_MAP_LIMIT=0 DM_TEST_GUEST_C)

@@ -46,8 +46,9 @@ static int find_repo(const char *argv0, char *out, size_t n) {
 
 // ---------- The Metal backend's key, as nvn_mtl.m builds it ----------
 // pso_key_fill (nvn_mtl.m): formats, sample count, blend enables, masks and alpha to coverage from S; S.blend[i] where the pass attaches a Metal format at i; for each attribute
-// location a the vertex shader reads, below 16 and below S.nattr, S.attr[a] and the stream it names when that is below 16; then pso_key_norm for a normal pass. pso_get_ records
-// pso_skey_from(&k, vs, fs, merged 0, no readable-tile description) for a normal pass
+// location a the vertex shader reads, below 32 and below S.nattr, S.attr[a] (16 and up in attr_hi, NVN2's, since upstream 90edd532) and the stream it names when that is below
+// 16; then pso_key_norm for a normal pass. pso_get_ records pso_skey_from(&k, vs, fs, merged 0, no readable-tile description) for a normal pass. The fragment variants upstream
+// added (atest, logic, border) come from the shaders' reflection, which neither this model nor nvn_pipe_from_state has: 0 in both
 static void metal_key(pso_skey *out, const nvn_draw_state *s, const char *vsk, int vss, uint32_t vin, const char *fsk, int fss,
                       const uint32_t cfmt[8], uint32_t dfmt, uint32_t sfmt, uint32_t samples) {
     pso_key k; memset(&k, 0, sizeof k);
@@ -56,7 +57,7 @@ static void metal_key(pso_skey *out, const nvn_draw_state *s, const char *vsk, i
     for (int i = 0; i < 8; i++) if (k.cfmt[i]) k.blend[i] = s->blend[i];
     for (int a = 0; a < 32; a++) {
         if (!(vin >> a & 1)) continue;
-        if (a < 16 && a < s->nattr) { k.attr[a] = s->attr[a]; int st = s->attr[a].stream; if (st < 16) k.stream[st] = s->stream[st]; }
+        if (a < 32 && a < s->nattr) { if (a < 16) k.attr[a] = s->attr[a]; else k.attr_hi[a - 16] = s->attr[a]; int st = s->attr[a].stream; if (st < 16) k.stream[st] = s->stream[st]; }
     }
     pso_key_norm(&k, 0);
     NvShader vs, fs; memset(&vs, 0, sizeof vs); memset(&fs, 0, sizeof fs);
@@ -140,20 +141,31 @@ int main(int argc, char **argv) {
     {
         memset(&d, 0, sizeof d); strcpy(d.vs.key, "abc_b");
         int n = nvn_pipe_write_row(&d, row, sizeof row);
-        const char *want = "P\tv1\tvs=abc_b@0\tfs=-@0\tc=0,0,0,0,0,0,0,0\tds=0,0\tguess=0\tms=0,0\tblend_en=0\tchmask=0\tblend=-,-,-,-,-,-,-,-\t"
-                           "attr=-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-\tstream=-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-\trast=-\tdss=-";
+        const char *want = "P\tv2\tvs=abc_b@0\tfs=-@0\tc=0,0,0,0,0,0,0,0\tds=0,0\tguess=0\tms=0,0\tblend_en=0\tchmask=0\tblend=-,-,-,-,-,-,-,-\t"
+                           "attr=-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-\tstream=-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-\trast=-\tdss=-\tatest=0\tlogic=0\tborder=0\tattr_hi=-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-";
         t("a vertex-only description writes the documented P row, character for character", n == (int)strlen(want) && !strcmp(row, want));
         t("... and reads back to the same description", nvn_pipe_parse_row(row, &e, why, sizeof why) == 0 && !memcmp(&d, &e, sizeof d));
     }
     desc_basic(&d);
     {
         int n = nvn_pipe_write_row(&d, row, sizeof row);
-        const char *want = "P\tv1\tvs=6180d0b6557e5f4c_b@0\tfs=fcec5d913dc496e4_b@1\tc=0x25,0x3f,0,0,0,0,0,0\tds=0x36,0x36\tguess=0\tms=1,0\tblend_en=0x1\tchmask=0xff\t"
-                           "blend=0.6.7.2.1.1.1.0.0.0,-,-,-,-,-,-,-\tattr=46.0.0,34.12.1,-,-,-,-,-,-,-,-,-,-,-,-,-,-\tstream=12.0,8.1,-,-,-,-,-,-,-,-,-,-,-,-,-,-\trast=-\tdss=-";
+        const char *want = "P\tv2\tvs=6180d0b6557e5f4c_b@0\tfs=fcec5d913dc496e4_b@1\tc=0x25,0x3f,0,0,0,0,0,0\tds=0x36,0x36\tguess=0\tms=1,0\tblend_en=0x1\tchmask=0xff\t"
+                           "blend=0.6.7.2.1.1.1.0.0.0,-,-,-,-,-,-,-\tattr=46.0.0,34.12.1,-,-,-,-,-,-,-,-,-,-,-,-,-,-\tstream=12.0,8.1,-,-,-,-,-,-,-,-,-,-,-,-,-,-\trast=-\tdss=-\tatest=0\tlogic=0\tborder=0\tattr_hi=-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-";
         t("a G-buffer-like description writes the documented P row", n > 0 && !strcmp(row, want));
         if (strcmp(row, want)) printf("  got  %s\n  want %s\n", row, want);
         t("... and reads back byte for byte", nvn_pipe_parse_row(row, &e, NULL, 0) == 0 && !memcmp(&d, &e, sizeof d));
         t("a trailing CR LF is ignored", (strcat(row, "\r\n"), nvn_pipe_parse_row(row, &e, NULL, 0) == 0 && !memcmp(&d, &e, sizeof d)));
+        // a v1 row, written before upstream 90edd532 grew the key: version 2 without its last four fields, read with those fields zero
+        { char v1[NVN_PIPE_ROW_MAX]; snprintf(v1, sizeof v1, "%s", row); *strstr(v1, "\tatest=") = 0; v1[3] = '1';
+          t("a v1 row still reads: the same description, the fields version 2 added zero", nvn_pipe_parse_row(v1, &e, why, sizeof why) == 0 && !memcmp(&d, &e, sizeof d)); }
+        // the key fields upstream 90edd532 added: carried by the description, its P row and the key
+        { nvn_pipe_desc x = d; x.atest = 1; x.border = 1; x.attr_hi[3] = (va_st){.fmt = 46, .offset = 16, .stream = 1}; char xr[NVN_PIPE_ROW_MAX]; pso_skey xk; nvn_pipe_desc y;
+          int xn = nvn_pipe_write_row(&x, xr, sizeof xr);
+          t("atest, border and NVN2's attribute 19: in the P row, and read back byte for byte", xn > 0 && strstr(xr, "\tatest=1\tlogic=0\tborder=1\tattr_hi=-,-,-,46.16.1,-,") != NULL
+            && nvn_pipe_parse_row(xr, &y, NULL, 0) == 0 && !memcmp(&x, &y, sizeof x));
+          t("... and through the key and back", nvn_pipe_to_key(&x, &xk) == 0 && xk.k.atest == 1 && xk.k.border == 1 && xk.k.logic == 0 && xk.k.attr_hi[3].fmt == 46
+            && nvn_pipe_from_key(&xk, &y, why, sizeof why) == 0 && y.atest == 1 && y.border == 1 && y.logic == 0 && !memcmp(&y.attr_hi, &x.attr_hi, sizeof x.attr_hi));
+          x.logic = 2; t("a variant flag beyond 1 is refused", nvn_pipe_write_row(&x, xr, sizeof xr) == -1); }
         t("to_key: RGBA8 -> RGBA8Unorm (70), R11G11B10F -> RG11B10Float (92), DEPTH32F_STENCIL8 -> Depth32Float_Stencil8 (260) in both slots",
           nvn_pipe_to_key(&d, &k) == 0 && k.k.cfmt[0] == 70 && k.k.cfmt[1] == 92 && k.k.cfmt[2] == 0 && k.k.dfmt == 260 && k.k.sfmt == 260);
         t("to_key: keys, stages, samples, enables and masks carried", !strcmp(k.vs, "6180d0b6557e5f4c_b") && !strcmp(k.fs, "fcec5d913dc496e4_b") && k.fs_stage == 1
@@ -232,8 +244,8 @@ int main(int argc, char **argv) {
     {
         desc_basic(&d); d.xstate = 1; char good[NVN_PIPE_ROW_MAX]; nvn_pipe_write_row(&d, good, sizeof good);
         struct { const char *what, *from, *to; } cases[] = {
-            {"an unknown version", "P\tv1\t", "P\tv2\t"},
-            {"no version", "P\tv1\t", "P\t"},
+            {"an unknown version", "P\tv2\t", "P\tv3\t"},
+            {"no version", "P\tv2\t", "P\t"},
             {"a field name changed", "\tc=", "\tcolor="},
             {"a colour list one short", "c=0x25,0x3f,0,0,0,0,0,0", "c=0x25,0x3f,0,0,0,0,0"},
             {"a colour list one long", "c=0x25,0x3f,0,0,0,0,0,0", "c=0x25,0x3f,0,0,0,0,0,0,0"},
@@ -251,6 +263,9 @@ int main(int argc, char **argv) {
             {"depth-stencil state cut off", "\tdss=", "\tdss"},
             {"spaces for tabs", "\tms=", " ms="},
             {"hex digits after decimal ones", "ms=1,0", "ms=1f,0"},
+            {"a version 2 field missing", "\tlogic=0", ""},
+            {"an alpha-test flag beyond 1", "atest=0", "atest=2"},
+            {"an attr_hi list one short", "attr_hi=-,-,-,-,-,-,-,-,-,-,-,-,-,-,-,-", "attr_hi=-,-,-,-,-,-,-,-,-,-,-,-,-,-,-"},
         };
         for (size_t i = 0; i < sizeof cases / sizeof *cases; i++) {
             char bad[NVN_PIPE_ROW_MAX + 64]; const char *at = strstr(good, cases[i].from);
@@ -264,7 +279,7 @@ int main(int argc, char **argv) {
         t("malformed P row refused: an extra field", nvn_pipe_parse_row(bad, &e, why, sizeof why) == -1);
         snprintf(bad, sizeof bad, "%s", good); *strstr(bad, "\trast=") = 0; strcat(bad, "\trast=-\tdss=1.1.4.1.8.8.0.0.3.0.0.3");
         t("malformed P row refused: rast=- with a depth-stencil state", nvn_pipe_parse_row(bad, &e, why, sizeof why) == -1);
-        t("a v2 row is refused naming the version", (snprintf(bad, sizeof bad, "P\tv2\tvs=a@0"), nvn_pipe_parse_row(bad, &e, why, sizeof why) == -1 && strstr(why, "version 2") != NULL));
+        t("a v3 row is refused naming the version", (snprintf(bad, sizeof bad, "P\tv3\tvs=a@0"), nvn_pipe_parse_row(bad, &e, why, sizeof why) == -1 && strstr(why, "version 3") != NULL));
         t("malformed R row refused: too short", nvn_pipe_parse_row("R\t00ff", &e, why, sizeof why) == -1);
         memset(bad, '0', 864); bad[0] = 'R'; bad[1] = '\t'; memset(bad + 2, '0', 864); bad[866] = 0; bad[100] = 'g';
         t("malformed R row refused: a character that is not a hex digit", nvn_pipe_parse_row(bad, &e, why, sizeof why) == -1);
@@ -291,8 +306,8 @@ int main(int argc, char **argv) {
                 b->target = rnd(8); b->src_rgb = rnd(20); b->dst_rgb = rnd(20); b->src_a = rnd(20); b->dst_a = rnd(20); b->eq_rgb = rnd(6); b->eq_a = rnd(6);
                 b->adv = rnd(8) ? 0 : rnd(64); b->adv_npm = rnd(2); b->adv_ovl = rnd(3);
             }
-            s.nattr = (int)rnd(17); s.nstream = (int)rnd(17);
-            for (int a = 0; a < 16; a++) { s.attr[a].fmt = rnd(0x9D); s.attr[a].offset = rnd(1u << 19); s.attr[a].stream = rnd(20); }
+            s.nattr = (int)rnd(33); s.nstream = (int)rnd(17);
+            for (int a = 0; a < 32; a++) { s.attr[a].fmt = rnd(0x9D); s.attr[a].offset = rnd(1u << 19); s.attr[a].stream = rnd(20); }
             for (int i = 0; i < 16; i++) { s.stream[i].stride = rnd(256); s.stream[i].divisor = rnd(4) ? 0 : rnd(5); }
             s.poly.cull = rnd(4); s.poly.front = rnd(2); s.poly.mode = rnd(3); s.poly.offset_en = rnd(8);
             s.ds.dt = rnd(2); s.ds.dw = rnd(2); s.ds.df = rnd(9); s.ds.st = rnd(2); s.ds.sf_f = rnd(9); s.ds.sf_b = rnd(9);

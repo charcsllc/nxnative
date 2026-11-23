@@ -309,10 +309,9 @@ static void bench_one(const char *what, int prim, int isz, int restart, uint32_t
     uint8_t *ib = isz ? ib_take((size_t)n * (size_t)isz + 4) : NULL;
     if (isz) put_stream(ib, g_v, n, isz);
     for (int i = 0; i < d; i++) { if (isz) hv_draw_idx(&g_c, prim, isz == 1 ? 0 : isz == 2 ? 1 : 2, (int)n, ib, 0, 1); else hv_draw(&g_c, prim, 0, (int)n, 1); }
-    hv_emit(&g_c, OP_END, NULL, 0);
     stats(s0);
     uint64_t c0 = thread_ns(), w0 = plat_now_ns();
-    NVNcommandHandle h = (NVNcommandHandle)(uintptr_t)g_c.base;
+    static hv_list l; NVNcommandHandle h = hv_handle(&g_c, &l);   // the records as a control list (t_vk_harness.h)
     h_nvnQueueSubmitCommands(&g_q, 1, &h);
     uint64_t c1 = thread_ns();
     h_nvnQueueFinish(&g_q);
@@ -339,9 +338,8 @@ static void bench_replay(const char *what, int d, int indexed, int churn, double
         if (indexed) hv_draw_idx(&g_c, prim, 1, prim == NVN_DRAW_PRIMITIVE_LINES ? 2 : 3, ib, 0, 1);
         else hv_draw(&g_c, prim, 0, prim == NVN_DRAW_PRIMITIVE_LINES ? 2 : 3, 1);
     }
-    hv_emit(&g_c, OP_END, NULL, 0);
     uint64_t c0 = thread_ns(), w0 = plat_now_ns();
-    NVNcommandHandle h = (NVNcommandHandle)(uintptr_t)g_c.base;
+    static hv_list l; NVNcommandHandle h = hv_handle(&g_c, &l);   // the records as a control list (t_vk_harness.h)
     h_nvnQueueSubmitCommands(&g_q, 1, &h);
     uint64_t c1 = thread_ns();
     h_nvnQueueFinish(&g_q);

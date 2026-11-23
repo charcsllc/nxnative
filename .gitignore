@@ -23,3 +23,7 @@ dm/games/*/cb_extent_vk.tsv
 Mario-vs-Donkey-Kong.xci
 
 /prod_keys_firmware/
+# coverage.py data and its JSON report (pyproject.toml, [tool.coverage.run])
+.coverage
+.coverage.*
+/coverage.json

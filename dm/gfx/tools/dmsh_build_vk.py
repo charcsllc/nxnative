@@ -33,6 +33,7 @@
 import ast, collections, concurrent.futures as cf, hashlib, heapq, json, os, re, shutil, struct, subprocess, sys, tempfile, threading, time
 HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
 import dmsh_chain, dmsh_chain_vk, dmsh_spv, dmsh_atomic   # noqa: E402
+sys.path.insert(0, os.path.join(HERE, "..", "..", "tools")); import shader_lib   # noqa: E402   dm/tools: a library's stamp (read_stamp, which upstream moved out of dmsh_chain.py)
 
 # The binding kinds the reflection names, and the nvn_refl.h kind each is (the strings are the ones nvn_refl.c reads from the Metal reflection, plus tex_dyn / samp_dyn, which the
 # Metal reflection marks by the binding's MSL name and type instead); '?' is an unrecognized binding, reported in the summary as the Metal build does
@@ -177,7 +178,7 @@ class Build:
         if not os.path.exists(dmsh_facts.TABLE): sys.exit(f'[RED] no answer table {dmsh_facts.TABLE} (it comes with the game profile; an empty table = every query answered with defaults)')
         self.dm_dir, self.cache_root, self.want = dm_dir, cache_root, want
         self.out = os.path.join(cache_root, dmsh_chain_vk.PREFIX + self.chain); os.makedirs(self.out, exist_ok=True)
-        g = dmsh_chain.read_stamp(self.out).get('game')
+        g = shader_lib.read_stamp(self.out).get('game')
         if g and g != self.game.id: sys.exit(f'[RED] {self.out} holds the shader libraries of game {g}, not {self.game.id}: give each game its own output directory')
         self.xlate = dmsh_chain_vk.xlate_cmd()   # the dll of a dotnet build with dotnet, or a published translator (dm/tools/publish_port_tools.sh) as it is
         self.cross = dmsh_chain_vk.spirv_cross()
@@ -491,7 +492,7 @@ class Build:
         unknown = [k for k in keys if k not in self.loc]
         if unknown: sys.exit(f'[RED] not in the shader map: {" ".join(unknown[:8])}')
         # A full build starts from no outputs, a partial one from none of its keys (as dmsh_build.py); the stamp goes unless a partial build keeps the current inputs
-        stamp_before = dmsh_chain.read_stamp(self.out).get('inputs')
+        stamp_before = shader_lib.read_stamp(self.out).get('inputs')
         for d in (self.out, os.path.join(self.out, 'analysis')):
             for n in os.listdir(d) if os.path.isdir(d) else []:
                 mk = re.match(r'([0-9a-f]{16})(?:_bv|_fp32|_b)?\.(?:spv|json|metal)$', n)

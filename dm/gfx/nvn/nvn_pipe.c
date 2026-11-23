@@ -55,7 +55,8 @@ int nvn_pipe_from_key(const pso_skey *k, nvn_pipe_desc *out, char *why, size_t n
     if (p->vs || p->fs || p->fsfn) return say(why, n, -1, "live pointers in the key");
     if (!key_text(k->vs) || !key_text(k->fs)) return say(why, n, -1, "shader key is not text");
     { const uint8_t *b = (const uint8_t *)k; for (size_t i = offsetof(pso_skey, fz_desc) + sizeof k->fz_desc; i < offsetof(pso_skey, k); i++) if (b[i]) return say(why, n, -1, "bits outside the NVN fields"); }
-    if (p->samples > 0xff || p->blend_en > 0xff || p->a2c > 0xff) return say(why, n, -1, "field out of range");
+    if (p->samples > 0xff || p->blend_en > 0xff || p->a2c > 0xff || p->atest > 1 || p->logic > 1 || p->border > 1) return say(why, n, -1, "field out of range");
+    if (p->border_spare) return say(why, n, -1, "bits outside the NVN fields");
     memcpy(out->vs.key, k->vs, 24); out->vs.stage = k->vs_stage;
     memcpy(out->fs.key, k->fs, 24); out->fs.stage = k->fs_stage;
     for (int i = 0; i < 10; i++) {
@@ -66,8 +67,10 @@ int nvn_pipe_from_key(const pso_skey *k, nvn_pipe_desc *out, char *why, size_t n
     }
     out->samples = (uint8_t)p->samples; out->blend_en = (uint8_t)p->blend_en; out->a2c = (uint8_t)p->a2c; out->chmask = p->chmask;
     for (int i = 0; i < 8; i++) out->blend[i] = blend_clean(p->blend[i]);
-    for (int i = 0; i < 16; i++) { out->attr[i] = attr_clean(p->attr[i]); out->stream[i] = stream_clean(p->stream[i]); }
-    if (memcmp(out->blend, p->blend, sizeof out->blend) || memcmp(out->attr, p->attr, sizeof out->attr) || memcmp(out->stream, p->stream, sizeof out->stream)) {
+    for (int i = 0; i < 16; i++) { out->attr[i] = attr_clean(p->attr[i]); out->attr_hi[i] = attr_clean(p->attr_hi[i]); out->stream[i] = stream_clean(p->stream[i]); }
+    out->atest = (uint8_t)p->atest; out->logic = (uint8_t)p->logic; out->border = (uint8_t)p->border;
+    if (memcmp(out->blend, p->blend, sizeof out->blend) || memcmp(out->attr, p->attr, sizeof out->attr) || memcmp(out->attr_hi, p->attr_hi, sizeof out->attr_hi)
+        || memcmp(out->stream, p->stream, sizeof out->stream)) {
         memset(out, 0, sizeof *out); return say(why, n, -1, "bits outside the NVN fields");
     }
     return say(why, n, 0, "");
@@ -81,7 +84,8 @@ int nvn_pipe_to_key(const nvn_pipe_desc *d, pso_skey *out) {
     for (int i = 0; i < 8; i++) { k->cfmt[i] = to_mtl(d->cfmt[i]); bad |= d->cfmt[i] && !k->cfmt[i]; }
     k->dfmt = to_mtl(d->dfmt); k->sfmt = to_mtl(d->sfmt); bad |= (d->dfmt && !k->dfmt) || (d->sfmt && !k->sfmt);
     k->samples = d->samples; k->blend_en = d->blend_en; k->chmask = d->chmask; k->a2c = d->a2c;
-    memcpy(k->blend, d->blend, sizeof k->blend); memcpy(k->attr, d->attr, sizeof k->attr); memcpy(k->stream, d->stream, sizeof k->stream);
+    memcpy(k->blend, d->blend, sizeof k->blend); memcpy(k->attr, d->attr, sizeof k->attr); memcpy(k->attr_hi, d->attr_hi, sizeof k->attr_hi); memcpy(k->stream, d->stream, sizeof k->stream);
+    k->atest = d->atest; k->logic = d->logic; k->border = d->border;
     pso_key_norm(k, 0);
     return bad ? -1 : 0;
 }
@@ -97,9 +101,9 @@ int nvn_pipe_from_state(nvn_pipe_desc *out, const nvn_draw_state *s, const char 
     // pso_key_fill: blend enables, masks and alpha to coverage from S, a target's blend state where the pass attaches it, the vertex shader's attributes and their streams
     out->blend_en = (uint8_t)s->color.blend_en; out->chmask = s->chmask.mask; out->a2c = s->ms.a2c;
     for (int i = 0; i < 8; i++) if (cfmt[i]) out->blend[i] = blend_clean(s->blend[i]);
-    for (int a = 0; a < 16; a++) {
+    for (int a = 0; a < 32; a++) {
         if (!(vs_inputs >> a & 1) || a >= s->nattr) continue;
-        out->attr[a] = attr_clean(s->attr[a]);
+        if (a < 16) out->attr[a] = attr_clean(s->attr[a]); else out->attr_hi[a - 16] = attr_clean(s->attr[a]);
         int st = s->attr[a].stream; if (st < 16) out->stream[st] = stream_clean(s->stream[st]);
     }
     // pso_key_norm for a normal pass, on the NVN formats
@@ -128,6 +132,14 @@ static void put_key(wbuf *w, const char *name, const nvn_pipe_stage *s) {
     if (s->key[0]) put(w, "\t%s=%.24s@%u", name, s->key, s->stage); else put(w, "\t%s=-@%u", name, s->stage);
 }
 static void put_fmt(wbuf *w, uint16_t f) { if (f) put(w, "%#x", f); else put(w, "0"); }
+static void put_attrs(wbuf *w, const char *name, const va_st *at) {   // attr= / attr_hi=: 16 entries
+    put(w, "\t%s=", name);
+    for (int i = 0; i < 16; i++) {
+        const va_st *a = &at[i];
+        if (i) put(w, ",");
+        if (!a->fmt && !a->offset && !a->stream) put(w, "-"); else put(w, "%u.%u.%u", (unsigned)a->fmt, (unsigned)a->offset, (unsigned)a->stream);
+    }
+}
 
 int nvn_pipe_write_row(const nvn_pipe_desc *d, char *out, size_t n) {
     if (!out || !n) return -1;
@@ -146,12 +158,7 @@ int nvn_pipe_write_row(const nvn_pipe_desc *d, char *out, size_t n) {
         else put(&w, "%u.%u.%u.%u.%u.%u.%u.%u.%u.%u", (unsigned)b->target, (unsigned)b->src_rgb, (unsigned)b->dst_rgb, (unsigned)b->src_a, (unsigned)b->dst_a,
                  (unsigned)b->eq_rgb, (unsigned)b->eq_a, (unsigned)b->adv, (unsigned)b->adv_npm, (unsigned)b->adv_ovl);
     }
-    put(&w, "\tattr=");
-    for (int i = 0; i < 16; i++) {
-        const va_st *a = &d->attr[i];
-        if (i) put(&w, ",");
-        if (!a->fmt && !a->offset && !a->stream) put(&w, "-"); else put(&w, "%u.%u.%u", (unsigned)a->fmt, (unsigned)a->offset, (unsigned)a->stream);
-    }
+    put_attrs(&w, "attr", d->attr);
     put(&w, "\tstream=");
     for (int i = 0; i < 16; i++) {
         const vs_st *s = &d->stream[i];
@@ -165,8 +172,11 @@ int nvn_pipe_write_row(const nvn_pipe_desc *d, char *out, size_t n) {
         put(&w, "\tdss=%u.%u.%u.%u.%u.%u.%u.%u.%u.%u.%u.%u", (unsigned)s->dt, (unsigned)s->dw, (unsigned)s->df, (unsigned)s->st, (unsigned)s->sf_f, (unsigned)s->sf_b,
             (unsigned)s->fail_f, (unsigned)s->zfail_f, (unsigned)s->zpass_f, (unsigned)s->fail_b, (unsigned)s->zfail_b, (unsigned)s->zpass_b);
     }
+    put(&w, "\tatest=%u\tlogic=%u\tborder=%u", d->atest, d->logic, d->border);   // version 2
+    put_attrs(&w, "attr_hi", d->attr_hi);
     // A description a P row cannot say exactly is refused: fields beyond the key without xstate, reserved bytes, bits outside the state objects' fields
-    { uint8_t z[sizeof d->rsv] = {0}; if (memcmp(d->rsv, z, sizeof z)) w.bad = 1; }
+    { uint8_t z[sizeof d->rsv] = {0}, zk[sizeof d->rsv_k] = {0}; if (memcmp(d->rsv, z, sizeof z) || memcmp(d->rsv_k, zk, sizeof zk)) w.bad = 1; }
+    if (d->atest > 1 || d->logic > 1 || d->border > 1) w.bad = 1;
     if (!d->xstate) { nvn_pipe_desc t; memset(&t, 0, sizeof t); if (memcmp(&d->ds, &t.ds, offsetof(nvn_pipe_desc, rsv) - offsetof(nvn_pipe_desc, ds))) w.bad = 1; }
     if (d->xstate > 1) w.bad = 1;
     for (int i = 0; i < 8 && !w.bad; i++) { blend_st c = blend_clean(d->blend[i]); if (memcmp(&c, &d->blend[i], sizeof c)) w.bad = 1; }
@@ -200,6 +210,18 @@ static int nums(const char **s, int count, char sep, const uint64_t *max, uint64
     return 0;
 }
 static int field_end(const char *s) { return *s == '\t' || *s == 0; }
+static int parse_attrs(const char **s, const char *name, va_st *at) {   // attr= / attr_hi=: 16 entries, '-' or fmt.offset.stream
+    static const uint64_t am[3] = {0xff, 0x7ffff, 0x1f};
+    uint64_t v[3];
+    if (lit(s, name)) return -1;
+    for (int i = 0; i < 16; i++) {
+        if (i && *(*s)++ != ',') return -1;
+        if (**s == '-') { (*s)++; continue; }
+        if (nums(s, 3, '.', am, v)) return -1;
+        at[i].fmt = (uint32_t)v[0]; at[i].offset = (uint32_t)v[1]; at[i].stream = (uint32_t)v[2];
+    }
+    return field_end(*s) ? 0 : -1;
+}
 
 static int parse_key(const char **s, const char *name, nvn_pipe_stage *st) {
     if (lit(s, name)) return -1;
@@ -224,7 +246,8 @@ static int parse_p(const char *s, nvn_pipe_desc *d, char *why, size_t n) {
     if (lit(&p, "P\t")) BAD("no P");
     if (lit(&p, "v")) BAD("no version");
     if (num(&p, 1000000, &v[0]) || !field_end(p)) BAD("version");
-    if (v[0] != NVN_PIPE_ROW_VERSION) { memset(d, 0, sizeof *d); return say(why, n, -1, "P row version %llu is not known (this reader knows v%d)", (unsigned long long)v[0], NVN_PIPE_ROW_VERSION); }
+    if (v[0] != 1 && v[0] != NVN_PIPE_ROW_VERSION) { memset(d, 0, sizeof *d); return say(why, n, -1, "P row version %llu is not known (this reader knows v1 and v%d)", (unsigned long long)v[0], NVN_PIPE_ROW_VERSION); }
+    const int version = (int)v[0];
     if (parse_key(&p, "\tvs=", &d->vs) || !field_end(p)) BAD("vs=");
     if (parse_key(&p, "\tfs=", &d->fs) || !field_end(p)) BAD("fs=");
     static const uint64_t f8[8] = {0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff, 0xffff};
@@ -251,15 +274,7 @@ static int parse_p(const char *s, nvn_pipe_desc *d, char *why, size_t n) {
         b->target = v[0]; b->src_rgb = v[1]; b->dst_rgb = v[2]; b->src_a = v[3]; b->dst_a = v[4]; b->eq_rgb = v[5]; b->eq_a = v[6]; b->adv = v[7]; b->adv_npm = v[8]; b->adv_ovl = v[9];
     }
     if (!field_end(p)) BAD("blend=");
-    if (lit(&p, "\tattr=")) BAD("attr=");
-    static const uint64_t am[3] = {0xff, 0x7ffff, 0x1f};
-    for (int i = 0; i < 16; i++) {
-        if (i && *p++ != ',') BAD("attr=");
-        if (*p == '-') { p++; continue; }
-        if (nums(&p, 3, '.', am, v)) BAD("attr=");
-        d->attr[i].fmt = (uint32_t)v[0]; d->attr[i].offset = (uint32_t)v[1]; d->attr[i].stream = (uint32_t)v[2];
-    }
-    if (!field_end(p)) BAD("attr=");
+    if (parse_attrs(&p, "\tattr=", d->attr)) BAD("attr=");
     if (lit(&p, "\tstream=")) BAD("stream=");
     static const uint64_t sm[2] = {0xffffffffu, 0xffffffffu};
     for (int i = 0; i < 16; i++) {
@@ -284,6 +299,16 @@ static int parse_p(const char *s, nvn_pipe_desc *d, char *why, size_t n) {
         s->dt = v[0]; s->dw = v[1]; s->df = v[2]; s->st = v[3]; s->sf_f = v[4]; s->sf_b = v[5];
         s->fail_f = v[6]; s->zfail_f = v[7]; s->zpass_f = v[8]; s->fail_b = v[9]; s->zfail_b = v[10]; s->zpass_b = v[11];
         d->xstate = 1;
+    }
+    if (version >= 2) {   // the fields version 2 added
+        static const uint64_t one[1] = {1};
+        if (lit(&p, "\tatest=") || nums(&p, 1, ',', one, v) || !field_end(p)) BAD("atest=");
+        d->atest = (uint8_t)v[0];
+        if (lit(&p, "\tlogic=") || nums(&p, 1, ',', one, v) || !field_end(p)) BAD("logic=");
+        d->logic = (uint8_t)v[0];
+        if (lit(&p, "\tborder=") || nums(&p, 1, ',', one, v) || !field_end(p)) BAD("border=");
+        d->border = (uint8_t)v[0];
+        if (parse_attrs(&p, "\tattr_hi=", d->attr_hi)) BAD("attr_hi=");
     }
     if (*p) BAD("extra fields");
 #undef BAD

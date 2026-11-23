@@ -47,6 +47,7 @@ int hvk_win_ready(void);        // presents go to the window presenter: it is on
 // after the timeline value wait_val of wait (VK_NULL_HANDLE: none). Returns the ticket (be_present_wait), 0 when the frame is not shown (logged once)
 uint64_t hvk_win_present(VkImage image, VkFormat fmt, VkImageLayout layout, uint32_t w, uint32_t h, const int crop[4], int flip, VkSemaphore wait, uint64_t wait_val);
 void hvk_win_present_wait(uint64_t ticket);   // the present of ticket no longer reads its image
+int hvk_win_present_done(uint64_t ticket);    // the same without waiting: 1 when it no longer reads it
 void hvk_win_flush(void);                     // every present so far no longer reads its image
 void hvk_win_shutdown(void);                  // the threads stopped, every object released, the surface destroyed (before hostvk_destroy)
 // The game's window registered a texture (decision D12): be_xv_window_tex (nvnWindowInitialize hands the backend each texture of the window builder's SetTextures) and be_ext_tex
@@ -63,6 +64,7 @@ int hvk_vsync_rate(void);
 int hvk_vsync_stalled(void);
 int hvk_vsync_wait(int vsyncs, uint64_t timeout_ns);
 int hvk_vsync_wait_ticks(int ticks, uint64_t timeout_ns);
+int hvk_vsync_ready_ticks(int ticks);   // hvk_vsync_wait_ticks would return at once
 int hvk_vsync_wait_vsync(uint64_t *seen, uint64_t timeout_ns);
 
 // ---------- Test hooks (dm/host/tests/t_vk_present.c) ----------

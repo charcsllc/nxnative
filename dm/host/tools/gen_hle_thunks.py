@@ -4,8 +4,9 @@
 Recompiled guest code (docs/design/aot-recompiler.md, section 2.4) calls a host function through its slot in the host-function page (dm/host/aot_hostfn.c);
 the dispatcher maps the slot to a thunk, which reads the arguments from the guest state block (dm_guest_state, dm/tools/aot/include/nxaot/guest_state.h) as
 AAPCS64 passes them, calls the C function on the host thread's own stack and writes its result back to the block. This script reads the host sources given on
-its command line, finds every HLE(, HLE_FORCE( and HLE_FORCE_BIG( entry (hle.h), also through a file's own wrapper macros (hle_net.c's SKF) and aliases
-(hle_fs.c's #define HLE_FORCE HLE_FORCE_BIG), the NVN interface layer's NVN( and NVN_NOPROTO( entries (dm/gfx/nvn/hle_nvn.c: NVN(name, ret, params...), the
+its command line, finds every HLE(, HLE_FORCE( and HLE_FORCE_DIRECT( entry (hle.h; the two forced kinds differ only in the stack Apple runs them on), also through a
+file's own wrapper macros (hle_net.c's SKF) and aliases of an entry macro (#define X HLE_FORCE), and checks each HLE_FORCE_ALIAS( (a forced reference bound to another guest
+symbol: no C function, so no thunk) against the forced entries, the NVN interface layer's NVN( and NVN_NOPROTO( entries (dm/gfx/nvn/hle_nvn.c: NVN(name, ret, params...), the
 entry named by the NVN function's name, its C function h_<name>), the guest Vulkan layer's VK( and VKB( entries of the same form (dm/gfx/hostvk/guest_vk.c: named
 by the Vulkan function's name, registered in the HLE table) and the guest OpenGL layer's GL(, GLB( and EGL( entries, also of that form (dm/gfx/hostvk/guest_gl.c: named
 by the GL or EGL function's name, in the HLE table; their GL types are the layer's own typedefs), the C library passthrough's PASS( entries of the same form
@@ -28,9 +29,14 @@ Parameter types come from the C spelling, the pointers, and the typedefs of the 
 file, then in the -I directories, as the compiler finds them); a Khronos Vulkan header (<vulkan/...>, in angle brackets or quotes) found in the -I directories
 is read by rules of its own (learn_vulkan_header: its include guard and platform conditionals would hide every typedef from the C reader). A struct whose one
 member is a 64-bit integer (NVN's separate texture and sampler handles) is
-passed as that integer: AAPCS64 gives an 8-byte composite one x register, and the host ABIs (System V, Windows x64) one integer register. A type the script
-does not know (any other struct or union by value, a sub-32-bit parameter, ..., an unknown typedef), an entry inside a preprocessor conditional other than
-#if 0 / #if 1 (and #ifdef / #ifndef __cplusplus, which is never defined in these C sources), or a C name used by two entries stops the run with file:line.
+passed as that integer: AAPCS64 gives an 8-byte composite one x register, and the host ABIs (System V, Windows x64) one integer register. A typedef'd struct of
+integer and pointer members (their own widths, arrays of them; no float, no bit-field, no nested struct) is an aggregate (AAPCS64 B.3, C.10-C.13): up to 16 bytes in one or
+two x registers (both, or the stack slots when fewer remain), larger by reference (its address in the next x register); returned in x0 and x1 up to 16 bytes, else into the
+memory x8 points at. The thunk declares a struct of the same members, so the host ABI (System V, Windows x64) passes it as the definition's own does. A sub-32-bit parameter
+(bool, a 16-bit integer: AAPCS64 leaves the register's upper bits unspecified, and the Switch caller does not extend it) is read as its low bits; hle.h asks entries to take
+such values as int or unsigned on Apple, where the callee assumes them extended. A type the script does not know (a union or a struct with other members by value, ..., an
+unknown typedef), an entry inside a preprocessor conditional other than #if 0 / #if 1 (and #ifdef / #ifndef __cplusplus, which is never defined in these C sources),
+or a C name used by two entries stops the run with file:line.
 
 The arena guard (DM_AOT_ARENA_CHECK=1; dm/host/aot.h, "Host memory the guest sees"): every thunk of an entry with pointer parameters or a pointer result checks them,
 before and after the call, against the arena below 2^39 (DM_AOT_ARENA_BASE and DM_AOT_ARENA_SIZE, read from dm/host/aot.h), and logs a [RED] line once per entry
@@ -45,10 +51,10 @@ import os
 import re
 import sys
 
-MACROS = {"HLE": 3, "HLE_FORCE": 4, "HLE_FORCE_BIG": 4, "NVN": 2, "NVN_NOPROTO": 2, "VK": 2, "VKB": 2, "GL": 2, "GLB": 2, "EGL": 2, "PASS": 2}   # macro -> index of the first parameter argument (mangled, [why,] ret, cname, params...; name, ret, params...)
+MACROS = {"HLE": 3, "HLE_FORCE": 4, "HLE_FORCE_DIRECT": 4, "HLE_FORCE_ALIAS": 3, "NVN": 2, "NVN_NOPROTO": 2, "VK": 2, "VKB": 2, "GL": 2, "GLB": 2, "EGL": 2, "PASS": 2}   # macro -> index of the first parameter argument (mangled, [why,] ret, cname, params...; name, ret, params...)
 NAMED = {"NVN", "NVN_NOPROTO", "VK", "VKB", "GL", "GLB", "EGL", "PASS"}   # entries named by an identifier, the API function's name, whose C function is <prefix><name> (dm/gfx/nvn/hle_nvn.c, dm/gfx/hostvk/guest_vk.c, guest_gl.c, dm/host/libc_pass.c)
 PREFIX = {"PASS": "libc_"}   # a named entry's C function prefix, h_ when not listed
-TABLES = {"HLE": "hle", "HLE_FORCE": "force", "HLE_FORCE_BIG": "force", "NVN": "nvn", "NVN_NOPROTO": "nvn", "VK": "hle", "VKB": "hle", "GL": "hle", "GLB": "hle", "EGL": "hle",
+TABLES = {"HLE": "hle", "HLE_FORCE": "force", "HLE_FORCE_DIRECT": "force", "HLE_FORCE_ALIAS": "force", "NVN": "nvn", "NVN_NOPROTO": "nvn", "VK": "hle", "VKB": "hle", "GL": "hle", "GLB": "hle", "EGL": "hle",
           "PASS": "hle", "HLE_LINKAGE": "hostfn"}   # the host table each entry registers in (a name is unique within one; HLE_LINKAGE functions are in none)
 API = {"NVN": "NVN", "NVN_NOPROTO": "NVN", "VK": "Vulkan", "VKB": "Vulkan", "GL": "GL", "GLB": "GL", "EGL": "EGL", "PASS": "C library"}   # a named entry's API, for its messages
 NATIVE = "DM_NATIVE_EXEC"   # plat.h: 1 where the guest's code runs natively (Apple arm64), 0 for every build the generator serves
@@ -297,6 +303,7 @@ def learn_typedef(scope, decl):
     bwords = [v for _, v, _ in base if v not in QUALIFIERS]
     aggregate = bool(bwords) and bwords[0] in ("struct", "union")
     single = one_member_x64(base, scope.typedefs) if aggregate and bwords[0] == "struct" else None
+    layout = struct_layout(base, scope.typedefs) if aggregate and bwords[0] == "struct" and not single else None
     for idx, p in enumerate(parts):
         n = name_at(p)
         if n is None:
@@ -307,12 +314,76 @@ def learn_typedef(scope, decl):
             scope.typedefs[name] = ("ptr", "void *")
         elif single:
             scope.typedefs[name] = single
+        elif layout:   # an aggregate the thunks pass as AAPCS64 does: ("agg", the thunk's struct name, (members, size, alignment))
+            scope.typedefs[name] = ("agg", f"hle_agg_{name}", layout)
         elif aggregate:
             scope.typedefs[name] = ("struct", " ".join(bwords[:2]))
         elif bwords and bwords[0] == "enum":
             scope.typedefs[name] = ("x32", "uint32_t")   # an enum is int-sized on every host ABI when its values fit, as the Switch passes it in a w register
         else:
             scope.typedefs[name] = resolve_words(bwords, scope.typedefs) or ("unknown", " ".join(bwords))
+
+
+# Member sizes of an aggregate (struct_layout): the integer classes by their canonical C type, pointers 8 bytes (every host the generator serves is 64-bit)
+AGG_SIZES = {"int8_t": 1, "uint8_t": 1, "int16_t": 2, "uint16_t": 2, "int32_t": 4, "uint32_t": 4, "int64_t": 8, "uint64_t": 8, "void *": 8}
+
+
+def struct_layout(base, typedefs):
+    """The members of 'struct { ... }' in base as [(canonical C type, count)] with the struct's size and alignment, when every member is an integer, a pointer or an array
+    of them; None otherwise (a float, a nested struct, a bit-field, a function pointer member)"""
+    vals = [v for _, v, _ in base]
+    if vals.count("{") != 1 or vals.count("}") != 1:
+        return None
+    body = base[vals.index("{") + 1:vals.index("}")]
+    members, decl = [], []
+    for t in body + [("p", ";", 0)]:
+        if t[1] != ";":
+            decl.append(t); continue
+        if not decl:
+            continue
+        if any(v in ("(", ":", "{") for _, v, _ in decl):
+            return None
+        parts, cur = [], []
+        for d in decl:
+            if d[1] == ",": parts.append(cur); cur = []
+            else: cur.append(d)
+        parts.append(cur); decl = []
+        first = parts[0]
+        nk = max((k for k, (kind, v, _) in enumerate(first) if kind == "id" and v not in QUALIFIERS and (k + 1 == len(first) or first[k + 1][1] == "[")), default=None)
+        if nk is None or nk == 0:
+            return None
+        tw = [v for _, v, _ in first[:nk] if v not in QUALIFIERS]
+        for idx, part in enumerate(parts):
+            toks = part if idx else first[nk:]
+            stars = sum(1 for _, v, _ in (first[:nk] if idx == 0 else []) if v == "*") + sum(1 for _, v, _ in toks if v == "*")
+            toks = [t2 for t2 in toks if t2[1] != "*"]
+            if not toks or toks[0][0] != "id":
+                return None
+            count = 1
+            rest = [v for _, v, _ in toks[1:]]
+            while rest:
+                if len(rest) < 3 or rest[0] != "[" or rest[2] != "]":
+                    return None
+                try: count *= int(rest[1], 0)
+                except ValueError: return None
+                rest = rest[3:]
+            if stars:
+                ctype = "void *"
+            else:
+                words = [w for w in tw if w != "*"]
+                r = resolve_words(words, typedefs)
+                if not r or r[0] not in ("x32", "x64", "small") or r[1] not in AGG_SIZES:
+                    return None
+                ctype = r[1]
+            members.append((ctype, count))
+    if not members:
+        return None
+    off, align = 0, 1
+    for ctype, count in members:
+        sz = AGG_SIZES[ctype]
+        off = (off + sz - 1) // sz * sz + sz * count
+        align = max(align, sz)
+    return members, (off + align - 1) // align * align, align
 
 
 def one_member_x64(base, typedefs):
@@ -503,6 +574,12 @@ def parse_file(path, scope=None, entries=None, seen=None, incs=()):
 
 
 def take_entry(scope, base, name, args, path, line, entries):
+    if base == "HLE_FORCE_ALIAS":   # HLE_FORCE_ALIAS(mangled, target, why): no C function, so no thunk; kept for main's checks against the forced entries
+        if len(args) != 3 or not args[2] or any(not x or any(k != "str" for k, _, _ in x) for x in args[:2]):
+            raise GenError(f"{path}:{line}: {name}( takes three string literals: the mangled name, the mangled name of its target and why")
+        entries.append({"macro": base, "path": path, "line": line, "mangled": "".join(unescape(v) for _, v, _ in args[0]),
+                        "target": "".join(unescape(v) for _, v, _ in args[1])})
+        return
     first = MACROS[base]
     if len(args) < first + 1 or not args[first - 1]:
         raise GenError(f"{path}:{line}: {name}( with {len(args)} arguments")
@@ -578,7 +655,9 @@ def classify(toks, typedefs, path, line, what):
         raise GenError(f"{path}:{line}: {what} '{text}': unknown type '{' '.join(words)}' (known: the fixed-width integers, int, unsigned, long, size_t, "
                        "float, double, pointers, and typedefs of them in the source or its quoted headers)")
     if r[0] == "struct":
-        raise GenError(f"{path}:{line}: {what} '{text}': '{' '.join(words)}' is a {r[1]} by value, which is not supported")
+        raise GenError(f"{path}:{line}: {what} '{text}': '{' '.join(words)}' is a {r[1]} by value, which is not supported (an aggregate of integers and pointers is)")
+    if r[0] == "agg":
+        return ("agg", r)
     return r
 
 
@@ -593,6 +672,9 @@ def opaque(toks, typedefs):
 def analyse(e):
     p, ln, td = e["path"], e["line"], e["typedefs"]
     e["rcls"], e["rtype"] = classify(e["ret"], td, p, ln, "return type")
+    e["aggs"] = {}
+    if e["rcls"] == "agg":   # its struct, then the result's handling by its size (render)
+        _, name, lay = e["rtype"]; e["aggs"][name] = lay; e["rtype"] = name; e["rsize"] = lay[1]
     e["check_ret"] = e["rcls"] == "ptr" and not opaque(e["ret"], td)   # the arena guard: a pointer result
     e["checks"] = []   # the arena guard: (1-based position, register) of each pointer parameter
     params = e["params"]
@@ -612,9 +694,17 @@ def analyse(e):
         words = [v for _, v in toks]
         if e["name_arg"] is None and words[:3] in (["const", "char", "*"], ["char", "const", "*"]) and len(words) <= 4:
             e["name_arg"] = len(args)
-        if cls == "small":
-            raise GenError(f"{p}:{ln}: parameter {k + 1} '{' '.join(v for _, v in toks)}': a sub-32-bit parameter (the Switch caller does not extend it; "
-                           "hle.h: declare it as int or unsigned)")
+        if cls == "agg":
+            _, name, lay = ctype; e["aggs"][name] = lay; n = (lay[1] + 7) // 8
+            if lay[1] > 16:   # by reference: a pointer to a copy, in the next x register or stack slot (C.10)
+                args.append(("aggref", name, f"x{nx}" if nx < 8 else f"s{nsaa}"))
+                if nx < 8: nx += 1
+                else: nsaa += 8
+            elif nx + n <= 8:   # in consecutive x registers (C.12)
+                args.append(("agg", name, f"x{nx}+{n}")); nx += n
+            else:   # no room: the stack, and no further x register (C.13)
+                nx = 8; args.append(("agg", name, f"s{nsaa}+{n}")); nsaa += 8 * n
+            continue
         if cls in ("f32", "f64") and nv < 8:
             args.append((cls, ctype, f"v{nv}")); nv += 1
         elif cls not in ("f32", "f64") and nx < 8:
@@ -637,6 +727,19 @@ def load(reg, ctype):
         return f"ld_{'f' if ctype == 'float' else 'd'}((const void *)(uintptr_t)(st->sp + {n}))"
     v = f"ld_stk(st, {n})"
     return f"(void *)(uintptr_t){v}" if ctype == "void *" else f"({ctype}){v}"
+
+
+def load_arg(cls, ctype, reg):
+    """C expression of one argument: load's for a scalar; an aggregate from its registers or stack slots, or through the pointer to its copy"""
+    if cls == "agg":
+        at, n = reg.split("+"); n = int(n)
+        if at[0] == "x":
+            k = int(at[1:])
+            return f"ld_{ctype}((const uint64_t[]){{{', '.join(f'st->x[{k + i}]' for i in range(n))}}})"
+        return f"ld_{ctype}((const void *)(uintptr_t)(st->sp + {int(at[1:])}))"
+    if cls == "aggref":
+        return f"ld_{ctype}({load(reg, 'void *')})"
+    return load(reg, ctype)
 
 
 ZEXT = {"int32_t": "uint32_t", "uint32_t": "uint32_t", "int16_t": "uint16_t", "uint16_t": "uint16_t", "int8_t": "uint8_t", "uint8_t": "uint8_t"}
@@ -708,12 +811,26 @@ def render(entries, sources, bounds=None):
         w("        if (v_ >= 0x10000 && v_ - HLE_ARENA_BASE >= HLE_ARENA_SIZE && hle_arena_check()) hle_arena_bad(&(seen), (pos), v_, (cname)); \\")
         w("    } while (0)")
         w("")
+    aggs = {}
+    for e in entries:
+        for name, lay in e["aggs"].items():
+            if aggs.setdefault(name, lay) != lay:
+                raise GenError(f"{e['path']}:{e['line']}: struct {name[8:]} has another layout in another entry's file: name the two apart")
+    if aggs:
+        w("// The aggregates entries take or return by value (AAPCS64 B.3): the same members as the definitions in their files, so the host ABI passes them alike, and a loader each")
+    for name, (members, size, align) in sorted(aggs.items()):
+        body = " ".join(f"{t} m{i}{f'[{c}]' if c > 1 else ''};" for i, (t, c) in enumerate(members))
+        w(f"typedef struct {{ {body} }} {name};")
+        w(f"_Static_assert(sizeof({name}) == {size} && _Alignof({name}) == {align}, \"{name}: the layout the generator computed\");")
+        w(f"static inline {name} ld_{name}(const void *p) {{ {name} v; memcpy(&v, p, sizeof v); return v; }}")
+    if aggs:
+        w("")
     for e in entries:
         params = ", ".join(t for _, t, _ in e["args"]) or "void"
         w(f"extern {e['rtype']} {e['cname']}({params});   // {e['path']}:{e['line']}")
     w("")
     for e in entries:
-        call = f"{e['cname']}({', '.join(load(r, t) for _, t, r in e['args'])})"
+        call = f"{e['cname']}({', '.join(load_arg(c, t, r) for c, t, r in e['args'])})"
         rc = e["rcls"]
         if rc == "void":
             body = f"{call};"
@@ -729,6 +846,10 @@ def render(entries, sources, bounds=None):
             body = f"st->x[0] = (uint64_t)(int64_t){call};"
         elif rc in ("x32", "small"):
             body = f"st->x[0] = (uint64_t)({ZEXT[e['rtype']]}){call};"
+        elif rc == "agg" and e["rsize"] <= 16:   # x0 and x1 (B.6, C.10)
+            body = f"{{ {e['rtype']} r_ = {call}; uint64_t w_[2] = {{0, 0}}; memcpy(w_, &r_, sizeof r_); st->x[0] = w_[0]; st->x[1] = w_[1]; }}"
+        elif rc == "agg":   # into the memory the caller's x8 points at
+            body = f"{{ {e['rtype']} r_ = {call}; memcpy((void *)(uintptr_t)st->x[8], &r_, sizeof r_); }}"
         elif rc == "f32":
             body = f"st_f(st, {call});"
         else:
@@ -753,7 +874,7 @@ def render(entries, sources, bounds=None):
     return "\n".join(out) + "\n"
 
 
-NAMES = {"ptr": "pointer", "fnptr": "host function pointer", "x64": "64-bit integer", "x32": "32-bit integer", "xl": "long", "xul": "unsigned long",
+NAMES = {"agg": "struct in registers", "aggref": "struct by reference", "ptr": "pointer", "fnptr": "host function pointer", "x64": "64-bit integer", "x32": "32-bit integer", "xl": "long", "xul": "unsigned long",
          "small": "sub-32-bit integer", "f32": "float", "f64": "double", "void": "void"}
 
 
@@ -770,10 +891,13 @@ def main(argv=None):
     ap.add_argument("-I", dest="incs", action="append", default=[], help="a directory to find quoted headers in after the including file's own (as the compiler's -I)")
     ap.add_argument("sources", nargs="+", help="host sources: exactly the ones compiled into the host")
     a = ap.parse_args(argv)
-    errors, entries = [], []
+    errors, entries, aliases = [], [], []
     for src in a.sources:
         try:
             for e in parse_file(src, incs=tuple(a.incs)):
+                if e["macro"] == "HLE_FORCE_ALIAS":
+                    aliases.append(e)
+                    continue
                 try:
                     analyse(e)
                     entries.append(e)
@@ -791,6 +915,16 @@ def main(argv=None):
         o = by_mangled.setdefault((TABLES[e["macro"]], e["mangled"]), e)
         if o is not e:
             errors.append(f"{e['path']}:{e['line']}: duplicate entry {e['mangled']}: also at {o['path']}:{o['line']}")
+    # A forced alias binds its name to the loaded modules' definition of its target (loader.c force_lookup): its name is in the forced table like any other (one entry per name),
+    # and a target that is itself taken over would bypass that take-over, which the loader refuses at start (force_build); both are caught here first
+    for e in aliases:
+        o = by_mangled.setdefault(("force", e["mangled"]), e)
+        if o is not e:
+            errors.append(f"{e['path']}:{e['line']}: duplicate entry {e['mangled']}: also at {o['path']}:{o['line']}")
+    for e in aliases:
+        o = by_mangled.get(("force", e["target"]))
+        if o is not None and o["macro"] != "HLE_FORCE_ALIAS":
+            errors.append(f"{e['path']}:{e['line']}: forced alias {e['mangled']}: its target {e['target']} is itself taken over at {o['path']}:{o['line']}")
     if errors:
         for x in errors:
             print(f"gen_hle_thunks: error: {x}", file=sys.stderr)
@@ -816,6 +950,7 @@ def main(argv=None):
     print(f"gen_hle_thunks: parameters: {tally(c for e in entries for c, _, _ in e['args'])}; 0 unknown types")
     print(f"gen_hle_thunks: returns: {tally(e['rcls'] for e in entries)}; 0 duplicate C names")
     print(f"gen_hle_thunks: {stacked} entries read arguments from the guest stack; {longs} entries use long (32 bits on Windows)")
+    print(f"gen_hle_thunks: {len(aliases)} forced aliases (HLE_FORCE_ALIAS: bound to a guest symbol by the loader, no thunk)")
     print(f"gen_hle_thunks: arena guard (DM_AOT_ARENA_CHECK): {sum(len(e['checks']) for e in entries)} pointer parameters and {sum(1 for e in entries if e['check_ret'])} "
           f"pointer results checked in {sum(1 for e in entries if e['checks'] or e['check_ret'])} entries")
     fn = [e for e in entries if e["rcls"] == "fnptr"]

@@ -72,6 +72,16 @@ void dm_guest_frame_tick(void) {}
 module_t *module_of(const void *p) { (void)p; return NULL; }
 void dm_backtrace(uint64_t fp) { (void)fp; }
 int front_screen_max_fps(void) { return 60; }
+// The host functions upstream's frontend added calls to (90edd532): hle_svc.c's device sharing, hle_vi.c's layer crop and frame history, the front end's focus clock and its
+// capable frame rate, hle_cheats.c's per-frame cheats; none is linked here (dm/gfx/tests/t_host_stubs.c holds the same for the Mac's tests)
+void dm_device_share(const void *p, uint64_t size, int share) { (void)p; (void)size; (void)share; }
+#if !defined(T_VK_LINKS_HLE_VI)   // a test that links dm/gfx/hle_vi.c (t_vk_guest, t_vk_guest_gl, t_vk_spirv_fix) defines this before including the harness, and has hle_vi.c's own
+void dm_vi_layer_crop(int c[4]) { c[0] = c[1] = c[2] = c[3] = 0; }
+void dm_vi_frame_queued(uint64_t frame) { (void)frame; }
+#endif
+uint64_t dm_focus_in_since(void) { return 0; }
+int front_screen_capable_fps(void) { return 60; }
+void dm_cheats_present(void) {}
 int front_vk_instance_extensions(const char **names, unsigned *n) { (void)names; if (n) *n = 0; return 0; }   // no window
 static int (*g_fault_hook)(void *, int, void *);
 static void (*g_prep_hook)(void *, size_t);
@@ -269,9 +279,32 @@ static void hv_emit(hv_cmds *c, unsigned op, const void *p, size_t n) {
     if (c->used + size + 8 > c->cap) { fprintf(stderr, "command buffer full\n"); exit(2); }
     memcpy(c->base + c->used, &h, 8); if (n) memcpy(c->base + c->used + 8, p, n); c->used += size;
 }
-static void hv_submit(NVNqueue *q, hv_cmds *c) {   // the records so far, ended, submitted on q and waited for
-    hv_emit(c, OP_END, NULL, 0);
-    NVNcommandHandle h = (NVNcommandHandle)(uintptr_t)c->base;
+// A recording's control list, the handle nvnQueueSubmitCommands takes since upstream 90edd532 (nvn_obj.h ctl_e; hle_nvn.c EndRecording writes one): 8-byte entries, each a
+// piece of records (at most CTL_CHUNK_MAX bytes; a longer record a piece of its own, CTL_ONE), the last marked CTL_LAST. A piece holds no END, JUMP or CALL record: the list ends
+// with its last piece, and a called recording's pieces join the caller's list (CallCommands), so a test lays out a call or a jump as the pieces in the order they run
+typedef struct { uint64_t e[64]; int n; } hv_list;
+static void hv_list_piece(hv_list *l, const uint8_t *p, size_t n) {
+    if (l->n == 64) { fprintf(stderr, "control list full\n"); exit(2); }
+    l->e[l->n++] = ctl_e(CTL_CHUNK, p, n);
+}
+static void hv_list_add(hv_list *l, const uint8_t *p, size_t n) {   // the records at p, n bytes, as pieces of the list
+    size_t o = 0, start = 0;
+    while (o < n) {
+        op_hdr h; memcpy(&h, p + o, sizeof h);
+        if (h.size > CTL_CHUNK_MAX) { if (o > start) hv_list_piece(l, p + start, o - start); hv_list_piece(l, p + o, CTL_ONE); o += h.size; start = o; continue; }
+        if (o + h.size - start > CTL_CHUNK_MAX) { hv_list_piece(l, p + start, o - start); start = o; }
+        o += h.size;
+    }
+    if (o > start) hv_list_piece(l, p + start, o - start);
+}
+static NVNcommandHandle hv_list_handle(hv_list *l) {   // the list ended: its handle (an empty list is one empty piece)
+    if (!l->n) hv_list_piece(l, NULL, 0);
+    l->e[l->n - 1] |= CTL_LAST;
+    return (NVNcommandHandle)(uintptr_t)l->e;
+}
+static NVNcommandHandle hv_handle(const hv_cmds *c, hv_list *l) { l->n = 0; hv_list_add(l, c->base, c->used); return hv_list_handle(l); }   // the records so far, as one list
+static void hv_submit(NVNqueue *q, hv_cmds *c) {   // the records so far, as a list, submitted on q and waited for
+    static hv_list l; NVNcommandHandle h = hv_handle(c, &l);
     h_nvnQueueSubmitCommands(q, 1, &h); h_nvnQueueFinish(q);
     c->used = 0;
 }
@@ -337,10 +370,9 @@ static void hv_b2b(hv_cmds *c, const void *src, void *dst, uint64_t n) { uint64_
 static void hv_clear_color(hv_cmds *c, int index, int mask, float r, float g, float b, float a) { p_clear_color cc = {index, mask, {r, g, b, a}}; hv_emit(c, OP_CLEAR_COLOR, &cc, sizeof cc); }
 // An array of 32-bit words from a GLSL source's SPIR-V header: its byte size (the generated arrays are static)
 #define HV_SPV(name) name, sizeof name
-// The records so far, ended and submitted on q without waiting for the GPU (the replay encodes them during the call, so the command memory can be reused at once)
+// The records so far, as a list, submitted on q without waiting for the GPU (the queue copies them during the call, so the command memory can be reused at once)
 static void hv_submit_nowait(NVNqueue *q, hv_cmds *c) {
-    hv_emit(c, OP_END, NULL, 0);
-    NVNcommandHandle h = (NVNcommandHandle)(uintptr_t)c->base;
+    static hv_list l; NVNcommandHandle h = hv_handle(c, &l);
     h_nvnQueueSubmitCommands(q, 1, &h); h_nvnQueueFlush(q);
     c->used = 0;
 }
@@ -396,7 +428,7 @@ static int hv_fetch(NVNqueue *q, hv_cmds *c, const NVNprogram *prog, const NVNte
     hv_rt(c, 1, rt, NULL);
     p_set_pool tpp = {(const dpool_t *)tp}, spp = {(const dpool_t *)sp}; hv_emit(c, OP_SET_TEX_POOL, &tpp, sizeof tpp); hv_emit(c, OP_SET_SAMP_POOL, &spp, sizeof spp);
     hv_bind(c, prog, 3); hv_depth(c, 0, 0, NVN_DEPTH_FUNC_ALWAYS); hv_cull(c, NVN_FACE_NONE);
-    p_bind_tex1 b = {1, 0, (uint64_t)(uint32_t)id | (uint64_t)1 << 20, nvn_dpool_base(tp, 1), nvn_dpool_base(sp, 0)}; hv_emit(c, OP_BIND_TEX1, &b, sizeof b);
+    p_bind_tex1 b = {1, 0, (uint64_t)(uint32_t)id | (uint64_t)1 << 20}; hv_emit(c, OP_BIND_TEX1, &b, sizeof b);
     hv_draw(c, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3, 1);
     hv_submit(q, c);
     return hv_read(&target, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 0, 0, w, h, 16, out);

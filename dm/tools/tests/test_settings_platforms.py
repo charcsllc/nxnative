@@ -24,7 +24,7 @@ def load(path, name):
 settings = load(ROOT / 'dm/games/settings.py', 'launcher_settings_platforms')
 conforms = load(ROOT / 'dm/tools/tests/test_launcher_settings.py', 'launcher_settings_schema').conforms
 BOTW, WONDER, VK, GL = '01007EF00011E000', '010015100B514000', '0100535012974000', '010014E00DB56000'
-BASE = '08af422'   # the commit before the port's rows: Apple's lists must come out of it and of this tree alike (a deliberate change to Apple's rows moves BASE to that change)
+BASE = '90edd532'   # upstream as merged (origin/main 90edd532): Apple's lists must come out of it and of this tree alike (a deliberate change to Apple's rows moves BASE to that change; it was 08af422, the commit before the port's rows)
 APPLE_ONLY = {'DM_PRESENT_SNAP', 'DM_PSO_MTL4', 'DM_PSO_PREBUILD', 'DM_NVN_ENC_THREAD', 'DM_METAL_HUD', 'DM_SHOW_FPS', 'DM_TOUCH_HAPTICS'}
 
 

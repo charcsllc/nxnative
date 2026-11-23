@@ -3,9 +3,10 @@
 // backend's pipeline another. It also reads and writes the prewarm lists' pipeline rows: today's R rows (the hex of pso_skey: Metal formats, decoded through nvn_fmt_from_mtl) and
 // the portable P rows below (NVN formats), which the Vulkan backend's per-device list will hold. S and C rows (shaders, compute pipelines) are not its business.
 //
-// P row, version 1: one line, fields separated by one TAB, in this order (names are fixed; numbers are decimal, or hexadecimal with 0x where shown so):
-//   P   v1   vs=<key>@<stage>   fs=<key>@<stage>   c=<f0>,<f1>,...,<f7>   ds=<depth>,<stencil>   guess=<mask>   ms=<samples>,<a2c>   blend_en=<mask>   chmask=<mask>
-//   blend=<8 entries>   attr=<16 entries>   stream=<16 entries>   rast=<raster state>   dss=<depth-stencil state>
+// P row, version 2: one line, fields separated by one TAB, in this order (names are fixed; numbers are decimal, or hexadecimal with 0x where shown so):
+//   P   v2   vs=<key>@<stage>   fs=<key>@<stage>   c=<f0>,<f1>,...,<f7>   ds=<depth>,<stencil>   guess=<mask>   ms=<samples>,<a2c>   blend_en=<mask>   chmask=<mask>
+//   blend=<8 entries>   attr=<16 entries>   stream=<16 entries>   rast=<raster state>   dss=<depth-stencil state>   atest=<0|1>   logic=<0|1>   border=<0|1>   attr_hi=<16 entries>
+// Version 1 is version 2 without its last four fields (rows written before upstream 90edd532 grew the key); it still reads, those fields zero.
 // - <key>: the shader's content key as the shader map names it (printable ASCII without space, ',', '@' or '=', up to 24 characters), or '-' for no shader; <stage>: the stage
 //   number pso_skey holds (NvShader.stage).
 // - c=, ds=: NVN format numbers (NVNformat) in hexadecimal (0x25), 0 for no attachment. ds= gives the depth and the stencil attachment as the pass attaches them: a combined format
@@ -17,6 +18,8 @@
 // - attr=: per vertex attribute, '-' or fmt.offset.stream (va_st); stream=: per vertex stream, '-' or stride.divisor (vs_st).
 // - rast=: '-' when the row does not carry the state beyond the Metal key (an R row decoded), else cull.front.poly_mode.bias_en.depth_clamp.rast_discard.restart.logic_op.alpha_func.
 // - dss=: '-' as rast=, else dt.dw.df.st.sf_f.sf_b.fail_f.zfail_f.zpass_f.fail_b.zfail_b.zpass_b (ds_st's fields).
+// - atest=, logic=, border=: pso_key's fields of the same names (nvn_pso_skey.h): the draw had the alpha test, a logic operation, a sampler with a border-colour twin, so the
+//   Metal backend took the fragment from the shader's side library or kept its border corrections. attr_hi=: as attr=, NVN2's attributes 16 to 31 (pso_key.attr_hi).
 // A later version adds fields at the end and bumps v<N>; a reader refuses a version it does not know. nvn_pipe_parse_row(nvn_pipe_write_row(d)) gives d back byte for byte.
 //
 // Objective-C includers (the Metal replay) include this after declaring their NvShader class: nvn_pso_skey.h's helpers read its key and stage. In C the small struct below stands in.
@@ -31,8 +34,9 @@ typedef struct NvShader { int stage; char key[24]; } NvShader;   // what pso_ske
 #endif
 #include "nvn_pso_skey.h"
 
-#define NVN_PIPE_ROW_VERSION 1
-#define NVN_PIPE_ROW_MAX 1024   // a P row's longest form, with its NUL, fits in this many bytes
+#define NVN_PIPE_ROW_VERSION 2
+#define NVN_PIPE_ROW_MAX 2048   // a P row's longest form, and an R row (2 + 2 * sizeof(pso_skey) characters: 1026 since upstream 90edd532), with its NUL, fit in this many bytes
+_Static_assert(NVN_PIPE_ROW_MAX >= 2 + 2 * sizeof(pso_skey) + 1, "an R row does not fit in NVN_PIPE_ROW_MAX");
 
 typedef struct {
     char key[24];    // content key, NUL-padded, as pso_skey holds it; all zero = no shader
@@ -54,6 +58,9 @@ typedef struct {
     blend_st blend[8];       // per colour target; zero where blending is off or the target is absent
     va_st attr[16];          // the attributes the vertex shader reads (S.attr), the others zero
     vs_st stream[16];        // the streams those attributes read (S.stream), the others zero
+    va_st attr_hi[16];       // NVN2's attributes 16 to 31, as attr (pso_key.attr_hi)
+    uint8_t atest, logic, border;   // pso_key's fragment variants, 0 / 1 (nvn_pso_skey.h): drawn with the alpha test, with a logic operation, with a border-colour sampler twin
+    uint8_t rsv_k[5];        // zero (ds below is 8-byte aligned)
     // ---- Beyond the key: the rest of the pipeline state S holds (design 3.1) ----
     ds_st ds;                // depth-stencil state (its fields only; the unused bits zero)
     uint8_t cull, front, poly_mode, bias_en;   // poly_st: cull face, front face (winding as the game set it, before the queue's origin), polygon mode, depth-bias enable bits
@@ -65,13 +72,13 @@ typedef struct {
     // - the queue's origin for the winding: queue_t.origin_ll, given to the backend by be_set_queue_origin_lower_left, not in S
     // - depth mode (near 0 or -w): dev_t_.depth_mode, given by be_set_depth_zero, not in S
     // - conservative rasterization: nvnCommandBufferSetConservativeRasterEnable is only logged (hle_nvn.c); S.conservative
-    // - line mode and width: nvnCommandBufferSetLineWidth is only logged; S.line_width (and a smooth / stipple mode if the polygon state gains one)
-    // - alpha-test reference: nvnCommandBufferSetAlphaRef is only logged; S.alpha_ref (alpha_func above is recorded)
-    // - patch size: nvnCommandBufferSetPatchSize is a no-op; S.patch_size
+    // - line width: recorded since upstream 90edd532 (OP_LINE_WIDTH, S.line_width), not described here; a smooth / stipple mode if the polygon state gains one
+    // - alpha-test reference: recorded since upstream 90edd532 (OP_ALPHA_REF, S.alpha_ref), not described here (alpha_func above is)
+    // - patch size: recorded since upstream 90edd532 (OP_PATCH_SIZE, S.patch_size), not described here
     // - the geometry and tessellation stages: S.bst[2..4] hold their programs, but pso_skey names only the vertex and fragment shaders; nvn_pipe_stage gs, tcs, tes
     // - multisample state beyond the sample count and alpha to coverage (S.ms: raster samples, coverage modulation, coverage to colour, sample locations)
 } nvn_pipe_desc;
-_Static_assert(sizeof(nvn_pipe_desc) == 2 * 25 + 16 + 6 + 4 + 4 + 64 + 64 + 128 + 8 + 9 + 7, "nvn_pipe_desc has padding");
+_Static_assert(sizeof(nvn_pipe_desc) == 2 * 25 + 16 + 6 + 4 + 4 + 64 + 64 + 128 + 64 + 8 + 8 + 9 + 7, "nvn_pipe_desc has padding");
 
 // Today's key → neutral: 0, or -1 when the key is not representable, with the reason in why (n bytes; may be NULL): "merged pass", "readable-tile variant",
 // "Metal format %u has no NVN source", "live pointers in the key", "shader key is not text", "field out of range", "bits outside the NVN fields".
@@ -87,7 +94,8 @@ int nvn_pipe_parse_row(const char *line, nvn_pipe_desc *out, char *why, size_t n
 int nvn_pipe_write_row(const nvn_pipe_desc *d, char *out, size_t n);
 // From the draw state and the pass, as the Metal backend's pso_key_fill fills its key (nvn_mtl.m) but with NVN formats, and with the state beyond the key (xstate 1):
 // vs_key / fs_key: the shaders' 24-byte keys (fs_key NULL for none); vs_inputs: bit a for each NVN attribute location the vertex shader reads (its reflection's nvn_refl.v[].nvn;
-// locations of 16 and up are ignored, as the key has 16); cfmt / dfmt / sfmt: the NVN formats the pass attaches (a view's format where the view sets one), 0 for none.
+// 16 to 31 go to attr_hi, as pso_key_fill puts NVN2's into the key); cfmt / dfmt / sfmt: the NVN formats the pass attaches (a view's format where the view sets one), 0 for none.
+// atest, logic and border stay 0: they name the Metal backend's fragment variants, which it decides from the shaders' reflection (nvn_mtl.m atest_key, lop_key, border_need).
 // The result through nvn_pipe_to_key is the Metal key wherever the Metal backend attaches what the NVN formats map to (not where it attaches a shadow or keeps a base texture's
 // format, nvn_mtl.m rt_view_fmt). Returns 0, or -1 for a sample count above 255
 int nvn_pipe_from_state(nvn_pipe_desc *out, const nvn_draw_state *s, const char vs_key[24], int vs_stage, uint32_t vs_inputs, const char *fs_key, int fs_stage,

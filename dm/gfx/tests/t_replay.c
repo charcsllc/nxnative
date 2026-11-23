@@ -24,6 +24,11 @@ static int n_hook_bind;
 void nvn_state_hook_bind(uint32_t op, const p_bind_handles *b) { (void)op; (void)b; n_hook_bind++; }
 void nvn_state_hook_bind_bad(const void *rec, int n) { (void)rec; (void)n; }
 void nvn_state_hook_img_range(const p_bind_handles *b) { (void)b; }
+uint8_t nvn_state_hook_stage_mask(const prog_t *p) { (void)p; return 0; }   // the backend knows no program's stages (nvn_state.h)
+int nvn_state_hook_rt_program(const prog_t *p) { (void)p; return 0; }
+void nvn_state_hook_prog_keep(prog_t *copy, const prog_t *source) { *copy = *source; }   // the queue's copy (nvn_state_preserve)
+void nvn_state_hook_prog_drop(prog_t *p) { (void)p; }
+void nvn_state_hook_tex_keep(uint64_t serial, uint64_t old) { (void)serial; (void)old; }
 
 // ---------- The stub backend: every call is an event ----------
 typedef struct {
@@ -53,6 +58,7 @@ void be_state_dirty(uint32_t mask) { call_ev *e = note("dirty", NULL, NULL, NULL
 STUB(end) STUB(signal_event) STUB(report_counter) STUB(render_cond) STUB(fence_sync) STUB(reset_counter) STUB(fill) STUB(copy_b2b) STUB(update_ub) STUB(set_rt)
 STUB(clear_color) STUB(clear_ds) STUB(draw) STUB(draw_idx) STUB(bind_program) STUB(tf_bind) STUB(tf_state_note) STUB(tf_state) STUB(rast_discard) STUB(copy_b2t)
 STUB(copy_t2b) STUB(copy_t2t) STUB(clear_tex) STUB(dispatch) STUB(barrier)
+STUB(multi_draw) STUB(draw_tex) STUB(dlss) STUB(as_build) STUB(as_copy) STUB(bind_as) STUB(rt_dispatch)   // the records upstream 90edd532 added
 
 // ---------- Command lists in memory ----------
 typedef struct { uint64_t w[2048]; size_t n; } list_t;   // 8-byte aligned records
@@ -193,7 +199,7 @@ int main(void) {
     p_bind_buf ubo = {2, 3, 0x3000, 256}, ssbo = {4, 1, 0x4000, 128};
     p_bind_ubo_small ubs = {1, 5, 64, 0x5000};
     p_bind_handles bt; memset(&bt, 0, sizeof bt); bt.stage = 1; bt.first = 0; bt.n = 1; bt.h[0] = 7;
-    p_bind_tex1 bt1 = {0, 3, 9, 0, 0};
+    p_bind_tex1 bt1 = {0, 3, 9};
     p_bind_handles bsm; memset(&bsm, 0, sizeof bsm); bsm.stage = 1; bsm.first = 0; bsm.n = 1; bsm.h[0] = 3;
     p_bind_handles bim; memset(&bim, 0, sizeof bim); bim.stage = 1; bim.first = 0; bim.n = 1; bim.h[0] = 4;
     p_stencil st = {3, 0x0f, 0, 0, 0};
@@ -209,6 +215,7 @@ int main(void) {
     p_prim_restart pr = {1, 0xffff};
     p_rast_discard rd = {1};
     p_set_pool sp = {&pool_a};
+    p_alpha_ref ar = {0.5f}; p_patch_size ps = {4}; p_line_width lw = {2}; p_depth_bounds dbn = {1, 0.25f, 0.75f};
     struct { uint32_t op; const void *pl; size_t len; const char *calls; } T[] = {
         {OP_BEGIN, NULL, 0, ""},
         {OP_SIGNAL_EVENT, NULL, 16, "signal_event"}, {OP_REPORT_COUNTER, NULL, 16, "report_counter"}, {OP_COPY_B2B, NULL, 24, "copy_b2b"}, {OP_UPDATE_UB, NULL, 24, "update_ub"},
@@ -224,6 +231,12 @@ int main(void) {
         {OP_RENDER_COND, NULL, 16, "render_cond"}, {OP_FENCE_SYNC, NULL, 8, "fence_sync"}, {OP_TF_BIND, &tfb, sizeof tfb, "tf_bind dirty"},
         {OP_TF_STATE, &tfs, sizeof tfs, "tf_state_note dirty tf_state"}, {OP_RAST_DISCARD, &rd, sizeof rd, "rast_discard dirty"}, {OP_VP_SWIZZLE, &sw, sizeof sw, "dirty"},
         {OP_BIND_TEX1, &bt1, sizeof bt1, "dirty"}, {OP_PRIM_RESTART, &pr, sizeof pr, "dirty"}, {OP_BIND_UBO_SMALL, &ubs, sizeof ubs, "dirty"}, {OP_BIND_VBUF1, &vb1, sizeof vb1, "dirty"},
+        // the records upstream 90edd532 added: the new draws, copies and NVN2 work go to their backend functions, the new state records are applied; a wait is the queue's (a
+        // job of its own, nvn_queue.inc) and has no arm, as in the Metal replay
+        {OP_DRAW_TEX, NULL, 16, "draw_tex"}, {OP_ALPHA_REF, &ar, sizeof ar, "dirty"}, {OP_PUSH_CONST, NULL, 8, "dirty"}, {OP_DLSS, NULL, 16, "dlss"},
+        {OP_MULTI_DRAW, NULL, 16, "multi_draw"}, {OP_WAIT_EVENT, NULL, 16, ""}, {OP_WAIT_SYNC, NULL, 8, ""}, {OP_PATCH_SIZE, &ps, sizeof ps, "dirty"},
+        {OP_LINE_WIDTH, &lw, sizeof lw, "dirty"}, {OP_AS_BUILD, NULL, 32, "as_build"}, {OP_AS_COPY, NULL, 24, "as_copy"}, {OP_BIND_AS, NULL, 16, "bind_as"},
+        {OP_RT_DISPATCH, NULL, 32, "rt_dispatch"}, {OP_DEPTH_BOUNDS, &dbn, sizeof dbn, "dirty"},
         {OP_COUNT_ + 3, NULL, 8, ""},   // an unknown opcode: only its pre
     };
     enum { NT = sizeof T / sizeof T[0] };
@@ -237,7 +250,7 @@ int main(void) {
     const uint8_t *o_end = emit0(o, OP_END);
     seen[OP_END] = 1; seen[OP_JUMP] = seen[OP_CALL] = 1;   // walked above
     int all = 1; for (int op = 0; op < OP_COUNT_; op++) all &= seen[op];
-    t("the opcode list covers all 51 opcodes (with END, JUMP, CALL above)", all && OP_COUNT_ == 51);
+    t("the opcode list covers all 65 opcodes (with END, JUMP, CALL above)", all && OP_COUNT_ == 65);
     reset_ev();
     nvn_replay_exec((const uint8_t *)o->w);
     int bad = 0, i_ev = 1;   // ev[0] is list_begin

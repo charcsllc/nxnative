@@ -451,3 +451,24 @@ char *mkdtemp(char *tmpl) {   // the trailing XXXXXX become random letters until
     }
     return NULL;
 }
+
+// POSIX getpagesize, which mingw-w64 lacks: the protection granule (plat_page_size), as on the other platforms
+int getpagesize(void) { return (int)plat_page_size(); }
+int pause(void) { for (;;) Sleep(INFINITE); }
+int fsync(int fd) { return _commit(fd); }
+int plat_win32_link(const char *from, const char *to) {
+    if (CreateHardLinkA(to, from, NULL)) return 0;   // the process code page is UTF-8 (win32_utf8.manifest), so the A form takes UTF-8 paths
+    errno = GetLastError() == ERROR_ALREADY_EXISTS ? EEXIST : EIO; return -1;
+}
+int mkstemps(char *tmpl, int suffixlen) {
+    size_t n = strlen(tmpl);
+    if (suffixlen < 0 || n < (size_t)suffixlen + 6 || memcmp(tmpl + n - suffixlen - 6, "XXXXXX", 6)) { errno = EINVAL; return -1; }
+    static const char set[] = "abcdefghijklmnopqrstuvwxyz0123456789";
+    for (int tries = 0; tries < 100; tries++) {
+        for (int i = 0; i < 6; i++) tmpl[n - suffixlen - 6 + i] = set[plat_random32() % (sizeof set - 1)];
+        int fd = _open(tmpl, _O_RDWR | _O_CREAT | _O_EXCL | _O_BINARY, _S_IREAD | _S_IWRITE);
+        if (fd >= 0 || errno != EEXIST) return fd;
+    }
+    errno = EEXIST; return -1;
+}
+int fchmod(int fd, int mode) { (void)fd; (void)mode; return 0; }

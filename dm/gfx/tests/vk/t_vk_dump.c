@@ -43,6 +43,9 @@ int main(void) {
     const tex_t *rt[1] = {&target};
     char png[700], want[200]; snprintf(png, sizeof png, "%s/t_vk_dump_%%d.png", g_lib);
 
+    // The queue's worker replays a job in the frame it was submitted in (nvn_queue.inc, upstream 90edd532: be_set_frame(dm_nvn_frame_count()) when that changes), 0 here as nothing
+    // is presented: a first submission settles it, so the frames the test sets below stay
+    hv_scissor(&c, 0, 0, 16, 8); hv_submit(&q, &c);
     // Frame 11: both dumps. A blue clear folded into the pass, a red draw over the left half (8 of 16 columns)
     be_set_frame(10);
     dm_gfx_passdump_next(1); dm_gfx_texdump_next(png);

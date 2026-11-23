@@ -68,25 +68,25 @@ class CapstoneVersion(unittest.TestCase):
         self.assertNotIn('Traceback', r.stderr)
 
     def test_packer_refuses_at_its_start(self):
-        # build_ipa_from_nsp.py's prerequisite checks, the port's (--platform linux / windows) and the Apple one, before anything is extracted
+        # build_ipa_from_nsp.py's prerequisite check of the port (--platform linux / windows), before anything is extracted. The Apple builds' check_prereqs runs upstream's
+        # check_capstone (Capstone 5.x by its cs_version; test_nsp_env_checks.py tests it), and patch_nso.py refuses the rest at the rewrite
         code = textwrap.dedent('''
             import importlib.util, sys
             from pathlib import Path
             spec = importlib.util.spec_from_file_location('nsp', sys.argv[1]); nsp = importlib.util.module_from_spec(spec); spec.loader.exec_module(nsp)
             nsp._importable = lambda m: True   # lz4 and the others: there
-            for check in (lambda: nsp.check_prereqs_port({'PATH': ''}, Path(sys.argv[2])), lambda: nsp.check_prereqs({'PATH': ''}, Path('/nonexistent'))):
-                try: check(); print('passed')
-                except nsp.BuildError as e: print(e)
+            try: nsp.check_prereqs_port({'PATH': ''}, Path(sys.argv[2])); print('passed')
+            except nsp.BuildError as e: print(e)
         ''')
         for name, module, dist, refused in (('ubuntu', '4.0.2', '4.0.2', True), ('pip', '5.0.7', '5.0.9', False)):
             with self.subTest(name=name):
                 r = self.py(self.fake(name, module, dist), code, str(REPO / 'scripts/build_ipa_from_nsp.py'), str(REPO))
                 self.assertEqual(r.returncode, 0, r.stderr)
                 lines = r.stdout.splitlines()
-                self.assertEqual(len(lines), 2, r.stdout)
+                self.assertEqual(len(lines), 1, r.stdout)
                 for line in lines:
                     if refused: self.assertRegex(line, r'^capstone 4\.0\.2 \(.*\): the rewriter needs capstone 5\.0\.2 or later 5\.0\.x.*for the Python running this script')
-                    else: self.assertNotIn('capstone', line)   # past the capstone check: dotnet, Xcode and the others are what this machine lacks
+                    else: self.assertNotIn('capstone', line)   # past the capstone check: dotnet (or the bundle's nx_extract) is what this machine may lack
 
 
 if __name__ == '__main__':

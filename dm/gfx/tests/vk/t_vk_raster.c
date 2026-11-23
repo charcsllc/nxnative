@@ -142,7 +142,7 @@ int main(void) {
         hv_rt(&g_c, 1, rt, NULL);
         p_set_pool tp = {(const dpool_t *)&g_tp}, sp = {(const dpool_t *)&g_sp}; hv_emit(&g_c, OP_SET_TEX_POOL, &tp, sizeof tp); hv_emit(&g_c, OP_SET_SAMP_POOL, &sp, sizeof sp);
         hv_bind(&g_c, &g_arr, 0x1f); hv_depth(&g_c, 0, 0, NVN_DEPTH_FUNC_ALWAYS); hv_cull(&g_c, NVN_FACE_NONE);
-        for (int s = 0; s < 2; s++) { p_bind_tex1 b = {1, s, (uint64_t)(uint32_t)(1 + s) | (uint64_t)1 << 20, nvn_dpool_base(&g_tp, 1), nvn_dpool_base(&g_sp, 0)}; hv_emit(&g_c, OP_BIND_TEX1, &b, sizeof b); }
+        for (int s = 0; s < 2; s++) { p_bind_tex1 b = {1, s, (uint64_t)(uint32_t)(1 + s) | (uint64_t)1 << 20}; hv_emit(&g_c, OP_BIND_TEX1, &b, sizeof b); }
         hv_draw(&g_c, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3, 1);
         hv_submit(&g_q, &g_c);
         uint8_t px[256]; int ok = hv_read(&target, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 0, 0, 8, 8, 4, px);

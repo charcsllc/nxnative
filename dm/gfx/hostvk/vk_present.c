@@ -126,6 +126,10 @@ static uint64_t tl_submit(VkCommandBuffer cb, const VkSemaphoreSubmitInfo *waits
     return r == VK_SUCCESS ? v : 0;
 }
 static uint64_t tl_last(void) { pthread_mutex_lock(&hvk.queue_mu); uint64_t v = W.tl_n; pthread_mutex_unlock(&hvk.queue_mu); return v; }
+static int tl_done(uint64_t v) {   // the window presenter's own work up to v has finished (tl_wait without waiting)
+    uint64_t c = 0;
+    return !v || !W.tl || (vkGetSemaphoreCounterValue(hvk.d, W.tl, &c) == VK_SUCCESS && c >= v);
+}
 static void tl_wait(uint64_t v) {
     if (!v || !W.tl) return;
     VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, NULL, 0, 1, &W.tl, &v};
@@ -234,14 +238,20 @@ int hvk_vsync_active(void) { return V.on; }
 int hvk_vsync_rate(void) { return 60; }
 int hvk_vsync_stalled(void) { return 0; }   // the ticks come from a clock: they never go silent as a display link can (a present that stalls drops frames instead, hvk_win_present)
 // The display link's rule (nvn_mtl.m mtl_link_wait_ticks): when a tick has passed since the previous frame started, go at once; otherwise wait for it
+static uint64_t g_vs_started;   // the tick the last vsync wait returned at: the game's present thread only, as on Apple
+int hvk_vsync_ready_ticks(int ticks) {   // the wait below would return at once (nvn_mtl.m mtl_link_ready_ticks): no source, or the ticks have passed since it last returned
+    if (!V.on) return 1;
+    const uint64_t step = ticks < 1 ? 1 : (uint64_t)ticks;
+    pthread_mutex_lock(&v_mu); int ok = V.n >= g_vs_started + step; pthread_mutex_unlock(&v_mu);
+    return ok;
+}
 int hvk_vsync_wait_ticks(int ticks, uint64_t timeout_ns) {
     if (!V.on) return 0;
-    static uint64_t started;   // the game's present thread only, as on Apple
     const uint64_t step = ticks < 1 ? 1 : (uint64_t)ticks;
     pthread_mutex_lock(&v_mu);
-    if (V.n >= started + step) { started = V.n; pthread_mutex_unlock(&v_mu); return 1; }
+    if (V.n >= g_vs_started + step) { g_vs_started = V.n; pthread_mutex_unlock(&v_mu); return 1; }
     pthread_mutex_unlock(&v_mu);
-    return ticks_wait(&started, step, timeout_ns, 0);
+    return ticks_wait(&g_vs_started, step, timeout_ns, 0);
 }
 int hvk_vsync_wait(int vsyncs, uint64_t timeout_ns) { return hvk_vsync_wait_ticks(vsyncs < 1 ? 1 : vsyncs, timeout_ns); }   // 60 Hz ticks: one per vsync
 // hle_sdk16.c's vsync event (nvn_mtl.m mtl_link_wait_vsync): 1 at the next tick after *seen (updated), 0 without the source or at the timeout
@@ -979,6 +989,7 @@ uint64_t hvk_win_present(VkImage image, VkFormat fmt, VkImageLayout layout, uint
     return v;
 }
 void hvk_win_present_wait(uint64_t ticket) { tl_wait(ticket); }
+int hvk_win_present_done(uint64_t ticket) { return tl_done(ticket); }
 void hvk_win_flush(void) { pthread_mutex_lock(&g_mu); uint64_t t = W.last_ticket; pthread_mutex_unlock(&g_mu); tl_wait(t); }
 void hvk_win_shutdown(void) {
     pthread_mutex_lock(&g_mu); W.stop = 1; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu);

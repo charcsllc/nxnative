@@ -168,6 +168,9 @@ class Pack(unittest.TestCase):
                    mock.patch.object(nsp.shutil, 'which', side_effect=lambda name, **kw: TRUE),
                    mock.patch.object(nsp, 'scan_nsps', return_value=(TID, fam)), mock.patch.object(nsp, 'decompress_nsz', return_value=fam),
                    mock.patch.object(nsp, 'build_nx_extract', return_value='nx_extract'), mock.patch.object(nsp, 'extract', return_value=self.game),
+                   # the steps on extract's output that read what this fixture leaves out: the RomFS image's file heads (the fixture keeps a RomFS folder) and main's imports
+                   # (its NSO is a header only, a game that does not use nn::jit)
+                   mock.patch.object(nsp, 'check_formats'), mock.patch.object(nsp, 'uses_jit', return_value=False),
                    mock.patch.object(nsp, 'split_shaders', side_effect=self.split), mock.patch.object(profile_guess, 'build_sources', side_effect=lambda *a: sources(self.gfx)),
                    mock.patch.object(nsp, 'run', side_effect=self.fake_run), mock.patch.object(nsp.subprocess, 'Popen', side_effect=self.popen)):
             cm.__enter__(); self.addCleanup(cm.__exit__, None, None, None)
@@ -186,7 +189,7 @@ class Pack(unittest.TestCase):
             return types.SimpleNamespace(poll=lambda: 0, returncode=0, terminate=lambda: None, wait=lambda *a: 0)
         return REAL_POPEN(cmd, **kw)
 
-    def fake_run(self, cmd, log, env=None, cwd=None, on_line=None, ok=(0,)):
+    def fake_run(self, cmd, log, env=None, cwd=None, on_line=None, ok=(), fatal=True):
         cmd = [str(c) for c in cmd]; log = Path(log); log.parent.mkdir(parents=True, exist_ok=True)
         tool = Path(cmd[1] if cmd[0] == sys.executable else cmd[0]).name
         self.ran.append((tool, cmd)); self.tool_env[tool] = dict(env or {})
@@ -200,7 +203,11 @@ class Pack(unittest.TestCase):
             Path(cmd[-1]).write_text(json.dumps({'schema': 1, 'game': cmd[2], 'settings': [{'env': 'DM_RUMBLE', 'kind': 'toggle', 'section': 'Controls', 'label': 'Game rumble', 'note': '',
                                                                                             'default': '1', 'on': '1', 'off': '0', 'level': 'basic'}]}))
             return 0
-        if tool == 'nro_collect.py':   # the registered NRO, found loose: nro.tsv as nro_collect.py writes it (a refused online SDK too)
+        if tool == 'nx_extract':   # the package check (package_reader check_keys: the keys open every package) and the offline pages (extract_html: none, its folder stays empty)
+            if '--keys' in cmd: log.write_text(f'the keys open all {len(cmd) - 3} packages\n')
+            elif '--html' in cmd: log.write_text('html: no HtmlDocument content\n')
+            else: raise AssertionError(f'unexpected nx_extract run: {cmd}')
+        elif tool == 'nro_collect.py':   # the registered NRO, found loose: nro.tsv as nro_collect.py writes it (a refused online SDK too)
             out = Path(cmd[3]); out.mkdir(parents=True); (out / 'nro0.nro').write_bytes(self.nro)
             (out / 'nro.tsv').write_text('# name\tsha256\tsize\tnrr\twhere\n' + f'nro0\t{hashlib.sha256(self.nro).hexdigest()}\t{len(self.nro)}\tgame.nrr\tloose a.nro\n'
                                          + f'refused\t{"ef" * 32}\t256\tgame.nrr\tloose eos.nro (EOS_Platform_Create)\n')
@@ -223,7 +230,7 @@ class Pack(unittest.TestCase):
         else: raise AssertionError(f'unexpected tool run: {cmd}')
         return 0
 
-    def split(self, py, repo, roms, mains, pkg, env, logs, g, *a):   # the shader split (test_nsp_incremental.py tests it): the package and its key
+    def split(self, py, repo, roms, mains, pkg, env, logs, g, *a, glslc_play=()):   # the shader split (test_nsp_incremental.py tests it): the package and its key
         pkg.mkdir(parents=True, exist_ok=True); (pkg / 'main.bin').write_bytes(b'package'); return nsp.package_key(pkg)
 
     # ---- helpers ----
@@ -259,9 +266,9 @@ class Pack(unittest.TestCase):
 class Linux(Pack):
     def test_layout_invocations_and_reuse(self):
         self.pack()
-        # the stage lines' total is known from the start for a profile with shader tables (an NVN game's): nx_extract, the extraction, the rewrite, the shader split,
-        # the shader libraries and the packs planned at once, nothing added after the extraction ([1/6] to [6/6], not [1/5], [2/5], then [3/6])
-        self.assertEqual(nsp.PROG.plan.call_args_list[-1].args[0], 6)
+        # the stage lines' total is known from the start for a profile with shader tables (an NVN game's): the extraction, the rewrite, the shader split, the shader
+        # libraries and the packs planned at once, nothing added after the extraction ([1/5] to [5/5], not [1/4], [2/4], then [3/5]); nx_extract has no stage of its own
+        self.assertEqual(nsp.PROG.plan.call_args_list[-1].args[0], 5)
         self.assertEqual(sum(c.args[0] for c in nsp.PROG.add.call_args_list), 0)
         aot, nro_dir = self.aot, self.work / 'nro_v0'
         # the rewrite: one run per module, the profile's modules with --aot into the folder's partial copy, the NRO without (the host maps it from the game's image)
@@ -705,7 +712,9 @@ class Linux(Pack):
         (bundle / 'bin/spirv-cross').unlink(); self.assertIsNone(nsp.bundled_spirv(bundle))   # all four, or none
         (bundle / 'bin/spirv-cross').write_text('')
         seen = []
-        with mock.patch.object(nsp, 'bundled_spirv', return_value=bundle / 'bin'), mock.patch.object(nsp, 'port_font', side_effect=lambda *a: seen.append(os.environ['PATH'])):
+        # main puts the bundle's bin/ on this process's PATH and leaves restoring it to cli (as for every variable it sets): os.environ as it was for the second, checkout's run
+        with mock.patch.object(nsp, 'bundled_spirv', return_value=bundle / 'bin'), mock.patch.object(nsp, 'port_font', side_effect=lambda *a: seen.append(os.environ['PATH'])), \
+                mock.patch.dict(os.environ):
             self.pack()
         self.assertEqual(self.tool_env['dmsh_chain_vk.py']['PATH'].split(os.pathsep)[0], str(bundle / 'bin'))
         self.assertEqual(self.tool_env['dmsh_build_vk.py']['PATH'].split(os.pathsep)[0], str(bundle / 'bin'))
@@ -953,7 +962,7 @@ class Apple(unittest.TestCase):   # what the Apple builds run is as it was: no -
     def test_rewrite_without_aot(self):
         tmp = Path(tempfile.mkdtemp()).resolve(); self.addCleanup(shutil.rmtree, tmp)
         exe = tmp / 'game/ExeFS'; nso(exe / 'main', BID); (exe.parent / 'RomFS').mkdir()
-        g, cmds = types.SimpleNamespace(words=lambda k: ['main']), []
+        g, cmds = types.SimpleNamespace(words=lambda k: ['main'], modules_in=lambda exe_dir: ['main']), []
         def popen(cmd, **kw):
             cmds.append(cmd); (Path(cmd[3]) / f'{cmd[4]}.patched.bin').write_bytes(b'x')
             if '--aot' in cmd: d = Path(cmd[cmd.index('--aot') + 1]); (d / 'main.aot.tsv').write_text('m'); (d / 'main.image.bin').write_bytes(b'i')

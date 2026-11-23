@@ -21,14 +21,32 @@ REPO = Path(__file__).resolve().parents[3]
 spec = importlib.util.spec_from_file_location('package_port', REPO / 'scripts/package_port.py')
 pp = importlib.util.module_from_spec(spec); spec.loader.exec_module(pp)
 sys.path.insert(0, str(REPO / 'dm/gfx/tools'))
-import dmsh_chain, dmsh_chain_vk   # noqa: E402
+import dmsh_chain, dmsh_chain_vk, tool_lock   # noqa: E402
 
 GAMES = ('010015100B514000', '0100000000010000')   # two profiles of dm/games
-# A few of the packer's files instead of all of them (about 220 MB): the packer and what its --help imports, the chain tools with every file their versions hash and the headers,
-# the two profiles' game.tsv and game.py (which writes their files for the host's check); the bundle's check runs on these as on the whole set
+
+
+def module_imports(*entries):
+    """The repository's .py files the entries import at their module level (what runs before --help prints: not the imports inside functions), at any depth, looked up in the importing
+    file's folder, then in the folders the packer and the chain tools put on sys.path (dm/tools, dm/games, dm/gfx/tools)"""
+    import ast
+    dirs, seen, todo = [REPO / d for d in ('dm/tools', 'dm/games', 'dm/gfx/tools')], set(), [REPO / e for e in entries]
+    while todo:
+        p = todo.pop()
+        if p in seen or not p.is_file(): continue
+        seen.add(p)
+        top = [n for s in ast.parse(p.read_bytes()).body for n in ast.walk(s) if not isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+        for m in [a.name for n in top if isinstance(n, ast.Import) for a in n.names] + [n.module for n in top if isinstance(n, ast.ImportFrom) and n.module and not n.level]:
+            todo += [next((d / f'{m.split(".")[0]}.py' for d in [p.parent] + dirs if (d / f'{m.split(".")[0]}.py').is_file()), p)]
+    return sorted(p.relative_to(REPO).as_posix() for p in seen)
+
+
+# A few of the packer's files instead of all of them (about 220 MB): the packer and what it imports at its start (its --help runs in the check), the chain tools with every file
+# their versions hash, what they import, and the headers, the two profiles' game.tsv and game.py (which writes their files for the host's check); the bundle's check runs on these as
+# on the whole set
 CHAIN = sorted({os.path.normpath(f'dm/gfx/{f}') for f in dmsh_chain.FILES + dmsh_chain_vk.FILES})
-TREES = ('scripts/build_ipa_from_nsp.py', 'dm/tools/romfs.py', 'dm/gfx/nvn/dmsh_chain.h', 'dm/gfx/nvn/dmsh_chain_vk.h', *CHAIN, 'dm/games/game.py',
-         *(f'dm/games/{g}/game.tsv' for g in GAMES))
+TREES = tuple(dict.fromkeys([*module_imports('scripts/build_ipa_from_nsp.py', 'dm/gfx/tools/dmsh_chain.py', 'dm/gfx/tools/dmsh_chain_vk.py'), 'dm/tools/romfs.py',
+                             'dm/gfx/nvn/dmsh_chain.h', 'dm/gfx/nvn/dmsh_chain_vk.h', *CHAIN, 'dm/games/game.py', *(f'dm/games/{g}/game.tsv' for g in GAMES)]))
 # a stand-in for nxhost-run (dm/host/game_rt.c, main_x86.c): --game <id> of its table (@TABLE@: the profiles it was built with) or --profile <file> prints the profile line, the
 # name from the bundle's game.tsv or the file's name row; an unknown title ID is refused with a [RED] line; then the usage (no module folder), status 2
 HOST = '''#!/bin/sh
@@ -103,6 +121,7 @@ class Bundle(unittest.TestCase):
         self.assertEqual((out / 'bin/nxhost-run').read_bytes(), (self.build / 'nxhost-run').read_bytes())   # the one host, whatever the tree's GAME
         self.assertFalse((out / 'hosts').exists())
         self.assertEqual(files.pop('scripts/build_ipa_from_nsp.py'), 0o755)   # git's executable bit
+        for rel in ('scripts/pack_nup.py', 'scripts/pack_dump.py'): self.assertEqual(files.pop(rel), 0o644, rel)   # the NUP and dump readers the packer imports, beside it
         for rel in ('README.txt', 'VERSION', 'licenses/nxnative.txt', 'licenses/SDL3.txt', 'licenses/LLVM.txt', 'licenses/imgui.txt', 'licenses/dynarmic.txt',
                     'licenses/dynarmic-fmt.txt', 'licenses/libvpx-PATENTS.txt', 'licenses/fsr1.txt', 'dm/tools/romfs.py', 'dm/gfx/nvn/dmsh_chain_vk.h', f'dm/games/{GAMES[0]}/game.tsv'):
             self.assertEqual(files.pop(rel), 0o644, rel)
@@ -264,7 +283,7 @@ class Bundle(unittest.TestCase):
         self.assertEqual(rc, 1); self.assertIn('dm/gfx/tools/dmsh_chain_vk.py: exit 1', err); self.assertIn('does not match the lock: dmsh_xlate_vk_linux-x64', err)
         # with the stand-in's fingerprint in the bundle's lock (and the bundle's header written again for it) the check passes
         lock = out / 'dm/gfx/tools/dmsh_chain_vk.lock'
-        lock.write_text(lock.read_text().replace(dmsh_chain_vk.lock()['dmsh_xlate_vk_linux-x64'], dmsh_chain.sha16(out / 'bin/dmsh_xlate_vk')))
+        lock.write_text(lock.read_text().replace(dmsh_chain_vk.lock()['dmsh_xlate_vk_linux-x64'], tool_lock.sha16(out / 'bin/dmsh_xlate_vk')))
         subprocess.run([sys.executable, '-I', out / 'dm/gfx/tools/dmsh_chain_vk.py', '--header'], check=True, capture_output=True)
         with mock.patch.object(pp, 'say', lambda m: None): self.assertEqual(pp.check('linux', out, [self.build, self.aot, tools]), [])
         # a tool or the runtime's licence missing
@@ -395,7 +414,7 @@ class Bundle(unittest.TestCase):
         self.assertIn('the launcher takes its own folder\'s bin/nxhost-run, recompiler, packer and Python instead when those are another bundle\'s or gone', readme)
         # the check: with the stand-in translator's fingerprint in the bundle's lock (and its header written again), everything passes, dmsh_chain_vk.py --check-tools with bin/ only
         lock = out / 'dm/gfx/tools/dmsh_chain_vk.lock'
-        lock.write_text(lock.read_text().replace(dmsh_chain_vk.lock()['dmsh_xlate_vk_linux-x64'], dmsh_chain.sha16(out / 'bin/dmsh_xlate_vk')))
+        lock.write_text(lock.read_text().replace(dmsh_chain_vk.lock()['dmsh_xlate_vk_linux-x64'], tool_lock.sha16(out / 'bin/dmsh_xlate_vk')))
         subprocess.run([sys.executable, '-I', out / 'dm/gfx/tools/dmsh_chain_vk.py', '--header'], check=True, capture_output=True)
         said = []
         with mock.patch.object(pp, 'say', said.append): self.assertEqual(pp.check('linux', out, [self.build, self.aot, tools, py, spv]), [])

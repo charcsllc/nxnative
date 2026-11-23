@@ -160,10 +160,10 @@ int main(void) {
     CHECK(call((const void *)t_bool_ret) && st.x[0] == 0, "bool false from w0 = 0 (upper half garbage)");
     reset(); st.x[0] = 2;
     CHECK(call((const void *)t_bool_ret) && st.x[0] == 1, "bool true: x0 = 1");
-    // HLE, HLE_FORCE_BIG, the alias, the wrapper macros
+    // HLE, HLE_FORCE_DIRECT, the alias, the wrapper macros
     reset(); st.x[0] = 41; CHECK(call((const void *)t_hle_plain) && st.x[0] == 42, "HLE entry");
-    reset(); st.x[0] = 21; CHECK(call((const void *)t_big) && st.x[0] == 42, "HLE_FORCE_BIG entry");
-    reset(); st.x[0] = 14; CHECK(call((const void *)t_aliased) && st.x[0] == 42, "entry through #define HLE_FORCE HLE_FORCE_BIG");
+    reset(); st.x[0] = 21; CHECK(call((const void *)t_big) && st.x[0] == 42, "HLE_FORCE_DIRECT entry");
+    reset(); st.x[0] = 14; CHECK(call((const void *)t_aliased) && st.x[0] == 42, "entry through #define HLE_FORCE HLE_FORCE_DIRECT");
     reset(); st.x[0] = 40; CHECK(call((const void *)t_numbered_2) && st.x[0] == 42, "entry through a wrapper with # and ##");
     CHECK(dm_aot_hostfn_lookup(dm_guest_fn((const void *)t_numbered_1)) && !strcmp(dm_aot_hostfn_lookup(dm_guest_fn((const void *)t_numbered_1))->mangled, "t_numbered1E"),
           "stringized mangled name");

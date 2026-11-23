@@ -347,8 +347,8 @@ static VkImageView tex_view_of(int st, int tid, const hvk_binding *d, const nvn_
 }
 static int samp_id(int st, const nvn_rbind *s) {
     switch (s->kind) {
-        case NVN_RB_SAMP: return s->reg < 128 ? (int)(S.samp[st][s->reg] >> 20) : 0;
-        case NVN_RB_SAMPT: return s->reg < NTEX ? (int)(S.tex[st][s->reg] >> 20) : 0;
+        case NVN_RB_SAMP: return s->reg < 128 ? (int)(nvn_bound_handle(S.samp[st][s->reg]) >> 20) : 0;   // bound handles are pool-relative: the active pools' bases at use
+        case NVN_RB_SAMPT: return s->reg < NTEX ? (int)(nvn_bound_handle(S.tex[st][s->reg]) >> 20) : 0;
         case NVN_RB_SAMPI: return (int)s->reg;
         case NVN_RB_SAMPU: return nvn_sid_from_handle(nvn_ubo_handle(st, s->reg, s->off));
         default: return 0;
@@ -356,9 +356,9 @@ static int samp_id(int st, const nvn_rbind *s) {
 }
 static int tex_id(int st, const nvn_rbind *t) {
     switch (t->kind) {
-        case NVN_RB_TEX: case NVN_RB_TBUF: return (int)(nvn_tex_slot_handle(S.tex[st], S.img[st], t->reg) & 0xfffff);
+        case NVN_RB_TEX: case NVN_RB_TBUF: return (int)(nvn_bound_handle(nvn_tex_slot_handle(S.tex[st], S.img[st], t->reg)) & 0xfffff);
         case NVN_RB_TEXU: return nvn_tid_from_handle(nvn_ubo_handle(st, t->reg, t->off));
-        case NVN_RB_IMG: return t->reg < 32 ? (int)(S.img[st][t->reg] & 0xfffff) : 0;
+        case NVN_RB_IMG: return t->reg < 32 ? (int)(nvn_bound_handle(S.img[st][t->reg]) & 0xfffff) : 0;
         default: return 0;
     }
 }
@@ -368,7 +368,7 @@ static int bank_alloc(int st, int bank, const hvk_shader *sh, uint32_t base_inst
     if (!hvk_ring_alloc(DRV_SIZE, align, a)) return 0;
     if (sh && sh->rf.drv_read[bank ? 2 : 0]) {
         static const uint32_t z3[3];
-        if (!nvn_fill_driver_bank(st, bank, a->cpu, sh->rf.dyn, base_instance, dispatch ? dispatch : z3))
+        if (!nvn_fill_driver_bank(st, bank, a->cpu, sh->rf.dyn, sh->rf.pool, base_instance, dispatch ? dispatch : z3))
             HVK_RED_ONCE("stage %d shader reads driver segment c0; the storage buffer table base was never measured", st);
     } else memset(a->cpu, 0, DRV_SIZE);
     return 1;
@@ -381,7 +381,7 @@ static void dummy_ssbo(VkBuffer *buf, VkDeviceSize *off, VkDeviceSize *range) { 
 static int elem_tex(int st, const nvn_rbind *t, uint32_t k) {
     if (!t) return 0;
     switch (t->kind) {
-        case NVN_RB_TEXD: { uint64_t h = k < 128 ? (S.tex[st][k] ? S.tex[st][k] : S.tex[st][NVN_SEPTEX_SLOT0 + k]) : 0; return (int)(h & 0xfffff); }
+        case NVN_RB_TEXD: { uint64_t h = k < 128 ? (S.tex[st][k] ? S.tex[st][k] : S.tex[st][NVN_SEPTEX_SLOT0 + k]) : 0; return (int)(nvn_bound_handle(h) & 0xfffff); }
         case NVN_RB_TEXA: return (int)(nvn_c2_handle(st, t->off + 8u * k) & 0xfffff);
         case NVN_RB_TEXU: return nvn_tid_from_handle(nvn_ubo_handle(st, t->reg, t->off + 8 * (int)k));
         default: return tex_id(st, t);
@@ -391,7 +391,7 @@ static int elem_samp(int st, const nvn_rbind *s, const nvn_rbind *t, uint32_t k)
     (void)t;
     if (!s) return 0;
     switch (s->kind) {
-        case NVN_RB_SAMPD: { int sid = k < 128 ? (int)(S.samp[st][k] >> 20) : 0; if (!sid && k < NTEX) sid = (int)(S.tex[st][k] >> 20); return sid; }
+        case NVN_RB_SAMPD: { int sid = k < 128 ? (int)(nvn_bound_handle(S.samp[st][k]) >> 20) : 0; if (!sid && k < NTEX) sid = (int)(nvn_bound_handle(S.tex[st][k]) >> 20); return sid; }
         case NVN_RB_SAMPA: return (int)(nvn_c2_handle(st, s->off + 8u * k) >> 20);
         case NVN_RB_SAMPU: return nvn_sid_from_handle(nvn_ubo_handle(st, s->reg, s->off + 8 * (int)k));
         default: return samp_id(st, s);

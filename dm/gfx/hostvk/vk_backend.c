@@ -57,7 +57,7 @@ void hvk_clear_tex(const p_clear_tex *c);
 void hvk_copy_b2b(uint64_t src, uint64_t dst, uint64_t n);
 void hvk_update_ub(const void *data, uint64_t dst, uint64_t n);
 void hvk_fill(uint64_t dst, uint64_t n, uint32_t value);
-void hvk_copy_b2t(const p_copy_b2t *c, int to_buffer);
+void hvk_copy_b2t(const p_copy_b2t *c, uint32_t size, int to_buffer);
 void hvk_copy_t2t(const p_copy_t2t *c);
 void hvk_barrier(int32_t bits);
 void hvk_signal_event(volatile uint32_t *val, uint32_t mode, uint32_t v);
@@ -161,6 +161,15 @@ void be_pool_del(const void *mem) {
     if (hvk.on) { hvk_pool_del(mem); return; }
     NULLRED(); pthread_mutex_lock(&g_null_mu); nvn_pool_del(mem); pthread_mutex_unlock(&g_null_mu);
 }
+// The runs of a sparse pool a request changed (hle_nvn.c vrun_set): removed and added as be_pool_del and be_pool_add do, one by one (the Metal backend changes its table in one
+// step; here a lookup between two of them misses the run, as with the separate calls the frontend made before)
+void be_pool_replace(const void *const *del, int ndel, const void *const *add, const uint64_t *size, int nadd, uint32_t nvn_flags) {
+    for (int i = 0; i < ndel; i++) be_pool_del(del[i]);
+    for (int i = 0; i < nadd; i++) be_pool_add(add[i], size[i], nvn_flags);
+}
+void be_pool_addressed(const void *mem, uint64_t size) { (void)mem; (void)size; }   // the Metal backend's raw global memory table (the pools a shader may reach by address): no such binding here
+void be_sparse_alias_delta(int delta) { (void)delta; }   // the Metal backend's residency of aliased sparse pools: the imports are resident
+void be_sp_phys_gone(const void *mem, uint64_t size) { (void)mem; (void)size; }   // the Metal backend's shared placement sparse tiles: none here
 void be_alias_drop_pool(const void *pool) { (void)pool; }   // the Metal backend's alias table (sparse views of a pool): the Vulkan imports have none to drop
 int be_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
     if (hvk.on) return hvk_addr(addr, len, buf, off);
@@ -173,6 +182,7 @@ int be_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
     pthread_mutex_unlock(&g_null_mu);
     return ok;
 }
+int be_addr_known(uint64_t addr, uint64_t len) { void *b; uint64_t o; return be_addr(addr, len, &b, &o); }   // the imports need no residency: be_addr's answer
 // Guest memory committed / about to be decommitted (design 1.5, 1.6; hle_svc.c's memory SVCs and the x86-64 engine's arena call them): the committed ranges are recorded from the
 // first call, device or not (a game sizes its heap before it makes an NVN device), for the imports pools share where the allocation count nears the device's limit (vk_memory.c,
 // step D2); a decommit under an import releases or moves it first. Before the device's bring-up was asked for (the host program's first guest memory SVCs) nothing is missing: the
@@ -190,6 +200,19 @@ void nvn_pool_hook_del(nvn_pool *p) { if (hvk.on) hvk_pool_hook_del(p); }   // t
 void be_tex_init(const tex_t *t) { if (hvk_up()) hvk_tex_init(t); else NULLRED(); }
 void be_tex_release(tex_t *t) { if (hvk.on) hvk_tex_release(t); else NULLRED(); }
 void be_tex_cpu_written(const tex_t *t) { if (hvk_up()) hvk_tex_cpu_written(t); else NULLRED(); }
+// The CPU wrote a registered texture's pages after its first use (hle_nvn.c nvn_ft_poll): as the Metal backend's texture without a storage view, one a submission wrote stays the
+// GPU's, any other is uploaded again (MTL_REWRITE_*)
+int be_tex_cpu_rewritten(const tex_t *t) {
+    if (!hvk.on) { NULLRED(); return MTL_REWRITE_UPLOADED; }
+    if (hvk_tex_gpu_owned(t->serial)) return MTL_REWRITE_GPU;
+    hvk_tex_cpu_written(t); return MTL_REWRITE_UPLOADED;
+}
+void be_tex_linear_cpu_written(const tex_t *t) { be_tex_cpu_written(t); }   // WriteTexels into a linear texture: uploaded again from its storage
+void be_tex_gpu_written(const tex_t *t) { (void)t; }   // recorded GPU writes: the backend sees them at replay (vk_texture.c ownership)
+// A texture or program a queued job still names after the game finalized it (nvn_queue.inc keeps its copy until the job replays): the Metal backend keeps its objects alive
+// for it; this backend keeps no pins, so a texture released before a parked job replays is made again from its storage at that replay, or missing (declared once)
+void be_tex_pin(uint64_t serial) { if (!serial) return; HVK_RED_ONCE("texture pins for queued jobs (nvn_queue.inc) are not kept by the Vulkan backend: a texture finalized before a parked job replays is not kept for it"); }
+void be_tex_unpin(uint64_t serial) { (void)serial; }
 int be_tex_gpu_owned(uint64_t serial) { if (hvk.on) return hvk_tex_gpu_owned(serial); NULLRED(); return 0; }
 void be_reg_tex(int tid, const tex_t *t, const view_t *v) { if (hvk_up()) hvk_reg_tex(tid, t, v, 0); else NULLRED(); }
 void be_reg_image(int tid, const tex_t *t, const view_t *v) {   // RegisterImage declares image use (the Metal backend's mtl_reg_image): the texture gets storage use when it is made
@@ -201,6 +224,19 @@ void be_reg_image(int tid, const tex_t *t, const view_t *v) {   // RegisterImage
 void be_reg_samp(int sid, const samp_par *sp) { if (hvk_up()) hvk_reg_samp(sid, sp); else NULLRED(); }
 void be_set_tex_pool_n(int n) { atomic_store(&hvk.tex_pool_n, n); }
 void be_prog_release(prog_t *p) { if (hvk.on) { if (p && p->serial) hvk_prog_drop(p->serial); } else NULLRED(); }
+void be_set_samp_pool_n(int n) { (void)n; }   // the sampler table is sized by its registrations (vk_texture.c)
+void be_prog_forget(const prog_t *p) { (void)p; }   // the Metal backend's cached program state per draw: programs are found by serial here
+void be_prog_prefetch(const prog_t *p) { (void)p; }   // modules load at the first draw (vk_shader.c) and through the prewarm lists
+void be_prog_snapshot(prog_t *copy, const prog_t *source) { *copy = *source; }   // a queued job's copy of the program (nvn_queue.inc): the serial names the same modules
+void be_prog_snapshot_pin(prog_t *copy, const prog_t *source) { *copy = *source; }
+void be_prog_unpin(prog_t *p) { (void)p; }
+// NVN2 ray tracing (nvn_raytrace.h, nvn_accel.h): the Metal backend's own; declared here, nothing traced
+int be_rt_program_set(prog_t *program, int count, const NVNshaderData *modules, uint32_t trace_depth, uint32_t callable_depth, uint32_t flags) {
+    (void)program; (void)count; (void)modules; (void)trace_depth; (void)callable_depth; (void)flags;
+    HVK_RED_ONCE("NVN2 ray tracing programs are not implemented by the Vulkan backend: the program has no ray tracing pipeline"); return 0;
+}
+void be_rt_group_handle(const prog_t *program, const int32_t indices[3], void *out16) { (void)program; (void)indices; memset(out16, 0, 16); HVK_RED_ONCE("NVN2 ray tracing shader group handles: zero (no ray tracing pipeline on the Vulkan backend)"); }
+void be_as_sizes(const nvn_as_build *b, uint64_t *storage, uint64_t *scratch, uint64_t *update) { (void)b; *storage = *scratch = *update = 0; HVK_RED_ONCE("NVN2 acceleration structure sizes: zero (no acceleration structures on the Vulkan backend)"); }
 void be_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
     if (hvk_up()) { hvk_tex_read(t, level, layer0, r, dst, row, img); return; }
     NULLRED();   // no texture holds GPU content: the texels read are zero (only the region's rows are written, each image's at its stride)
@@ -219,17 +255,30 @@ void be_set_origin_lower_left(int on) { atomic_store(&hvk.origin_ll, on != 0); }
 // ---------- Submission and sync (hle_nvn.c holds its submission lock) ----------
 void be_queue_activate(uint64_t serial) { (void)nvn_state_queue_activate(serial); if (!hvk_up()) NULLRED(); }   // the frontend's per-queue state, as the Metal backend switches it
 void be_queue_forget(uint64_t serial) { (void)nvn_state_queue_forget(serial); if (!hvk.on) NULLRED(); }
+void be_prepare(void) { }   // the Metal backend's prewarm at the first submission: this backend's starts with the device (vk_prewarm.c hvk_prewarm_start)
 void be_sub_begin(void) { if (hvk_up()) hvk_sub_begin(); else NULLRED(); }
-void be_sub_index(const uint64_t *h, int n) { (void)h; (void)n; }   // the Metal backend's store look-ahead index: not used on Vulkan (design 1.5)
+void be_sub_ready(uint64_t guest_ns) { (void)guest_ns; }   // counter timestamps are placed at the replay here
+int be_sub_stream_on(void) { return 0; }   // the Metal backend's streamed submission (encoding while recording): one command buffer per submission here
 void be_exec_rest(const uint64_t *h, int n) { hvk_predict_rest_handles(h, n); }   // the handles still to come in the submission: the look-ahead goes on into them (vk_predict.c)
 void be_exec(const uint8_t *handle) { if (!hvk.on) NULLRED(); nvn_replay_exec(handle); }   // the frontend's decoder hands every record to the functions below
-uint64_t be_sub_commit(void) { if (hvk.on) return hvk_sub_commit(); NULLRED(); return atomic_fetch_add(&g_null_fence, 1) + 1; }
+// The bindings that outlive the submission's job move into the queue's own copies once its replay is done (nvn_state_preserve; the Metal backend does it in mtl_sub_commit)
+uint64_t be_sub_commit(void) {
+    uint64_t f; if (hvk.on) f = hvk_sub_commit(); else { NULLRED(); f = atomic_fetch_add(&g_null_fence, 1) + 1; }
+    be_state_dirty(nvn_state_preserve());
+    return f;
+}
 uint64_t be_last_fence(void) { if (hvk.on) return hvk_last(); NULLRED(); return atomic_load(&g_null_fence); }
 int be_wait(uint64_t fence, uint64_t timeout_ns) { if (hvk.on) return hvk_wait(fence, timeout_ns); NULLRED(); (void)fence; (void)timeout_ns; return 1; }
 // An acquire sync (fenced 2, by WindowAcquireTexture): the window's texture is free once the commits before the acquire completed; headless, that is the fence itself
 int be_wait_acq(uint64_t fence, uint64_t timeout_ns) { if (hvk.on) return hvk_wait(fence, timeout_ns); NULLRED(); (void)fence; (void)timeout_ns; return 1; }
 void be_finish(void) { if (hvk.on) hvk_finish(); else NULLRED(); }
 void be_drain(void) { if (hvk.on) hvk_finish(); else NULLRED(); }
+uint64_t be_completed_fence(void) { if (hvk.on) return hvk_done_fence(); return atomic_load(&g_null_fence); }   // the last submission complete (its CPU-visible effects done)
+void be_set_present_suspended(int on) { (void)on; }   // the window presenter keeps its thread; the frames a suspended game does not make are not shown
+void be_drop_queued_presents(void) { }
+void be_suspend_drain(void) { if (hvk.on) hvk_finish(); }
+void be_arch_save(int wait_ms, int ending) { (void)wait_ms; (void)ending; if (hvk.on) hvk_cache_flush(ending ? "quit" : "background"); }   // the pipeline cache's file, now (vk_cache.c)
+void be_warm_stop(void) { }   // the prewarm workers stop with the backend (hvk_prewarm_shutdown)
 
 // ---------- Presentation and pacing (design 7; the window presenter and the vsync source are vk_present.c's, step P4a) ----------
 // A present goes to the window presenter while it is on or about to start (hvk_win_ready), else to the headless presenter below. Their tickets are kept apart by WIN_TICKET, so a
@@ -237,9 +286,13 @@ void be_drain(void) { if (hvk.on) hvk_finish(); else NULLRED(); }
 #define WIN_TICKET (1ull << 62)
 static uint64_t pres_headless(uint64_t serial, VkImage image, VkFormat format, VkImageLayout layout, uint32_t iw, uint32_t ih, void *ev, uint64_t ev_val, const int crop[4]);
 static void pres_wait(uint64_t v);
+static VkSemaphore g_pres_tl;   // the headless presenter's timeline (below)
 static void pres_flush(void);
-uint64_t be_present(const tex_t *t, double period_s, const int crop[4]) {
-    (void)period_s;   // the window presenter's FIFO and the acquire's vsync wait pace the frames (hle_nvn.c); the headless one paces nothing
+static _Atomic uint64_t g_presents;   // NVN presents handed to a presenter: hle_vi.c's frame history counts them queued and done at once (be_present_progress)
+uint64_t be_present(const tex_t *t, double period_s, const int crop[4], uint64_t *copy) {
+    (void)period_s;
+    if (copy) *copy = 0;   // the Metal backend's snapshot copy: the window presenter's snapshot is part of the ticket here
+    atomic_fetch_add(&g_presents, 1);   // the window presenter's FIFO and the acquire's vsync wait pace the frames (hle_nvn.c); the headless one paces nothing
     if (!hvk.on) { NULLRED(); return 0; }
     // The window's texture as the GPU left it: a texture no submission wrote (its content the CPU's) would need an upload, which only a submission records (vk_texture.c)
     if (!t || !hvk_tex_gpu_owned(t->serial)) { HVK_RED_ONCE("present of a texture no submission wrote (first ser=%llu): not shown", (unsigned long long)(t ? t->serial : 0)); return 0; }
@@ -260,6 +313,25 @@ int be_vsync_rate(void) { return hvk_vsync_rate(); }
 int be_vsync_stalled(void) { return hvk_vsync_stalled(); }
 int be_vsync_tick(uint64_t n, double *target, double *lead_ms, int *ticks, double *gap_ms) { (void)n; (void)target; (void)lead_ms; (void)ticks; (void)gap_ms; return 0; }   // the display link's per-tick record: none here
 double be_presented_time(uint64_t n) { return hvk_win_presented_time(n); }
+void be_present_progress(uint64_t *queued, uint64_t *done) { *queued = *done = atomic_load(&g_presents); }   // a present is handed on as it is made
+void be_present_layer(uint32_t w, uint32_t h) { (void)w; (void)h; HVK_RED_ONCE("a sized vi layer (%ux%u): the Vulkan presenter keeps the display's 16:9 (the Metal backend shows the layer's shape, mtl_present_layer)", w, h); }
+void be_present_wait_texture(uint64_t ticket, uint64_t copy) { (void)copy; be_present_wait(ticket); }
+int be_present_texture_ready(uint64_t ticket, uint64_t copy) {
+    (void)copy;
+    if (!ticket) return 1;
+    if (ticket & WIN_TICKET) return hvk_win_present_done(ticket & ~WIN_TICKET);
+    uint64_t c = 0; return !g_pres_tl || (vkGetSemaphoreCounterValue(hvk.d, g_pres_tl, &c) == VK_SUCCESS && c >= ticket);
+}
+void be_present_recorded(uint64_t frame) { (void)frame; }   // the Metal backend's screen wait (DM_PRESENT_DEPTH): the window presenter's FIFO paces here
+int be_present_screen_ready(void) { return 1; }
+uint64_t be_present_screen_wait(double period) { (void)period; return 0; }
+int be_vsync_ready_tick(int vsyncs) { return hvk_vsync_ready_ticks(vsyncs < 1 ? 1 : vsyncs); }   // 60 Hz ticks: one per vsync, as hvk_vsync_wait
+int be_vsync_ready_ticks(int ticks) { return hvk_vsync_ready_ticks(ticks); }
+void be_vsync_mode_set(int mode) { (void)mode; }   // the vsync source ticks at 60 Hz (vk_present.c)
+uint64_t be_vsync_drain_take_ns(void) { return 0; }   // the display link's drain of standing frames: none here
+int be_snap_acquire_ready(void) { return 1; }   // no snapshot ring (be_snap_on)
+void be_set_fstep_fine(int on) { (void)on; }   // the Metal display link's 60 Hz showing of a 30 cap's late frames
+int be_probe_ramp_on(void) { const char *e = getenv("DM_FSTEP_PROBE_RAMP"); return !(e && !strcmp(e, "0")); }   // the frame step's probe ramp, on by default (nvn_mtl.m mtl_probe_ramp_on; no A/B here)
 int be_snap_on(void) { return 0; }   // the window presenter's snapshots free the game's texture at once by construction (design 7.2): no ring for hle_nvn.c to manage
 uint64_t be_snap_acquire_wait(void) { return 0; }
 void be_present_wait(uint64_t ticket) { if (ticket & WIN_TICKET) hvk_win_present_wait(ticket & ~WIN_TICKET); else pres_wait(ticket); }
@@ -558,10 +630,9 @@ void be_ub_present(double iv_ms) { (void)iv_ms; }
 // ---------- Statistics: what the backend counts, zero for the Metal mechanisms it has not ----------
 void be_mem_stat(unsigned long long frame, unsigned long long rss_mb) { (void)frame; (void)rss_mb; }
 void be_stats(uint64_t *passes, uint64_t *draws) { *passes = atomic_load(&hvk.st_passes); *draws = atomic_load(&hvk.st_draws); }
-void be_args_stats(uint64_t *enc, uint64_t *reuse) { uint64_t h = 0, m = 0, w = 0; if (hvk.on) hvk_desc_stats(&h, &m, &w); *enc = m; *reuse = h; }   // descriptor sets written / taken from the cache
+void be_args_stats(uint64_t *enc, uint64_t *reuse, uint64_t *patch) { uint64_t h = 0, m = 0, w = 0; if (hvk.on) hvk_desc_stats(&h, &m, &w); *enc = m; *reuse = h; *patch = 0; }   // descriptor sets written / taken from the cache
 void be_use_stats(uint64_t *call, uint64_t *skip) { *call = *skip = 0; }
 void be_vbuf_stats(uint64_t *resolve, uint64_t *reuse, uint64_t *set, uint64_t *skip, uint64_t *copies, uint64_t *copy_bytes) { *resolve = *reuse = *set = *skip = *copies = *copy_bytes = 0; }
-uint64_t be_ds_omit(void) { return 0; }
 uint64_t be_drawable_ns_take(void) { return 0; }
 void be_bw(uint64_t *load, uint64_t *store, uint64_t *full_rw_passes) { *load = *store = *full_rw_passes = 0; }
 uint64_t be_udc_saved_bytes(void) { return 0; }
@@ -618,7 +689,7 @@ uint64_t be_copy_cut_count(void) { return 0; }
 uint64_t be_blit_splits(void) { return atomic_load(&hvk.st_pass_splits); }
 void be_ubd_stats(uint64_t *deferred, uint64_t *conflicts) { *deferred = *conflicts = 0; }
 void be_ubp_stats(uint64_t *made, uint64_t *reused, uint64_t *refused) { *made = *reused = *refused = 0; }
-void be_ubp_why(uint64_t w[5]) { memset(w, 0, 5 * sizeof *w); }
+void be_ubp_why(uint64_t w[6]) { memset(w, 0, 6 * sizeof *w); }
 void be_lc_stats(uint64_t *taken, uint64_t *landed) { *taken = *landed = 0; }
 void be_sm_stats(uint64_t *np, uint64_t *nc, uint64_t *nw) { *np = *nc = *nw = 0; }
 void be_cshoist_stats(uint64_t *moved, uint64_t *depth, uint64_t *stops) { *moved = *depth = 0; memset(stops, 0, 8 * sizeof *stops); }   // stops: 8 counters, as hle_nvn.c reads them
@@ -649,8 +720,25 @@ void be_pso_line(char *o, size_t n) {
     memcpy(p, v, sizeof p);
 }
 void be_alloc_stats(uint64_t *waits, uint64_t *grown, int *n) { *waits = *grown = 0; *n = 0; }
+void be_pkg_edge_stats(uint64_t *allocs, uint64_t *bytes, uint64_t *peak_bytes, uint64_t *fails, uint64_t *fail_bytes) { *allocs = *bytes = *peak_bytes = *fails = *fail_bytes = 0; }
+void be_spare_stats(uint64_t *held, uint64_t *trimmed, uint64_t *trimmed_mb) { *held = *trimmed = *trimmed_mb = 0; }
+void be_pool_stats(uint64_t s[POOL_STATS]) { memset(s, 0, POOL_STATS * sizeof *s); }
+void be_dispatch_barrier_stats(uint64_t *game, uint64_t *copy, uint64_t *unranged, uint64_t *none) { *game = *copy = *unranged = *none = 0; }
+void be_tf_stats(uint64_t v[4]) { memset(v, 0, 4 * sizeof *v); }
+void be_geohoist_stats(uint64_t *hoisted, uint64_t *refused, uint64_t *stops) { *hoisted = *refused = 0; memset(stops, 0, 6 * sizeof *stops); }   // stops: 6, as hle_nvn.c reads them
+void be_geomesh_stats(uint64_t *draws, uint64_t *wide, uint64_t *redraws, uint64_t *refused, uint64_t *reasons) { *draws = *wide = *redraws = *refused = 0; memset(reasons, 0, 5 * sizeof *reasons); }
+uint64_t be_geocomp_stats(char *out, size_t n) { if (n) out[0] = 0; return 0; }
+void be_fb_stats(uint64_t *same, uint64_t *redirected, uint64_t *tile, uint64_t *whole) { *same = *redirected = *tile = *whole = 0; }
+void be_dbnd_stats(uint64_t *o, uint64_t *d, uint64_t *c, uint64_t *e) { *o = *d = *c = *e = 0; }
+void be_gsb_stats(uint64_t *n, uint64_t *bytes) { *n = *bytes = 0; }
 
 // ---------- Per operation (nvn_replay_exec, in record order) ----------
+// DM_NVN_CAPTURE's hooks (nvn_capture.h): the Metal backend writes captures (nvn_capture.inc); this one does not, said once when the switch asks for one
+static void cap_red(void) { const char *e = getenv("DM_NVN_CAPTURE"); if (e && *e) HVK_RED_ONCE("DM_NVN_CAPTURE: captures are written by the Metal backend only; nothing is captured"); }
+void nvn_cap_submit(int n, const uint64_t *handles) { (void)n; (void)handles; cap_red(); }
+void nvn_cap_present(const tex_t *t, const int crop[4]) { (void)t; (void)crop; }
+void nvn_cap_queue(uint64_t serial, int waits) { (void)serial; (void)waits; }
+
 int be_list_begin(void) { return 0; }
 int be_rec_pre(const uint8_t *rec, const op_hdr *h, int list) { (void)rec; (void)h; (void)list; return 0; }   // no look-ahead: every record reaches the decoder
 void be_state_dirty(uint32_t mask) { (void)mask; }   // the draw reads S itself; pipelines and descriptor sets are cached by content
@@ -696,11 +784,23 @@ void be_tf_bind(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec;
 void be_tf_state_note(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; (void)a; }
 void be_tf_state(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; if (hvk.on) hvk_tf_state(a); else NULLRED(); }
 void be_rast_discard(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; (void)a; }   // dynamic state: the next draw sets it from S
-void be_copy_b2t(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; if (hvk.on) hvk_copy_b2t(a, 0); else NULLRED(); }
-void be_copy_t2b(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; if (hvk.on) hvk_copy_b2t(a, 1); else NULLRED(); }
+void be_copy_b2t(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; if (hvk.on) hvk_copy_b2t(a, h->size, 0); else NULLRED(); }   // size: the record's strides (copy_strides)
+void be_copy_t2b(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; if (hvk.on) hvk_copy_b2t(a, h->size, 1); else NULLRED(); }
 void be_copy_t2t(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; if (hvk.on) hvk_copy_t2t(a); else NULLRED(); }
 void be_clear_tex(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; if (hvk.on) hvk_clear_tex(a); else NULLRED(); }
 void be_dispatch(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; if (hvk.on) hvk_dispatch(a); else NULLRED(); }
+// The records upstream 90edd532 added that the Vulkan backend does not replay yet: each declared once with a red line, and skipped (docs/design/vulkan-backend.md, "Merge of
+// upstream 90edd532"). OP_BIND_AS keeps the binding in S.acceleration for when acceleration structures come
+void be_multi_draw(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; (void)a; HVK_RED_ONCE("multi-draw indirect with a GPU count (OP_MULTI_DRAW) is not replayed: those draws are skipped"); }
+void be_draw_tex(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; (void)a; HVK_RED_ONCE("nvnCommandBufferDrawTexture (OP_DRAW_TEX) is not replayed: the texture is not drawn"); }
+void be_dlss(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; (void)a; HVK_RED_ONCE("NVN2 DLSS evaluation (OP_DLSS) is not replayed: its output is not written"); }
+void be_as_build(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; (void)a; HVK_RED_ONCE("NVN2 acceleration structure builds (OP_AS_BUILD) are not replayed"); }
+void be_as_copy(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; (void)a; HVK_RED_ONCE("NVN2 acceleration structure copies (OP_AS_COPY) are not replayed"); }
+void be_bind_as(const uint8_t *rec, const op_hdr *h, const void *a) {
+    (void)rec; (void)h; const p_bind_as *b = a;
+    if (b->stage < 9 && b->index < 32) S.acceleration[b->stage][b->index] = b->address;
+}
+void be_rt_dispatch(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; (void)a; HVK_RED_ONCE("NVN2 ray dispatches (OP_RT_DISPATCH) are not replayed: nothing is traced"); }
 void be_barrier(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; int32_t bits; memcpy(&bits, a, 4); if (hvk.on) hvk_barrier(bits); else NULLRED(); }
 
 // ---------- The frontend's hooks into its backend ----------
@@ -708,6 +808,13 @@ uint64_t nvn_state_hook_compose(uint64_t old_serial, const prog_t *const bst[5])
 void nvn_state_hook_bind(uint32_t op, const p_bind_handles *b) { (void)op; nvn_bind_fresh(b); }   // deferred handles are read again before the bind applies (BindTexturesDeferred)
 void nvn_state_hook_bind_bad(const void *rec, int n) { (void)rec; HVK_RED_ONCE("a texture bind record holds a handle count of %d (overwritten after it was recorded): skipped", n); }
 void nvn_state_hook_img_range(const p_bind_handles *b) { HVK_RED_ONCE("an image bind of slots %d + %d past the 32 image slots: skipped", b->first, b->n); }
+// The stages a program holds, for NVN's rule that a program with no vertex shader bound with the vertex bit keeps the vertex stage (nvn_state_bind_stages): the Metal backend
+// reads them from the shader map without loading a library (nvn_mtl.m prog_stage_mask); here not known at the bind (the modules load at the draw), so the rule does not apply
+uint8_t nvn_state_hook_stage_mask(const prog_t *p) { (void)p; return 0; }
+int nvn_state_hook_rt_program(const prog_t *p) { (void)p; return 0; }   // no ray tracing programs (be_rt_program_set)
+void nvn_state_hook_prog_keep(prog_t *copy, const prog_t *source) { be_prog_snapshot(copy, source); }   // the queue's copy of a program bound past its job (nvn_state_preserve)
+void nvn_state_hook_prog_drop(prog_t *p) { be_prog_unpin(p); }
+void nvn_state_hook_tex_keep(uint64_t serial, uint64_t old) { be_tex_pin(serial); be_tex_unpin(old); }
 int nvn_resolve_hook_ubo_copy(uint64_t a, size_t n, void *out) { (void)a; (void)n; (void)out; return 0; }   // no copies of inline updates: the ledger has them (nvn_gw_pend_read)
 void nvn_resolve_hook_ubo_stale(int stage, int reg, int off, int kind) {
     HVK_RED_ONCE("the uniform buffer holding bindless handles (stage %d slot %d +%#x) has GPU-side writes in this submission (%s): the current value is read", stage, reg, off,

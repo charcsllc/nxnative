@@ -24,6 +24,7 @@
 // The engine's sampler: DM_AOT_PROFILE=<folder> (DM_AOT_PROFILE_HZ) writes the profile of the run, <folder>/<module>.tsv, when the process exits (aot.h, "The sampler"); the packer reads it
 // from <NSP folder>/<id>-work/profile/ for the next packs (nxaot build --profile; docs/development.md). Linux through per-thread timers, Windows through a sampler thread.
 #include "aot.h"
+#include "../gfx/nvn/dmsh_chain_vk.h"   // DMSH_CHAIN_VK: the Vulkan shader chain this host loads (the build line, as main.c's names DMSH_CHAIN)
 #include "front.h"
 #include <stdatomic.h>
 #if defined(_WIN32)
@@ -158,6 +159,29 @@ static void usage(FILE *f) {
             "  exit status %d: no font of the system stands in for the shared font the game asked for (the [RED] line names the fonts and folders looked in)\n",
             DM_AOT_PACK_SUFFIX, DM_AOT_REPACK, DM_AOT_NO_VULKAN, DM_AOT_NO_FONT);
 }
+// The modules to load when the command line names none: those of the profile's build row for main's build (its build ID from the rewriter's main.fixups.tsv), else all the
+// profile's modules (main.c profile_modules; Mario Kart World's base game has main subsdk0 sdk, its update 1.8.0 main subsdk0 subsdk1 sdk). The rows are the runtime form's array
+static int profile_modules(const char *dir, const char **names) {
+    char path[1024], line[256], bid[33] = "";
+    snprintf(path, sizeof path, "%s/main.fixups.tsv", dir);
+    FILE *f = fopen(path, "r");
+    while (f && fgets(line, sizeof line, f)) if (sscanf(line, "# BUILD_ID %32s", bid) == 1) break;
+    if (f) fclose(f);
+    for (int r = 0; *bid && r < DM_GAME_NBUILD_MODULES; r++) {
+        const char *rb = DM_GAME_BUILD_MODULES[r].build, *rm = DM_GAME_BUILD_MODULES[r].mods;
+        if (!rb || strcmp(rb, bid)) continue;
+        int n = 0;
+        for (int k = 0; k < DM_GAME_NMOD; k++) {   // in the profile's load order; build_modules (game.py) made the row from it
+            const char *m = DM_GAME_MODULES[k], *s = strstr(rm, m); size_t l = strlen(m);
+            while (s && !((s == rm || s[-1] == ' ') && (!s[l] || s[l] == ' '))) s = strstr(s + 1, m);
+            if (s) names[n++] = m;
+        }
+        if (n < DM_GAME_NMOD) LOG("modules of main's build %.16s: %s (the profile lists %d)", bid, rm, DM_GAME_NMOD);
+        return n;
+    }
+    for (int k = 0; k < DM_GAME_NMOD; k++) names[k] = DM_GAME_MODULES[k];
+    return DM_GAME_NMOD;
+}
 static void host_preload(int argc, char **argv) {
     g_t0_ns = proc_start_mono_ns();
     flags_init();
@@ -191,6 +215,8 @@ static void host_preload(int argc, char **argv) {
     const char *jit = "without the JIT fallback (CMake NXHOST_JIT off): guest code without a compiled entry stops the process with status 3";
 #endif
     LOG("nxhost-run: modules from %s; x86-64 engine %s", argv[1], jit);
+    // Which build this is (main.c's line): the commit a packer stamped into the environment (DM_COMMIT; a run outside a package has none), the shader chain the host loads, the profile
+    { const char *c = getenv("DM_COMMIT"); LOG("build: commit %s, shader chain %s, profile %s", c && *c ? c : "not recorded", DMSH_CHAIN_VK, DM_GAME_ID); }
     const char *names[argc + DM_GAME_NMOD]; int n = 0;
     int i = 2;
     for (; i < argc && strcmp(argv[i], "--"); i++) names[n++] = argv[i];
@@ -200,8 +226,11 @@ static void host_preload(int argc, char **argv) {
         for (char *t = strtok(s, " "); t && g_argc < 63; t = strtok(NULL, " ")) g_argv[g_argc++] = t;
         LOG("game arguments from the game profile: %s", DM_GAME_ARGS);
     }
-    if (!n) for (int k = 0; k < DM_GAME_NMOD; k++) names[n++] = DM_GAME_MODULES[k];   // the game profile's modules (main.c's initializer list is an array of the profile here)
+    if (!n) n = profile_modules(argv[1], names);   // the game profile's modules, the build's own row first (main.c)
+    // main.c's dm_exl_mod_modules / dm_exl_fake_rtld (a mod's exlaunch code plugins, Mac only: they write the game's code, which a pack does not read) have no port: a mod's exefs
+    // plugin is not loaded here, and hle_svc.c's MapProcessMemory refuses with a [RED] line (apple_null.c)
     load_modules(argv[1], names, n);   // loader.c's game-module path: manifests, images, GOT bindings, packs
+    dm_cheats_init();   // main.c's: the cheat files for main's build (hle_cheats.c on Apple; apple_null.c's [RED] line here when DM_CHEATS names some)
     dm_sdk_major();
     if (getenv("DM_PROBE")) LOG("[RED] DM_PROBE: the probes put brk words into the game's code (probe.c, Apple's native execution); the x86-64 engine runs packs: not set");
     hid_keys_init();   // DM_KEYS scripted input
@@ -225,6 +254,9 @@ int main(int argc, char **argv) {
     if (argc == 2 && (!strcmp(argv[1], "--help") || !strcmp(argv[1], "-h"))) { usage(stdout); return 0; }   // before anything takes the folder from argv[1]
     // --takeovers: the forced take-overs' names and nothing else (no module, no game profile): the launcher asks the host it would start (dm/launcher host_takeovers)
     if (argc == 2 && !strcmp(argv[1], "--takeovers")) { void loader_print_takeovers(FILE *f); loader_print_takeovers(stdout); fflush(stdout); return 0; }
+    // --check-tables: the linked forced take-over table checked as a build checks it (main.c, loader.c dm_check_tables: malformed entries, duplicates, an alias whose target is taken
+    // over), with no game files; 0 when it holds (CTest nxhost_check_tables)
+    if (argc == 2 && !strcmp(argv[1], "--check-tables")) { int dm_check_tables(void); return dm_check_tables(); }
     // The game profile first, before anything reads a DM_GAME_* constant (the loading thread of DM_PRELOAD too): --profile / --game are taken off the arguments here
     if (dm_game_profile_select(&argc, &argv)) return DM_AOT_USAGE;
     // --bindings <folder>: the module set's loader bindings written there, the process ended before any pack loads (aot.h dm_aot_write_module_bindings)

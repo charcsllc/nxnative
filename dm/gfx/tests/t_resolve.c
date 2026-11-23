@@ -22,6 +22,11 @@ static int n_bind;
 void nvn_state_hook_bind(uint32_t op, const p_bind_handles *b) { (void)op; n_bind++; nvn_bind_fresh(b); }
 void nvn_state_hook_bind_bad(const void *rec, int n) { (void)rec; (void)n; }
 void nvn_state_hook_img_range(const p_bind_handles *b) { (void)b; }
+uint8_t nvn_state_hook_stage_mask(const prog_t *p) { (void)p; return 0; }   // the backend knows no program's stages (nvn_state.h)
+int nvn_state_hook_rt_program(const prog_t *p) { (void)p; return 0; }
+void nvn_state_hook_prog_keep(prog_t *copy, const prog_t *source) { *copy = *source; }   // the queue's copy (nvn_state_preserve)
+void nvn_state_hook_prog_drop(prog_t *p) { (void)p; }
+void nvn_state_hook_tex_keep(uint64_t serial, uint64_t old) { (void)serial; (void)old; }
 static int copy_on, n_copy, n_stale, stale_kind = -9, n_mem, mem_none; static uint64_t copy_a, mem_a; static size_t mem_n; static uint8_t copy_bytes[8];
 int nvn_resolve_hook_ubo_copy(uint64_t a, size_t n, void *out) { n_copy++; copy_a = a; if (!copy_on) return 0; memcpy(out, copy_bytes, n); return 1; }
 void nvn_resolve_hook_ubo_stale(int stage, int reg, int off, int kind) { (void)stage; (void)reg; (void)off; n_stale++; stale_kind = kind; }
@@ -65,7 +70,11 @@ int main(void) {
     t("c2 0x128: slot 33, image unbound: the texture", nvn_c2_handle(1, 0x128) == 0x00200021);
     t("c2 0x160: slot 40, the last combined slot", nvn_c2_handle(1, 0x160) == 0x00200028);
     t("c2 0x168 and 0x560: separate textures 0 and 127", nvn_c2_handle(1, 0x168) == 0x00300080 && nvn_c2_handle(1, 0x560) == 0x003000ff);
-    t("c2 0x568 and 0x570: the sampler table gives no handle", nvn_c2_handle(1, 0x568) == 0 && nvn_c2_handle(1, 0x570) == 0);
+    t("c2 0x568 and 0x570: separate samplers 0 and 1 (1 unbound: 0)", nvn_c2_handle(1, 0x568) == 0x00400000 && nvn_c2_handle(1, 0x570) == 0);
+    S.tex_base = 1000; S.samp_base = 2000;
+    t("c2 0x20 with pools bound: the bases added (handles are pool-relative)", nvn_c2_handle(1, 0x20) == ((1 + 1000) | (uint64_t)(1 + 2000) << 20));
+    t("c2 0x568 with pools bound: the sampler base added", nvn_c2_handle(1, 0x568) == (uint64_t)(4 + 2000) << 20);
+    S.tex_base = S.samp_base = 0;
     t("c2 0x24 and 0x16c: not on an 8-byte word, 0", nvn_c2_handle(1, 0x24) == 0 && nvn_c2_handle(1, 0x16c) == 0);
     t("c2 below the tables (0, 0x18): 0", nvn_c2_handle(1, 0) == 0 && nvn_c2_handle(1, 0x18) == 0);
     t("c2 of another stage, nothing bound: 0", nvn_c2_handle(0, 0x20) == 0);
@@ -152,32 +161,35 @@ int main(void) {
     S.ssbo[1][2] = (p_bind_buf){1, 2, 0x5000, 0x40}; S.ssbo[2][1] = (p_bind_buf){2, 1, 0x6000, 0x80}; S.ssbo[5][3] = (p_bind_buf){5, 3, 0x7000, 0x30};
     S.ubo[5][7] = (p_bind_buf){5, 7, 0x8000000010ull, 144};
     const uint32_t dim[3] = {4, 5, 6};
-    memset(dd, 0xaa, sizeof dd); int ok = nvn_fill_driver_bank(0, 0, dd, 0, 61, dim);
+    memset(dd, 0xaa, sizeof dd); int ok = nvn_fill_driver_bank(0, 0, dd, 0, 0, 61, dim);
     t("c0 vertex: filled", ok == 1);
     t("c0 vertex: storage buffer 0 at 0x110 (address, size)", rd64(dd, 0x110) == 0x1122334455667788ull && rd32(dd, 0x118) == 0x100 && rd32(dd, 0x11c) == 0);
     t("c0 vertex: storage buffer 15 at 0x200, its size cut to 32 bits", rd64(dd, 0x200) == 0x99 && rd32(dd, 0x208) == 0x23456789);
     t("c0 vertex: point size 2047 at 0x610, base instance at 0x644", rdf(dd, 0x610) == 2047.0f && rd32(dd, 0x644) == 61);
     t("c0 vertex: every other byte 0", zero_except(dd, (const unsigned[][2]){{0x110, 12}, {0x200, 12}, {0x610, 4}, {0x644, 4}}, 4));
-    memset(dd, 0xaa, sizeof dd); ok = nvn_fill_driver_bank(1, 0, dd, 0, 0, dim);
+    memset(dd, 0xaa, sizeof dd); ok = nvn_fill_driver_bank(1, 0, dd, 0, 0, 0, dim);
     t("c0 pixel: the table at 0x510 (slot 2 at 0x530)", ok == 1 && rd64(dd, 0x530) == 0x5000 && rd32(dd, 0x538) == 0x40 && rdf(dd, 0x610) == 2047.0f
       && zero_except(dd, (const unsigned[][2]){{0x530, 12}, {0x610, 4}}, 2));
-    memset(dd, 0xaa, sizeof dd); ok = nvn_fill_driver_bank(2, 0, dd, 0, 0, dim);
+    memset(dd, 0xaa, sizeof dd); ok = nvn_fill_driver_bank(2, 0, dd, 0, 0, 0, dim);
     t("c0 geometry: the table at 0x410 (slot 1 at 0x420)", ok == 1 && rd64(dd, 0x420) == 0x6000 && rd32(dd, 0x428) == 0x80 && zero_except(dd, (const unsigned[][2]){{0x420, 12}, {0x610, 4}}, 2));
-    memset(dd, 0xaa, sizeof dd); ok = nvn_fill_driver_bank(5, 0, dd, 0, 61, dim);
+    memset(dd, 0xaa, sizeof dd); ok = nvn_fill_driver_bank(5, 0, dd, 0, 0, 61, dim);
     t("c0 compute: the table at 0x310 (slot 3 at 0x340)", ok == 1 && rd64(dd, 0x340) == 0x7000 && rd32(dd, 0x348) == 0x30);
     t("c0 compute: the dispatch size at 0x200", rd32(dd, 0x200) == 4 && rd32(dd, 0x204) == 5 && rd32(dd, 0x208) == 6);
     t("c0 compute: uniform buffer 7 at 0x280 (Link's Awakening's light parameters)", rd64(dd, 0x280) == 0x8000000010ull && rd32(dd, 0x288) == 144);
     t("c0 compute: no point size, no base instance, the rest 0", zero_except(dd, (const unsigned[][2]){{0x340, 12}, {0x200, 12}, {0x280, 12}}, 3));
-    memset(dd, 0xaa, sizeof dd); ok = nvn_fill_driver_bank(3, 0, dd, 0, 61, dim);
-    t("c0 hull: base never measured (0), no table, point size and base instance still written", ok == 0 && rdf(dd, 0x610) == 2047.0f && rd32(dd, 0x644) == 61
-      && zero_except(dd, (const unsigned[][2]){{0x610, 4}, {0x644, 4}}, 2));
-    t("c0 domain: base never measured (0)", nvn_fill_driver_bank(4, 0, dd, 0, 0, dim) == 0);
+    S.ssbo[3][1] = (p_bind_buf){3, 1, 0xa000, 0x20}; S.ssbo[4][0] = (p_bind_buf){4, 0, 0xb000, 0x10};
+    memset(dd, 0xaa, sizeof dd); ok = nvn_fill_driver_bank(3, 0, dd, 0, 0, 61, dim);
+    t("c0 NVN2 task stage (3): the table at 0x670 (slot 1 at 0x680), point size and base instance", ok == 1 && rd64(dd, 0x680) == 0xa000 && rd32(dd, 0x688) == 0x20
+      && rdf(dd, 0x610) == 2047.0f && rd32(dd, 0x644) == 61 && zero_except(dd, (const unsigned[][2]){{0x680, 12}, {0x610, 4}, {0x644, 4}}, 3));
+    memset(dd, 0xaa, sizeof dd); ok = nvn_fill_driver_bank(4, 0, dd, 0, 0, 0, dim);
+    t("c0 NVN2 mesh stage (4): the table at 0x770", ok == 1 && rd64(dd, 0x770) == 0xb000 && rd32(dd, 0x778) == 0x10);
+    t("c0 stage 6 (ray tracing): no table measured (0)", nvn_fill_driver_bank(6, 0, dd, 0, 0, 0, dim) == 0);
 
     S.tex[1][0] = 0x00100001; S.tex[1][1] = 0x500000002ull; S.tex[1][2] = 0x00000003; S.tex[1][31] = 0x0010001f; S.tex[1][32] = 0x00200020; S.tex[1][33] = 0x00200021;
     S.tex[1][40] = 0x00200028; S.tex[1][128] = 0x00300080; S.tex[1][255] = 0x003000ff;
     S.img[1][0] = 0x500; S.img[1][7] = 0x507; S.img[1][8] = 0x508;
     S.samp[1][0] = 0x00400000; S.samp[1][127] = 0x07f00000;
-    memset(dd, 0xaa, sizeof dd); ok = nvn_fill_driver_bank(1, 2, dd, 0, 61, dim);
+    memset(dd, 0xaa, sizeof dd); ok = nvn_fill_driver_bank(1, 2, dd, 0, 0, 61, dim);
     t("c2: filled", ok == 1);
     t("c2: images 0 and 7 at 0x120 and 0x158, image 8 not in the table", rd32(dd, 0x120) == 0x500 && rd32(dd, 0x158) == 0x507);
     t("c2: combined slots 0, 2 and 31 at 0x20 + 8 r", rd32(dd, 0x20) == 0x00100001 && rd32(dd, 0x30) == 3 && rd32(dd, 0x118) == 0x0010001f);
@@ -191,9 +203,15 @@ int main(void) {
                                                                           {0x168, 4}, {0x560, 4}, {0x568, 4}, {0x960, 4}}, 12));
     int same = 1; for (unsigned bb = 0x20; bb < 0x568; bb += 8) same &= rd32(dd, bb) == (uint32_t)nvn_c2_handle(1, bb);
     t("c2: every handle word is what nvn_c2_handle gives for its byte", same);
-    memset(dd, 0xaa, sizeof dd); ok = nvn_fill_driver_bank(1, 2, dd, 1, 61, dim);
+    S.tex_base = 1000; S.samp_base = 2000;
+    memset(dd, 0xaa, sizeof dd); ok = nvn_fill_driver_bank(1, 2, dd, 0, 0, 61, dim);
+    t("c2 with pools bound: the bases added", ok == 1 && rd32(dd, 0x20) == (uint32_t)((1 + 1000) | (uint64_t)(1 + 2000) << 20) && rd32(dd, 0x568) == (uint32_t)((uint64_t)(4 + 2000) << 20));
+    memset(dd, 0xaa, sizeof dd); ok = nvn_fill_driver_bank(1, 2, dd, 0, 1, 61, dim);
+    t("c2 of a pool shader (TEXP / SAMPP): the handles stay pool-relative", ok == 1 && rd32(dd, 0x20) == 0x00100001 && rd32(dd, 0x568) == 0x00400000);
+    S.tex_base = S.samp_base = 0;
+    memset(dd, 0xaa, sizeof dd); ok = nvn_fill_driver_bank(1, 2, dd, 1, 0, 61, dim);
     t("c2 dynamic: slot 0 is index 0 (its sampler bits give 0 << 20)", ok == 1 && rd32(dd, 0x20) == 0);
-    t("c2 dynamic: slot 31 with a sampler: 31 | 31 << 20; slot 2 without: 2", rd32(dd, 0x118) == (31u | 31u << 20) && rd32(dd, 0x30) == 2);
+    t("c2 dynamic: a bound combined slot is r | r << 20 (upstream 90edd532): slot 31 and slot 2", rd32(dd, 0x118) == (31u | 31u << 20) && rd32(dd, 0x30) == (2u | 2u << 20));
     t("c2 dynamic: slot 1's high handle bits count as a sampler", rd32(dd, 0x28) == (1u | 1u << 20));
     t("c2 dynamic: the image table keeps the handles; slot 33: 33 | 33 << 20", rd32(dd, 0x120) == 0x500 && rd32(dd, 0x128) == (33u | 33u << 20));
     t("c2 dynamic: separate textures 0 and 127 by index, an unbound one 0", rd32(dd, 0x168) == 0 && rd32(dd, 0x560) == 127 && rd32(dd, 0x170) == 0);

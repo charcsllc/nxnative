@@ -87,27 +87,30 @@ static keys ahead_of(const keys *waited) { keys k = *waited; if (k.n) { memmove(
 
 // ---------- Called lists, jumps and a second handle ----------
 static uint8_t *g_lists;   // 64 KiB of command memory for the four lists
-static void list_end(hv_cmds *c) { hv_emit(c, OP_END, NULL, 0); }
-static void call(hv_cmds *c, const hv_cmds *list) { uint64_t t = (uint64_t)(uintptr_t)list->base; hv_emit(c, OP_CALL, &t, 8); }
 // variant 0: the miss before the calls (H1: draw 0, CALL X {draw 2, CALL Y {draw 5}, draw 3}, draw 4, JUMP over draw 1, draw 6; H2: draw 7)
 // variant 1: the miss inside a called list (H1: CALL X {draw 0, draw 1}, draw 2; H2: draw 3)
+// The queue takes control lists since upstream 90edd532 (t_vk_harness.h hv_list): a call is the called list's pieces in the caller's list (CallCommands), a jump the end of one
+// piece and the start of the next, so each handle is laid out as the pieces in the order they run, the jumped-over draw 1 left out of every piece
 static void calls_submit(int variant) {
     hv_cmds x = {g_lists, 0, 16384}, y = {g_lists + 16384, 0, 16384}, h1 = {g_lists + 32768, 0, 16384}, h2 = {g_lists + 49152, 0, 16384};
+    static hv_list l1, l2; l1.n = l2.n = 0;
     if (!variant) {
-        draw(&y, 5, 5); list_end(&y);
-        draw(&x, 2, 2); call(&x, &y); draw(&x, 3, 3); list_end(&x);
-        defaults(&h1, &ta); draw(&h1, 0, 0); call(&h1, &x); draw(&h1, 4, 4);
-        uint64_t zero = 0; hv_emit(&h1, OP_JUMP, &zero, 8); size_t at = h1.used - 8;   // its target is patched below
+        draw(&y, 5, 5);
+        draw(&x, 2, 2); size_t x0 = x.used; draw(&x, 3, 3);
+        defaults(&h1, &ta); draw(&h1, 0, 0); size_t a0 = h1.used; draw(&h1, 4, 4); size_t a1 = h1.used;
         draw(&h1, 1, 1);                                                             // jumped over: not replayed, and not walked
-        uint64_t to = (uint64_t)(uintptr_t)(h1.base + h1.used); memcpy(h1.base + at, &to, 8);
-        draw(&h1, 6, 6); list_end(&h1);
-        draw(&h2, 7, 7); list_end(&h2);
+        size_t a2 = h1.used; draw(&h1, 6, 6);
+        hv_list_piece(&l1, h1.base, a0); hv_list_piece(&l1, x.base, x0); hv_list_piece(&l1, y.base, y.used); hv_list_piece(&l1, x.base + x0, x.used - x0);
+        hv_list_piece(&l1, h1.base + a0, a1 - a0); hv_list_piece(&l1, h1.base + a2, h1.used - a2);
+        draw(&h2, 7, 7);
     } else {
-        draw(&x, 0, 0); draw(&x, 1, 1); list_end(&x);
-        defaults(&h1, &ta); call(&h1, &x); draw(&h1, 2, 2); list_end(&h1);
-        draw(&h2, 3, 3); list_end(&h2);
+        draw(&x, 0, 0); draw(&x, 1, 1);
+        defaults(&h1, &ta); size_t a0 = h1.used; draw(&h1, 2, 2);
+        hv_list_piece(&l1, h1.base, a0); hv_list_piece(&l1, x.base, x.used); hv_list_piece(&l1, h1.base + a0, h1.used - a0);
+        draw(&h2, 3, 3);
     }
-    NVNcommandHandle h[2] = {(NVNcommandHandle)(uintptr_t)h1.base, (NVNcommandHandle)(uintptr_t)h2.base};
+    hv_list_add(&l2, h2.base, h2.used);
+    NVNcommandHandle h[2] = {hv_list_handle(&l1), hv_list_handle(&l2)};
     h_nvnQueueSubmitCommands(&queue, 2, h); h_nvnQueueFinish(&queue);
 }
 

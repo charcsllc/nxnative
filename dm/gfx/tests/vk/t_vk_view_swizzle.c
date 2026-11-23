@@ -37,7 +37,7 @@ static void read_check(int tc, int id, const float expected[8], float tol) {
     hv_rt(&g_c, 1, rt, NULL);
     p_set_pool tp = {(const dpool_t *)&g_tp}, sp = {(const dpool_t *)&g_sp}; hv_emit(&g_c, OP_SET_TEX_POOL, &tp, sizeof tp); hv_emit(&g_c, OP_SET_SAMP_POOL, &sp, sizeof sp);
     hv_bind(&g_c, &g_fetch, 3); hv_depth(&g_c, 0, 0, NVN_DEPTH_FUNC_ALWAYS); hv_cull(&g_c, NVN_FACE_NONE);
-    p_bind_tex1 b = {1, 0, (uint64_t)(uint32_t)id | (uint64_t)1 << 20, nvn_dpool_base(&g_tp, 1), nvn_dpool_base(&g_sp, 0)}; hv_emit(&g_c, OP_BIND_TEX1, &b, sizeof b);
+    p_bind_tex1 b = {1, 0, (uint64_t)(uint32_t)id | (uint64_t)1 << 20}; hv_emit(&g_c, OP_BIND_TEX1, &b, sizeof b);
     hv_draw(&g_c, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3, 1);
     hv_submit(&g_q, &g_c);
     float actual[8] = {-9, -9, -9, -9, -9, -9, -9, -9};
@@ -70,7 +70,7 @@ static void image_case(int tc) {   // an RGBX8 image: sampled with alpha one, st
     h_nvnTexturePoolRegisterTexture(&g_tp, tid, &tx, NULL); h_nvnTexturePoolRegisterImage(&g_tp, iid, &tx, NULL);
     p_set_pool tp = {(const dpool_t *)&g_tp}; hv_emit(&g_c, OP_SET_TEX_POOL, &tp, sizeof tp);
     hv_bind(&g_c, &g_store, NVN_SHADER_STAGE_COMPUTE_BIT);
-    p_bind_handles bh; memset(&bh, 0, sizeof bh); bh.stage = 5; bh.first = 0; bh.n = 1; bh.h[0] = (uint64_t)(iid + nvn_dpool_base(&g_tp, 1));
+    p_bind_handles bh; memset(&bh, 0, sizeof bh); bh.stage = 5; bh.first = 0; bh.n = 1; bh.h[0] = (uint64_t)iid;   // pool-relative: the bound pool's base is added at use
     hv_emit(&g_c, OP_BIND_IMG, &bh, offsetof(p_bind_handles, h) + 8);
     p_dispatch d = {1, 1, 1, 0, 0}; hv_emit(&g_c, OP_DISPATCH, &d, sizeof d);
     hv_submit(&g_q, &g_c);

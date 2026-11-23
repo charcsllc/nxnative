@@ -11,12 +11,14 @@
 // and one of its own, the strings, a fence object) in the x86-64 engine's arena below 2^39. Every validation message fails the test; without a Vulkan device
 // it skips as the other GPU tests do (t_vk_harness.h), and without a shader library (no glslangValidator when the tree was configured, or a runner on another machine) it
 // skips with a note. DM_GL_STUBS: a child process (hv_spawn) checks the reporting stub
+#define T_VK_LINKS_HLE_VI 1   // dm/gfx/hle_vi.c is linked (dm/host/CMakeLists.txt): its layer crop and frame history, not the harness's
 #include "t_vk_harness.h"
 #include "../../../host/hle.h"
 #include "../../hostvk/guest_gl.h"
 #include "../../hostvk/guest_vk.h"
 
 PLAT_TABLE_DEFINE(swhle)   // the import table (dm/host/hle.c defines it in a host binary)
+int dm_opmode(void) { return 0; }   // handheld (hle_vi.c sizes its buffers by the operation mode since upstream 90edd532)
 // The x86-64 engine's arena below 2^39 (dm/host/aot_arena.c, linked here: dm/host/CMakeLists.txt), where the layer puts what the game sees of host memory (guest_gl.c, "Memory
 // the game sees": the buffer mappings as arena pages imported with VK_EXT_external_memory_host, the strings, the fence objects), as in nxhost-run; and what aot_arena.c and
 // aot_hostfn.c take from the rest of the host, as t_vk_guest gives it: no host-call thunks, no loader

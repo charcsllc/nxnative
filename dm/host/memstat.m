@@ -12,6 +12,7 @@
 #include <TargetConditionals.h>
 #include <mach/mach.h>
 #include <mach/vm_statistics.h>
+#include <stdatomic.h>
 #if TARGET_OS_IPHONE
 #include <os/proc.h>
 #endif
@@ -52,6 +53,91 @@ static void dump_regions(const char *path) {
         a += sz;
     }
     fclose(f);
+}
+
+// The address-space census the crash handler writes after every crash and abort (crash.c on_crash): how much of the process's address space each class holds, the largest free gaps
+// between the lowest and highest address the task may use (TASK_VM_INFO min / max_address) and the thread count. An iPhone without the extended-virtual-addressing entitlement has
+// a few GB of address space (docs/reference/memory.md): a thread's stack, a realloc or a Metal heap that finds no room aborts there with the footprint far below the memory limit
+// (GitHub issue #2444). Regions inside a submap (the dyld shared cache) are "system" here and never a gap. Only mach calls and fprintf: it runs in the signal handler
+static void vm_fmt_size(char *b, size_t n, uint64_t v) {
+    if (v >= (1ull << 30)) snprintf(b, n, "%.2f GB", v / 1073741824.0);
+    else if (v >= (1ull << 20)) snprintf(b, n, "%.2f MB", v / 1048576.0);
+    else if (v >= (1ull << 10)) snprintf(b, n, "%.1f KB", v / 1024.0);
+    else snprintf(b, n, "%llu B", (unsigned long long)v);
+}
+typedef struct { uint64_t addr, size; uint32_t tag, prot; } vm_top_reg_t;
+static void vm_top_add(vm_top_reg_t top[4], uint64_t addr, uint64_t size, uint32_t tag, uint32_t prot) {
+    for (int i = 0; i < 4; i++) {
+        if (size > top[i].size) {
+            for (int j = 3; j > i; j--) top[j] = top[j - 1];
+            top[i] = (vm_top_reg_t){addr, size, tag, prot};
+            return;
+        }
+    }
+}
+void dm_vm_census(FILE *f) {
+    enum { C_SYS = NC, NCC };
+    uint64_t virt[NCC] = {0}, rcnt[NCC] = {0}, gap[3] = {0}, gap_at = 0, prev = 0, lo = 0, hi = 0, nreg = 0, tag[256] = {0};   // tag: "other" by VM user tag
+    vm_top_reg_t top_file[4] = {{0}}, top_other[4] = {{0}};
+    task_vm_info_data_t vi; mach_msg_type_number_t n = TASK_VM_INFO_COUNT;
+    if (task_info(mach_task_self(), TASK_VM_INFO, (task_info_t)&vi, &n) == KERN_SUCCESS && n >= TASK_VM_INFO_REV2_COUNT) { lo = vi.min_address; hi = vi.max_address; }
+    prev = lo;
+    vm_address_t a = 0; vm_size_t sz; natural_t depth = 0; uint64_t sub_end = 0;
+    for (;;) {
+        vm_region_submap_info_data_64_t in; mach_msg_type_number_t cnt = VM_REGION_SUBMAP_INFO_COUNT_64;
+        if (vm_region_recurse_64(mach_task_self(), &a, &sz, &depth, (vm_region_recurse_info_t)&in, &cnt) != KERN_SUCCESS) break;
+        uint64_t s = a, e = (uint64_t)a + sz;
+        if (s > prev) {   // free address space between the last region and this one: keep the three largest
+            uint64_t g = s - prev;
+            if (g > gap[0]) { gap[2] = gap[1]; gap[1] = gap[0]; gap[0] = g; gap_at = prev; } else if (g > gap[1]) { gap[2] = gap[1]; gap[1] = g; } else if (g > gap[2]) gap[2] = g;
+        }
+        if (e > prev) prev = e;
+        if (in.is_submap) { if (e > sub_end) sub_end = e; depth++; continue; }
+        int c = s < sub_end ? C_SYS : classify(a, &in); virt[c] += sz; rcnt[c]++; nreg++;
+        if (c == C_FILE) vm_top_add(top_file, s, (uint64_t)sz, in.user_tag, (uint32_t)in.protection);
+        if (c == C_OTHER) {
+            tag[in.user_tag & 255] += sz;
+            if (in.user_tag != 31) vm_top_add(top_other, s, (uint64_t)sz, in.user_tag, (uint32_t)in.protection);
+        }
+        a += sz;
+    }
+    if (hi > prev) { uint64_t g = hi - prev; if (g > gap[0]) { gap[2] = gap[1]; gap[1] = gap[0]; gap[0] = g; gap_at = prev; } else if (g > gap[1]) { gap[2] = gap[1]; gap[1] = g; } else if (g > gap[2]) gap[2] = g; }
+    uint64_t used = 0; for (int c = 0; c < NCC; c++) used += virt[c];
+    thread_act_array_t th; mach_msg_type_number_t nt = 0; int threads = -1;
+    if (task_threads(mach_task_self(), &th, &nt) == KERN_SUCCESS) {
+        threads = (int)nt;
+        for (mach_msg_type_number_t i = 0; i < nt; i++) mach_port_deallocate(mach_task_self(), th[i]);
+        vm_deallocate(mach_task_self(), (vm_address_t)th, nt * sizeof *th);
+    }
+    const double G = 1073741824.0;
+    char g0[32], g1[32], g2[32]; vm_fmt_size(g0, sizeof g0, gap[0]); vm_fmt_size(g1, sizeof g1, gap[1]); vm_fmt_size(g2, sizeof g2, gap[2]);
+    fprintf(f, "[dm] address space: %.2f GB in %llu regions between %#llx and %#llx (%.2f GB); largest free %s at %#llx, then %s and %s; threads %d\n",
+            used / G, (unsigned long long)nreg, (unsigned long long)lo, (unsigned long long)hi, (hi - lo) / G, g0, (unsigned long long)gap_at, g1, g2, threads);
+    fprintf(f, "[dm] address space by class (GB):");
+    for (int c = 0; c < NCC; c++) fprintf(f, " %s %.2f", c == C_SYS ? "system" : k_cls[c], virt[c] / G);
+    fprintf(f, "; footprint %.2f GB; other by VM tag:", vi.phys_footprint / G);
+    for (int k = 0; k < 3; k++) {   // the three largest tags of "other" (mach/vm_statistics.h VM_MEMORY_*; 0 = untagged, which holds plain mmap reservations)
+        int best = -1; for (int t = 0; t < 256; t++) if (tag[t] && (best < 0 || tag[t] > tag[best])) best = t;
+        if (best < 0) break;
+        fprintf(f, " %d %.2f", best, tag[best] / G); tag[best] = 0;
+    }
+    fputc('\n', f);
+    fprintf(f, "[dm] address space regions: malloc %llu, gpu %llu, file %llu, other %llu; top file:",
+            (unsigned long long)rcnt[C_MALLOC], (unsigned long long)rcnt[C_GPU], (unsigned long long)rcnt[C_FILE], (unsigned long long)rcnt[C_OTHER]);
+    for (int i = 0; i < 4 && top_file[i].size; i++) {
+        char sb[32]; vm_fmt_size(sb, sizeof sb, top_file[i].size);
+        uint32_t pr = top_file[i].prot;
+        fprintf(f, " %#llx+%s(%c%c%c)", (unsigned long long)top_file[i].addr, sb,
+                (pr & VM_PROT_READ) ? 'r' : '-', (pr & VM_PROT_WRITE) ? 'w' : '-', (pr & VM_PROT_EXECUTE) ? 'x' : '-');
+    }
+    fprintf(f, "; top other(!31):");
+    for (int i = 0; i < 4 && top_other[i].size; i++) {
+        char sb[32]; vm_fmt_size(sb, sizeof sb, top_other[i].size);
+        uint32_t pr = top_other[i].prot;
+        fprintf(f, " %#llx+%s(tag=%u,%c%c%c)", (unsigned long long)top_other[i].addr, sb, top_other[i].tag,
+                (pr & VM_PROT_READ) ? 'r' : '-', (pr & VM_PROT_WRITE) ? 'w' : '-', (pr & VM_PROT_EXECUTE) ? 'x' : '-');
+    }
+    fputc('\n', f);
 }
 
 static void sample(FILE *f, double t, id<MTLDevice> dev) {
@@ -102,7 +188,7 @@ static void *memstat_thread(void *p) {
     return NULL;
 }
 
-__attribute__((constructor)) static void memstat_start(void) {
+static void memstat_start(void) {
     const char *p = getenv("DM_MEMSTAT");
     if (!p || !*p) return;
     char *path = strdup(p);
@@ -144,7 +230,7 @@ static void *thrcpu_thread(void *p) {
     }
     return NULL;
 }
-__attribute__((constructor)) static void thrcpu_start(void) {
+static void thrcpu_start(void) {
     const char *p = getenv("DM_THRCPU");
     if (!p || !*p) return;
     char *spec = strdup(p);
@@ -152,4 +238,11 @@ __attribute__((constructor)) static void thrcpu_start(void) {
     if (*p != '/') { size_t n = strlen(getenv("HOME")) + strlen(p) + 16; spec = malloc(n); snprintf(spec, n, "%s/Documents/%s", getenv("HOME"), p); }
 #endif
     pthread_t th; pthread_create(&th, NULL, thrcpu_thread, spec); pthread_detach(th);
+}
+// DM_MEMSTAT and DM_THRCPU, started once by the host's loading (main.c host_preload), not by a constructor: on iOS a constructor runs before the app's main() sets what Documents/env.txt
+// holds, so either switch set there did nothing (GitHub issue #1184)
+void dm_diag_samplers_start(void) {
+    static atomic_int once;
+    if (atomic_exchange(&once, 1)) return;
+    memstat_start(); thrcpu_start();
 }

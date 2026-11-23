@@ -23,7 +23,7 @@ static void make(NVNtexture *t, int format) {
     h_nvnTextureInitialize(t, &tb);
 }
 static void pools(void) { p_set_pool tp = {(const dpool_t *)&g_tp}, sp = {(const dpool_t *)&g_sp}; hv_emit(&g_c, OP_SET_TEX_POOL, &tp, sizeof tp); hv_emit(&g_c, OP_SET_SAMP_POOL, &sp, sizeof sp); }
-static void bind_comb(int id) { p_bind_tex1 b = {1, 0, (uint64_t)(uint32_t)id | (uint64_t)1 << 20, nvn_dpool_base(&g_tp, 1), nvn_dpool_base(&g_sp, 0)}; hv_emit(&g_c, OP_BIND_TEX1, &b, sizeof b); }
+static void bind_comb(int id) { p_bind_tex1 b = {1, 0, (uint64_t)(uint32_t)id | (uint64_t)1 << 20}; hv_emit(&g_c, OP_BIND_TEX1, &b, sizeof b); }
 static void barrier(int bits) { int32_t b = bits; hv_emit(&g_c, OP_BARRIER, &b, sizeof b); }
 static int all_px(const tex_t *t, const uint8_t want[4], int tol, const char *label) {
     uint8_t px[256]; int ok = hv_read(t, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 0, 0, 8, 8, 4, px);
@@ -81,9 +81,9 @@ int main(void) {
     const tex_t *rt2[1] = {(const tex_t *)&b};
     hv_rt(&g_c, 1, rt2, NULL); hv_clear_color(&g_c, 0, 15, 1, 0, 0, 1);
     pools(); hv_bind(&g_c, &psep, 0x1f);
-    p_bind_handles th; memset(&th, 0, sizeof th); th.stage = 1; th.first = NVN_SEPTEX_SLOT0; th.n = 1; th.h[0] = (uint64_t)(2 + nvn_dpool_base(&g_tp, 1));
+    p_bind_handles th; memset(&th, 0, sizeof th); th.stage = 1; th.first = NVN_SEPTEX_SLOT0; th.n = 1; th.h[0] = 2;   // pool-relative: the bound pool's base is added at use
     hv_emit(&g_c, OP_BIND_TEX, &th, offsetof(p_bind_handles, h) + 8);
-    p_bind_handles sh; memset(&sh, 0, sizeof sh); sh.stage = 1; sh.first = 0; sh.n = 1; sh.h[0] = (uint64_t)(1 + nvn_dpool_base(&g_sp, 0)) << 20;
+    p_bind_handles sh; memset(&sh, 0, sizeof sh); sh.stage = 1; sh.first = 0; sh.n = 1; sh.h[0] = (uint64_t)1 << 20;
     hv_emit(&g_c, OP_BIND_SAMP, &sh, offsetof(p_bind_handles, h) + 8);
     hv_draw(&g_c, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3, 1);
     hv_submit(&g_q, &g_c);

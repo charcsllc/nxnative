@@ -7,6 +7,8 @@
 struct dm_flags g_flag;
 uint64_t g_t0_ns;
 __thread _Atomic int dm_host_work;   // hle_thread.c's host-work count; in the host it is defined in hle_nvn.c
+uint64_t guest_ticks(void) { return plat_now_ns() / 625 * 12; }   // hle_os.c: the guest's system counter at 19.2 MHz, on the host clock
+__thread uint64_t dm_clock_reads;   // hle_thread.c's clock-wait evidence (thr_yield); hle_os.c counts it in the host
 uint64_t now_ns(void) { return plat_now_ns(); }
 uint64_t guest_ns(void) { return now_ns(); }
 int dm_detclock_enabled(void) { return 0; }

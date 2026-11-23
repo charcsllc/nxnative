@@ -4,7 +4,11 @@ Readers opt into Path/open/os/mmap here; the real filesystem is untouched. A pat
 like /game/RomFS.img/Data/archive is a bounded view of that image entry. Ordinary
 paths retain their normal behavior, including writes to generated outputs.
 """
+from __future__ import annotations
+
 import builtins
+from contextlib import contextmanager, ExitStack
+from contextvars import ContextVar
 import errno
 import fnmatch
 import functools
@@ -30,7 +34,9 @@ class Image:
         self.path = _os.path.abspath(path)
         self.stat = _os.stat(self.path)
         with builtins.open(self.path, 'rb') as f:
-            magic, off, size, count = HEAD.unpack(f.read(HEAD.size))
+            head = f.read(HEAD.size)
+            if len(head) < HEAD.size: raise ValueError(f'invalid RomFS image header: {path}')
+            magic, off, size, count = HEAD.unpack(head)
             if magic != MAGIC or not 0 < count <= 0xffffffff or off < HEAD.size or off > self.stat.st_size or size != self.stat.st_size - off or count > size // ENT.size:
                 raise ValueError(f'invalid RomFS image header: {path}')
             f.seek(off); self.index = f.read(size)
@@ -38,8 +44,8 @@ class Image:
         self.count, self.pool = count, count * ENT.size
         next_child = 1
         for k in range(count):
-            a, b, no, nl, t, pad = self.entry(k)
-            if no + nl > size - self.pool or t > 1 or pad or (k == 0 and (t or nl)):
+            a, b, no, nl, t, flags = self.entry(k)
+            if no + nl > size - self.pool or t > 1 or flags > t or (k == 0 and (t or nl)):   # flags: 1 on a damaged file (romfs_image.py), 0 otherwise
                 raise ValueError(f'invalid RomFS image entry {k}: {path}')
             name = self.name(k)
             if k and (not nl or nl > 0x300 or b'\0' in name or b'/' in name or name in (b'.', b'..')):
@@ -91,6 +97,28 @@ def is_image(path):
     except (OSError, TypeError): return False
 
 
+def _identity(st: _os.stat_result): return st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns
+
+
+_scan_descriptors: ContextVar[dict[str, tuple[tuple[int, int, int, int], int]] | None] = ContextVar('_scan_descriptors', default=None)
+
+
+@contextmanager
+def reuse_descriptors(roots):
+    """Keep one backing descriptor per RomFS image for a scan. Each reader still owns a duplicate for pread and bounded mmap."""
+    with ExitStack() as stack:
+        descriptors = {}
+        for path in dict.fromkeys(map(_os.path.abspath, roots)):
+            if not is_image(path): continue
+            fd = stack.enter_context(builtins.open(path, 'rb')).fileno()
+            descriptors[path] = (_identity(_os.fstat(fd)), fd)
+        token = _scan_descriptors.set(descriptors)
+        try:
+            yield
+        finally:
+            _scan_descriptors.reset(token)
+
+
 def _resolve(path):
     p = _os.path.abspath(_os.fsdecode(path))
     parts = p.split('/') if _os.altsep is None else _re.split(r'[\\/]', p)   # Windows paths hold either separator; the image's path is joined with the native one
@@ -100,7 +128,7 @@ def _resolve(path):
         try: st = _os.stat(image)
         except OSError: continue
         if not _stat.S_ISREG(st.st_mode): continue
-        loaded = _image(image, (st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns))
+        loaded = _image(image, _identity(st))
         if loaded is not None: return loaded, '/'.join(parts[i + 1:])
     return None
 
@@ -126,7 +154,10 @@ def _read_at(fd, size, offset, lock):
 
 class _File(io.RawIOBase):
     def __init__(self, image, k):
-        self.fd = _os.open(image.path, _os.O_RDONLY | _O_BINARY)
+        descriptors = _scan_descriptors.get()
+        # a duplicate shares its file position with the backing descriptor, so it is taken only where reads give their offset (pread); on Windows each reader opens its own
+        backing = descriptors.get(image.path) if descriptors is not None and _pread is not None else None
+        self.fd = _os.dup(backing[1]) if backing is not None and backing[0] == _identity(image.stat) else _os.open(image.path, _os.O_RDONLY | _O_BINARY)
         self.lock = threading.Lock()
         self.start, self.length = image.entry(k)[:2]
         self.pos = 0
@@ -169,8 +200,12 @@ else:
 def stat(path, **kwargs):
     resolved = _resolve(path)
     if not resolved: return _os.stat(path, **kwargs)
-    image, relative = resolved; k = image.find(relative)
-    a, b, _, _, t, _ = image.entry(k); s = image.stat
+    image, relative = resolved
+    return _entry_stat(image, image.find(relative))
+
+
+def _entry_stat(image, k):
+    _, b, _, _, t, _ = image.entry(k); s = image.stat
     return SimpleNamespace(st_mode=(_stat.S_IFREG | 0o444) if t else (_stat.S_IFDIR | 0o555), st_size=b if t else 0,
                            st_ino=k + 1, st_dev=s.st_dev, st_mtime=s.st_mtime, st_mtime_ns=s.st_mtime_ns,
                            st_ctime=s.st_ctime, st_ctime_ns=s.st_ctime_ns, st_atime=s.st_atime, st_atime_ns=s.st_atime_ns)
@@ -187,13 +222,13 @@ def isfile(path):
     except OSError: return False
 
 
-class _Entry:
-    def __init__(self, parent, name): self.name, self.path = name, _os.path.join(parent, name)
-    def stat(self, **kwargs): return stat(self.path)
-    def is_dir(self, **kwargs): return isdir(self.path)
-    def is_file(self, **kwargs): return isfile(self.path)
+class _Entry:   # an image entry as the scan that listed it found it: its type, size and inode come from that image's index, not from the path resolved again
+    def __init__(self, parent, name, image, k): self.name, self.path, self._image, self._k = name, _os.path.join(parent, name), image, k
+    def stat(self, **kwargs): return _entry_stat(self._image, self._k)
+    def is_dir(self, **kwargs): return not self._image.entry(self._k)[4]
+    def is_file(self, **kwargs): return bool(self._image.entry(self._k)[4])
     def is_symlink(self): return False
-    def inode(self): return self.stat().st_ino
+    def inode(self): return self._k + 1
     def __fspath__(self): return self.path
 
 
@@ -210,7 +245,7 @@ def scandir(path):
     resolved = _resolve(path)
     if not resolved: return _os.scandir(path)
     image, relative = resolved
-    return _Scan(_Entry(path, name) for name, _ in image.children(image.find(relative)))
+    return _Scan(_Entry(path, name, image, k) for name, k in image.children(image.find(relative)))
 
 
 def walk(top, topdown=True, onerror=None, followlinks=False):

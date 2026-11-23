@@ -56,7 +56,7 @@ int main(void) {
     const char *(*wine)(void) = (void *)GetProcAddress(GetModuleHandleW(L"ntdll.dll"), "wine_get_version");
     // Whether the transforms are there and take these streams: the first access unit of the Main stream, and an AAC decoder
     {
-        mavc *a = mavc_new();
+        mavc *a = mavc_new(NULL);
         mavc_decode(a, mst_main.au[0].p, mst_main.au[0].n, 0);
         int fail = a->failed; char why[200]; snprintf(why, sizeof why, "%s", a->why); mavc_free(a);
         int ch = 2, rate = 48000; maac *m = maac_new(mst_aac2.asc, mst_aac2.asc_n, &ch, &rate); int afail = !m; maac_free(m);
@@ -70,15 +70,15 @@ int main(void) {
     }
     got_t g = {0};
     // 1. Baseline: the avcC record, length-prefixed units, a picture cropped from 64 to 60 lines, P pictures that copy their reference
-    { mavc *a = mavc_new(); mavc_avcc(a, mst_base.avcc, (size_t)mst_base.avcc_n); decode(a, &mst_base, 3, &g); check_nv12("Baseline", &mst_base, &g); got_free(&g); mavc_free(a); }
+    { mavc *a = mavc_new(NULL); mavc_avcc(a, mst_base.avcc, (size_t)mst_base.avcc_n); decode(a, &mst_base, 3, &g); check_nv12("Baseline", &mst_base, &g); got_free(&g); mavc_free(a); }
     // 2. Main: parameter sets in the stream, B pictures reordered by the transform into presentation order, each the average of its references
-    { mavc *a = mavc_new(); decode(a, &mst_main, 3, &g); check_nv12("Main", &mst_main, &g); got_free(&g); mavc_free(a); }
+    { mavc *a = mavc_new(NULL); decode(a, &mst_main, 3, &g); check_nv12("Main", &mst_main, &g); got_free(&g); mavc_free(a); }
     // 3. RGBA (the native texture mode) by the SPS's matrix: BT.709 (Main), BT.601 (Baseline)
-    { mavc *a = mavc_new(); mavc_set_rgba(a); decode(a, &mst_main, 4, &g); check_rgba("Main RGBA", &mst_main, &g); got_free(&g); mavc_free(a); }
-    { mavc *a = mavc_new(); mavc_set_rgba(a); mavc_avcc(a, mst_base.avcc, (size_t)mst_base.avcc_n); decode(a, &mst_base, 4, &g); check_rgba("Baseline RGBA", &mst_base, &g); got_free(&g); mavc_free(a); }
+    { mavc *a = mavc_new(NULL); mavc_set_rgba(a); decode(a, &mst_main, 4, &g); check_rgba("Main RGBA", &mst_main, &g); got_free(&g); mavc_free(a); }
+    { mavc *a = mavc_new(NULL); mavc_set_rgba(a); mavc_avcc(a, mst_base.avcc, (size_t)mst_base.avcc_n); decode(a, &mst_base, 4, &g); check_rgba("Baseline RGBA", &mst_base, &g); got_free(&g); mavc_free(a); }
     // 4. A flush in the middle (a seek: hle_movie.c md_reset), then the stream from its start: its pictures, none from before the flush
     {
-        mavc *a = mavc_new();
+        mavc *a = mavc_new(NULL);
         for (int i = 0; i < 3; i++) { mavc_decode(a, mst_main.au[i].p, mst_main.au[i].n, mst_main.au[i].pts_us); take_all(a, 0, mst_main.w, mst_main.h, 3, &g); }
         got_free(&g); mavc_drop(a);
         CHECK(mavc_queued(a) == 0, "a flush drops the queued pictures");
@@ -91,7 +91,7 @@ int main(void) {
     // 6. Media Foundation taken as absent: one black picture per access unit at its time, in presentation order (the Main stream's 4 held until its end), constant
     {
         g_mf_test_absent = 1;
-        mavc *a = mavc_new(); decode(a, &mst_main, 3, &g);
+        mavc *a = mavc_new(NULL); decode(a, &mst_main, 3, &g);
         int black = 1, sorted = 1; for (int i = 0; i < g.n; i++) { black &= is_black_nv12(g.pic[i], mst_main.w, mst_main.h); if (i) sorted &= g.pts[i - 1] < g.pts[i]; }
         CHECK(g.n == mst_main.nau && black && sorted, "no decoder: %d black pictures in order for %d access units", g.n, mst_main.nau);
         CHECK(mavc_constant(a) == 1, "no decoder: its pictures are all the same (mavc_constant 1)");

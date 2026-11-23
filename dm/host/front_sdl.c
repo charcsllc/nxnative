@@ -44,6 +44,19 @@ static void screen_fps_update(void) {
     g_screen_fps = (int)lroundf(mode_hz(d ? SDL_GetCurrentDisplayMode(d) : NULL));
 }
 int front_screen_max_fps(void) { return g_screen_fps; }
+// The screen's native rate before a fullscreen switch lowered it (front_mac.m front_screen_match): this front end switches no rate, so it is the screen's own
+int front_screen_capable_fps(void) { return front_screen_max_fps(); }
+// The controller applet's prompt (front_mac.m and the iOS app, ctrl_prompt.h) and the account applet's user picker are the Apple front ends': none here. The controller
+// applet then answers as the player closing it, as with no window (-1), and the account applet as a cancel (front.h), each said once
+int front_ctrl_support(int min, int max) {
+    static _Atomic int once; if (!atomic_exchange(&once, 1)) LOG("[RED] front end: no controller applet prompt in the SDL front end (the game wants %d to %d players): answered as the player closing it", min, max);
+    return -1;
+}
+int front_user_select(const front_user *users, int count, int allow_create, int allow_skip) {
+    (void)users; (void)allow_create; (void)allow_skip;
+    static _Atomic int once; if (!atomic_exchange(&once, 1)) LOG("[RED] front end: no account picker in the SDL front end (%d users offered): answered as a cancel", count);
+    return FRONT_USER_CANCEL;
+}
 // Main thread: on a new frame rate, on entering and leaving fullscreen and on a move to another screen. In fullscreen only, a screen whose rate is not a multiple of the game's gets the
 // mode of the same size with the highest rate that is; SDL switches the screen back to its desktop mode when the window leaves fullscreen. A window keeps the screen's rate (switching
 // changes the whole screen for every program). X11 keeps a mode a program set after the program ends, so front_atexit gives the desktop mode back (a crash cannot); Windows restores it

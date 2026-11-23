@@ -1603,8 +1603,10 @@ static void level_size(hvk_tex *x, unsigned level, uint32_t *w, uint32_t *h, uin
 // The aspects a texture copy reaches: both of a combined depth-stencil format (the stencil travels with the depth: rendering.md, "Depth-stencil copies carry the stencil"), the
 // stencil alone of a STENCIL8 held in D32_SFLOAT_S8_UINT
 static VkImageAspectFlags copy_aspect(hvk_tex *x) { return hvk_tex_copy_aspect(x); }
-void hvk_copy_b2t(const p_copy_b2t *c, int to_buffer);
-void hvk_copy_b2t(const p_copy_b2t *c, int to_buffer) {
+// The row and image strides are the record's since upstream 90edd532 (SetCopyRowStride / SetCopyImageStride are written into each copy, nvn_obj.h copy_strides); S's, from an
+// OP_COPY_STRIDE record, for a record without them (an older capture), as the Metal backend's copy_b2t
+void hvk_copy_b2t(const p_copy_b2t *c, uint32_t size, int to_buffer);
+void hvk_copy_b2t(const p_copy_b2t *c, uint32_t size, int to_buffer) {
     if (g_cur < 0 || !c->tex) return;
     hvk_tex *x = hvk_tex_get(c->tex); if (!x) return;
     if (hvk_dump_passes()) hvk_dump_line("T %d %s ser%llu %dx%d at %d,%d buffer %#llx", hvk_dump_pass_no(), to_buffer ? "texture->buffer" : "buffer->texture", (unsigned long long)c->tex->serial,
@@ -1612,8 +1614,9 @@ void hvk_copy_b2t(const p_copy_b2t *c, int to_buffer) {
     int bw, bh, bpb = nvn_fmt_bpb(c->tex->d.format, &bw, &bh);
     if (!bpb) return;
     unsigned level = c->has_view && c->view.set_levels ? c->view.base_level : 0, layer0 = c->has_view && c->view.set_layers ? c->view.min_layer : 0;
-    size_t row = S.copy_stride ? (size_t)S.copy_stride : (size_t)((c->r.width + bw - 1) / bw) * (size_t)bpb;
-    size_t rows = (size_t)((c->r.height + bh - 1) / bh), img = S.copy_img_stride ? (size_t)S.copy_img_stride : row * rows;
+    const p_copy_strides *cs = copy_strides(c, size); int64_t rs = cs ? cs->row : S.copy_stride, is = cs ? cs->image : S.copy_img_stride;
+    size_t row = rs ? (size_t)rs : (size_t)((c->r.width + bw - 1) / bw) * (size_t)bpb;
+    size_t rows = (size_t)((c->r.height + bh - 1) / bh), img = is ? (size_t)is : row * rows;
     int is3d = c->tex->d.target == NVN_TEXTURE_TARGET_3D, nz = c->r.depth > 0 ? c->r.depth : 1;
     VkBuffer b; VkDeviceSize off;
     if (!hvk_buf(c->src, img * (size_t)nz, &b, &off, NULL)) { HVK_RED_ONCE("%s copy with a buffer outside the memory pools: skipped", to_buffer ? "texture→buffer" : "buffer→texture"); return; }

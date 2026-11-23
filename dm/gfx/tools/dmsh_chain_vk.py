@@ -20,7 +20,7 @@
 #   of each platform of PUBLISHED as <platform>/dmsh_xlate_vk[.exe]), SPIRV_CROSS_VK (default spirv-cross on PATH), DOTNET (default dotnet)
 import hashlib, os, platform, shutil, subprocess, sys
 HERE = os.path.dirname(os.path.abspath(__file__)); GFX = os.path.dirname(HERE); REPO = os.path.dirname(os.path.dirname(GFX))
-sys.path.insert(0, HERE); import dmsh_chain   # noqa: E402
+sys.path.insert(0, HERE); import dmsh_chain, tool_lock   # noqa: E402   (tool_lock: the fingerprints, sha16, upstream moved out of dmsh_chain.py)
 FILES = ['tools/dmsh_chain_vk.py', 'tools/dmsh_build_vk.py', 'tools/dmsh_spv.py', 'tools/dmsh_xlate_vk/Program.cs', 'tools/dmsh_xlate_vk/dmsh_xlate_vk.csproj',
          'tools/dmsh_build.py', 'tools/dmsh_chain.py', 'tools/dmsh_facts.py', 'tools/dmsh_atomic.py', 'tools/c1_guard.py', 'tools/cb_extent.py']
 FILES += [f for f in dmsh_chain.FILES if f.startswith('../third_party/ryujinx/')] + ['tools/dmsh_chain_vk.lock']
@@ -69,11 +69,11 @@ def tools_now():
     """The tool fingerprints here: the translator's dlls (as dmsh_chain.py takes the Metal one's), or a published translator's program (its platform's row), its embedded source
     hash, and this platform's SPIRV-Tools, glslang and SPIRV-Cross (their version lines: --revision for SPIRV-Cross, built per OS from the tag dm/gfx/tools/spirv_cross_bin/build.sh pins)"""
     d, t, p = os.path.dirname(XLATE_VK), {}, plat()
-    if published(): t['dmsh_xlate_vk_' + p] = dmsh_chain.sha16(XLATE_VK) if os.path.isfile(XLATE_VK) else 'missing'
+    if published(): t['dmsh_xlate_vk_' + p] = tool_lock.sha16(XLATE_VK) if os.path.isfile(XLATE_VK) else 'missing'
     else:
         for dll in DLLS:
             f = os.path.join(d, dll)
-            t[dll] = dmsh_chain.sha16(f) if os.path.isfile(f) else 'missing'
+            t[dll] = tool_lock.sha16(f) if os.path.isfile(f) else 'missing'
     t['xlate_source'] = _first_line([*xlate_cmd(), '--source-sha']) if os.path.isfile(XLATE_VK) else 'missing'
     t['spirv-tools_' + p] = _first_line(['spirv-val', '--version'])
     t['glslang_' + p] = _first_line(['glslangValidator', '--version'])
@@ -113,7 +113,7 @@ def published_rows(folder):
         f = os.path.join(folder, p, name)
         if not os.path.isfile(f): sys.exit(f'[RED] no published translator {f}: run dm/tools/publish_port_tools.sh for {p} into {os.path.join(folder, p)} first')
         if p == plat() and _first_line([f, '--source-sha']) != xlate_source_sha(): sys.exit(f'[RED] {f} was not built from the in-repo source: publish it again')
-        rows['dmsh_xlate_vk_' + p] = dmsh_chain.sha16(f)
+        rows['dmsh_xlate_vk_' + p] = tool_lock.sha16(f)
     return rows
 
 
@@ -135,7 +135,7 @@ if __name__ == '__main__':
         print('wrote', LOCK)
     elif len(a) == 3 and a[0] == '--check-published':
         p, f = a[1], a[2]
-        want, have = lock().get('dmsh_xlate_vk_' + p), dmsh_chain.sha16(f) if os.path.isfile(f) else 'missing'
+        want, have = lock().get('dmsh_xlate_vk_' + p), tool_lock.sha16(f) if os.path.isfile(f) else 'missing'
         if want != have: sys.exit(f'[RED] the published translator {f} does not match the lock: dmsh_xlate_vk_{p} lock {want} / actual {have} (if the translator or the SDK changed, '
                                   'run dmsh_chain_vk.py --update-lock with XLATE_VK_PUBLISHED and commit the lock and the header: docker/README.md)')
         print(f'{f}: dmsh_xlate_vk_{p} {have}, as the lock')

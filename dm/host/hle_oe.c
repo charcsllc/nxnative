@@ -1,10 +1,20 @@
 // nn::oe (application operating environment): on the real device the console state is queried through the am/oe services; the host gives fixed state directly.
 // oe::Initialize is in hle_sdkinit.c, not here.
-// Environment switches: DM_OPMODE=0 handheld / 1 console (default: the profile's op_mode, console unless set; console corresponds to the console-mode render profile); DM_LANG=language code (default en-US; the iOS app sets it from the IPA's DMLanguage, main.m).
+// Environment switches: DM_OPMODE=0 handheld / 1 console (default: the profile's op_mode, console unless set; console corresponds to the console-mode render profile); DM_LANG=language code (default: first supported language in control.nacp, else en-US; the apps set it from Info.plist DMLanguage).
 #include "hle.h"
+#include "front.h"
 
 // The operation mode is runtime state (the front end can change it: iOS overheat downgrade switches to handheld): the single source is here, taken once from DM_OPMODE at startup, the environment variable is not read again afterwards
 #include <stdatomic.h>
+#include <errno.h>
+#if defined(__APPLE__)
+#include <TargetConditionals.h>
+#endif
+#include <unistd.h>
+#if defined(__APPLE__) && !TARGET_OS_IPHONE   // the Mac's execve of its own host (_NSGetExecutablePath, _NSGetArgv); elsewhere the path the iPhone takes
+#include <crt_externs.h>
+#include <mach-o/dyld.h>
+#endif
 static _Atomic int g_opmode = -1;
 int dm_opmode(void) {
     int m = g_opmode;
@@ -12,8 +22,8 @@ int dm_opmode(void) {
     return m;
 }
 // ---------- System notification queue (AppletMessage): front end state changes → fetched by the game every frame with TryPopNotificationMessage ----------
-// Message numbers the host sends: 15 focus change, 30 operation mode change, 31 performance mode change
-enum { MSG_FOCUS = 15, MSG_OPMODE = 30, MSG_PERFMODE = 31 };
+// Message numbers the host sends: 15 focus change, 30 operation mode change, 31 performance mode change, 95 startup logo disappeared
+enum { MSG_FOCUS = 15, MSG_OPMODE = 30, MSG_PERFMODE = 31, MSG_STARTUP_LOGO = 95 };
 #define MQ 32
 static pthread_mutex_t g_mq_lock = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_mq_cond = PTHREAD_COND_INITIALIZER;   // cond: wakes the blocking PopNotificationMessage
 static uint32_t g_mq[MQ]; static int g_mqh, g_mqn;
@@ -45,7 +55,8 @@ static void mq_push_(uint32_t m) {
     // 15/30/31 are invalidation notifications meaning "query the current state", not events carrying historical values.
     // While one of the same type has not been taken yet, the first queue position is kept: a consumer loop only reads the latest state, repeated notifications write back the same thing, and with the same size there is no further resize.
     // Only these three state notifications are merged; future per-occurrence events (such as Resume/Exit) must not use this rule.
-    // Legitimate producers only send these three, so at most three items are pending, and any number of focus losses/restores no longer hits the 32-slot limit; after a pop, new changes are enqueued as usual.
+    // Legitimate state producers only send these three, so at most three of them are pending, and any number of focus losses/restores no longer hits the 32-slot limit; after a pop, new changes are enqueued as usual.
+    // Per-occurrence messages (95, startup logo disappeared) keep a position each.
     if (m == MSG_FOCUS || m == MSG_OPMODE || m == MSG_PERFMODE)
         for (int i = 0; i < g_mqn; i++)
             if (g_mq[(g_mqh + i) % MQ] == m) { pthread_mutex_unlock(&g_mq_lock); return; }
@@ -58,30 +69,67 @@ void dm_set_opmode(int m) {   // called by the front end (overheat downgrade etc
     int old = dm_opmode(); if (old == m) return;
     g_opmode = m;
     LOG("oe operation mode %d → %d", old, m);
+    dm_hid_opmode_changed();   // player 1's npad moved: the style events first, so the game finds the new npads when the notification sends it to look
     if (g_ntf_opmode) mq_push(MSG_OPMODE);
     if (g_ntf_perfmode) mq_push(MSG_PERFMODE);
 }
 // FocusState: 1 InFocus, 2 OutOfFocus, 3 Background. The front end calls dm_focus_set (iOS lifecycle / Mac window losing focus)
-static _Atomic int g_focus = 1; static _Atomic uint64_t g_focus_in_ns;   // time of the most recent entry into InFocus
+static _Atomic int g_focus = 1; static _Atomic uint64_t g_focus_in_ns;   // the front end's state; time of its most recent entry into InFocus
 // Focus handling mode the game set (-1: none). The SDK's oe::SetFocusHandlingMode (SDK 18 sdk+0x3c5770) turns it into am's SetFocusHandlingMode(notify, ?, suspend) and
 // SetOutOfFocusSuspendingEnabled: 0 → (0, 0, 1), 1 → (1, 1, 0), 2 → (1, 0, 1), 3 → (0, 0, 1) + out-of-focus suspending. Only 1 and 2 ask for focus notifications; under 0 and 3
 // the system suspends the game out of focus and it never sees message 15 (the host's suspend is the guest clock freeze and the graphics gate). Super Mario Galaxy 2 sets 3, and
 // its Wii layer's pause on focus 2 (main+0x663ba0) never finished: the main loop waits for the GX thread to pause (main+0x5ce870), which waits for work the paused CPU never sends
 static _Atomic int g_focus_mode = -1;
 static int focus_notifies(void) { int m = atomic_load(&g_focus_mode); return m != 0 && m != 3; }   // no mode set: notify, as before
-int dm_focus_now(void) { return atomic_load(&g_focus); }
+// Library applets the game has open (dm_applet_enter / dm_applet_leave, DM_APPLET in hle.h). On Horizon an applet the application starts takes its focus: am sends message 15
+// with OutOfFocus when it opens (libnx: AppletFocusState_OutOfFocus, "LibraryApplet open") and 15 with InFocus when it closes, and the application's Show call returns once it
+// has closed. The host's stand-ins answer on the caller's thread, so the game sees that pair around the call. Mario Kart 8 Deluxe applies the controller applet's answer only
+// after the InFocus notification (its notification thread main+0x8ea560 sets the flag main+0x87b5d0 takes each frame); with none its 2P character select never took input
+// (GitHub issue #550). The game sees the front end's state, or 2 while an applet is open over an application in focus; a change of what it sees is one notification 15
+static int g_applets; static _Atomic int g_seen = 1; static pthread_mutex_t g_seen_lock = PTHREAD_MUTEX_INITIALIZER;
+static void focus_sync(int applets) {   // applets: +1 an applet opens, -1 one closes, 0 the front end's state changed
+    pthread_mutex_lock(&g_seen_lock);
+    g_applets += applets;
+    if (g_applets < 0) die("dm_applet_leave without dm_applet_enter");
+    int w = atomic_load(&g_focus), s = w == 1 && g_applets ? 2 : w, changed = atomic_exchange(&g_seen, s) != s;
+    pthread_mutex_unlock(&g_seen_lock);
+    if (!changed) return;   // pushed outside the lock: 15 only says "query the state again", so pushes from two threads need no order
+    LOG("oe focus state → %d%s", s, applets > 0 ? " (library applet open)" : applets < 0 ? " (library applet closed)" : "");
+    if (focus_notifies()) mq_push(MSG_FOCUS);
+}
+void dm_applet_enter(const char *name) { LOG("oe library applet: %s", name); focus_sync(1); }
+void dm_applet_leave(void) { focus_sync(-1); }
+int dm_focus_now(void) { return atomic_load(&g_focus); }   // the front end's state, not an applet's: the display link follows the window
 uint64_t dm_focus_in_since(void) { return atomic_load(&g_focus_in_ns); }   // graphics layer display link watchdog: stalls are only computed while active, counted from activation (nvn_mtl.m mtl_present_wait)
 void dm_focus_set(int st) {
     if (st < 1 || st > 3) die("dm_focus_set: invalid state %d", st);
     if (st == 1) atomic_store(&g_focus_in_ns, now_ns());
     if (atomic_exchange(&g_focus, st) == st) return;
-    LOG("oe focus state → %d", st);
-    if (focus_notifies()) mq_push(MSG_FOCUS);
+    focus_sync(0);
 }
 static int opmode(void) { return dm_opmode(); }
 
+// oe::Initialize is replaced by the host, so SDK wrappers must never access its
+// uncreated am ApplicationFunctions. These two only toggle Horizon's crash-report
+// service (command 90), not process signal handling. There is no such service on
+// the host; native crash diagnostics remain enabled. Found on FIFA 23, SDK 13.3.5.
+HLE_FORCE("_ZN2nn2oe17EnableCrashReportEv", "Horizon crash-report service switch; no host service", void, h_oe_EnableCrashReport, void) {}
+HLE_FORCE("_ZN2nn2oe18DisableCrashReportEv", "Horizon crash-report service switch; no host service", void, h_oe_DisableCrashReport, void) {}
+
+// The SDK's backlight calls dereference am's absent CommonStateGetter.
+// The host does not control a Switch LCD; leave the host display on.
+HLE_FORCE("_ZN2nn2oe20SwitchLcdBacklightOnEv", "turn the handheld screen on (through am); the host has no Switch LCD", void, h_oe_LcdOn, void) {}
+HLE_FORCE("_ZN2nn2oe21SwitchLcdBacklightOffEv", "turn the handheld screen off (through am); the host has no Switch LCD", void, h_oe_LcdOff, void) {}
 // Screenshot / video recording switches: the host has no system screenshot service, no-op
+// Star Fox (SDK 21): the game marks the sections where it shows the player's own photographs (GameChat's camera pictures on screen); the system keeps those out of captures. No captures here
+HLE_FORCE("_ZN2nn2oe32BeginPresentPhotographedContentsEv", "photographed contents on screen: noted nowhere (no capture service)", void, h_oe_PhotoBegin, void) {}
+HLE_FORCE("_ZN2nn2oe30EndPresentPhotographedContentsEv", "photographed contents off screen", void, h_oe_PhotoEnd, void) {}
+HLE_FORCE("_ZN2nn2oe41ExitApplicationAndGoBackToInStoreDemoMenuEv", "the in-store demo's exit: the host runs no demo menu, the call is logged and ignored", void, h_oe_DemoExit, void) {
+    static int once; if (!once++) LOG("[RED] oe: ExitApplicationAndGoBackToInStoreDemoMenu called: ignored (no in-store demo menu)");
+}
 HLE_FORCE("_ZN2nn2oe17FinishStartupLogoEv", "dismiss the system boot screen (through the am application proxy); the host has no boot screen", void, h_oe_FinishLogo, void) {}   // Metroid Dread calls it at main+0xadfed0
+HLE_FORCE("_ZN2nn2oe35EnableStartupLogoDisappearedMessageEv", "startup logo is already absent: deliver its notification through the host's queue, without an am proxy",
+          void, h_oe_EnableStartupLogoMessage, void) { mq_push(MSG_STARTUP_LOGO); }
 // am retains the requested inactivity extension even when auto-sleep is disabled.
 // SDK 12.3.9 maps the normal setter to mode 1, Unsafe to mode 2, and false to 0.
 // Xenoblade Chronicles 3 reads it after the opening movie (sdk+0x3391f0).
@@ -92,16 +140,188 @@ HLE_FORCE("_ZN2nn2oe43GetUserInactivityDetectionTimeExtensionModeEv", "inactivit
 HLE_FORCE("_ZN2nn2oe15EnableRecordingEv", "video recording switch; the host has no system recording", void, h_oe_EnableRec, void) {}
 // Applet resource user ID (ARUID, the number am assigns to this process): the host has no am, and the SDK's own getter returns 0. SDK 20's OpenAudioRenderer (the CPU rendering + manual execution path, sdk+0x221730)
 //   aborts when it gets 0 (The Legend of Zelda: Breath of the Wild 1.9.0); SDK 16 did not check. Report a fixed non-zero ID, used only as an identifier
-HLE_FORCE("_ZN2nn6applet23GetAppletResourceUserIdEv", "applet resource user ID; the host returns a fixed non-zero value", uint64_t, h_applet_Aruid, void) { return 0x80; }
+HLE_FORCE("_ZN2nn6applet23GetAppletResourceUserIdEv", "applet resource user ID; the host returns a fixed non-zero value", uint64_t, h_applet_Aruid, void) { return DM_APPLET_RESOURCE_USER_ID; }
 // Launch parameter (present only when another program launched this one with one; returns bool): the host never passes one
-HLE_FORCE("_ZN2nn2oe21TryPopLaunchParameterEPmPvm", "launch parameter: none", unsigned, h_oe_PopLaunchParam, size_t *out, void *buf, size_t n) { (void)buf; (void)n; if (out) *out = 0; return 0; }
+// Launch parameter (present only when another program launched this one with one; returns bool): DM_LAUNCH_PARAM=<file>, written by oe::ExecuteProgram on the way here (below), else what
+// the profile's launch_param describes, for a program of a multi-program application run by itself: Super Mario 3D All-Stars' games quit without the launcher's language and two volumes
+// (fields: lang8, the language code GetDesiredLanguage gives; f32:<value>; u32:<value>; hex:<bytes>). Handed over once, as a popped parameter
+HLE_LINKAGE uint64_t h_oe_GetLang(void);   // HLE_LINKAGE as its entry (hle.h: static on Apple, external for the x86-64 engine's thunk)
+HLE_FORCE("_ZN2nn2oe21TryPopLaunchParameterEPmPvm", "launch parameter: what the program that started this one handed over, else the profile's launch_param; once", unsigned, h_oe_PopLaunchParam, size_t *out, uint8_t *buf, size_t n) {
+    static _Atomic int popped; if (out) *out = 0;
+    const char *f = getenv("DM_LAUNCH_PARAM");
+    if ((!(f && *f) && !*DM_GAME_LAUNCH_PARAM) || atomic_exchange(&popped, 1)) return 0;
+    if (f && *f) {
+        FILE *fp = fopen(f, "rb");
+        if (!fp) { LOG("[RED] oe::TryPopLaunchParameter: cannot open DM_LAUNCH_PARAM %s", f); return 0; }
+        size_t got = buf ? fread(buf, 1, n, fp) : 0; fclose(fp);
+        LOG("oe::TryPopLaunchParameter: %zu bytes from %s", got, f);
+        if (!got) return 0;   // started with no parameter
+        if (out) *out = got;
+        return 1;
+    }
+    uint8_t p[256]; size_t len = 0; char spec[512]; strlcpy(spec, DM_GAME_LAUNCH_PARAM, sizeof spec);
+    for (char *t = strtok(spec, " "); t && len < sizeof p - 8; t = strtok(NULL, " ")) {
+        if (!strcmp(t, "lang8")) { uint64_t v = h_oe_GetLang(); memcpy(p + len, &v, 8); len += 8; }
+        else if (!strncmp(t, "f32:", 4)) { float v = strtof(t + 4, NULL); memcpy(p + len, &v, 4); len += 4; }
+        else if (!strncmp(t, "u32:", 4)) { uint32_t u = (uint32_t)strtoul(t + 4, NULL, 0); memcpy(p + len, &u, 4); len += 4; }
+        else if (!strncmp(t, "hex:", 4)) for (const char *h = t + 4; h[0] && h[1] && len < sizeof p; h += 2) { unsigned b; sscanf(h, "%2x", &b); p[len++] = (uint8_t)b; }
+        else LOG("[RED] launch_param: field %s not understood", t);
+    }
+    if (len > n) len = n;
+    memcpy(buf, p, len); if (out) *out = len;
+    LOG("oe::TryPopLaunchParameter: %zu bytes from the profile (%s)", len, DM_GAME_LAUNCH_PARAM);
+    return 1;
+}
 // Tears of the Kingdom (SDK 20.5.22): the index of the program that launched this one in a multi-program application. The SDK asks the applet proxy, which the host never opens
 // (null read in applet::GetPreviousProgramIndex right after the window setup); -1 = launched from the home menu
-HLE_FORCE("_ZN2nn2oe23GetPreviousProgramIndexEv", "previous program index: launched from HOME, -1", int, h_oe_PrevProgram, void) { return -1; }
-// Launch another program of a multi-program application (Octopath Traveler 0 imports it); on hardware it does not return. The host has only this program: logged, and the game carries on
-HLE_FORCE("_ZN2nn2oe14ExecuteProgramEiPKvm", "launch another program of the application: the host runs only this one (logged)", void, h_oe_ExecProgram, int index, const void *param, size_t n) {
-    (void)param; LOG("[RED] oe::ExecuteProgram(%d, %zu bytes of parameters): the host runs only this program; the game carries on", index, n);
+HLE_FORCE("_ZN2nn2oe23GetPreviousProgramIndexEv", "previous program index: the program that started this one (DM_PREV_PROGRAM), else launched from HOME, -1", int, h_oe_PrevProgram, void) {
+    const char *e = getenv("DM_PREV_PROGRAM"); return e && *e ? atoi(e) : -1;
 }
+// The programs of a multi-program application on the Mac: DM_PROGRAMS=<file> has one row per packed program, "<index>\t<KEY=VALUE>\t…": exe= its host, arg= its rewritten modules, cwd= its
+// run folder, and its environment (DM_ROOT, DM_ROMFS, DM_SAVE, DM_MSL_DIR, …; the NSP script writes it). Each program has a host of its own, as a host is built for one profile.
+// oe::ExecuteProgram ends this program and starts the named one in its place, as Horizon does: execve of its host after the graceful exit, with this environment less every key a row sets,
+// then the row's keys, DM_LAUNCH_PARAM=<cwd>/launch_param.bin and DM_PREV_PROGRAM.
+// The call never returns on Horizon, and the code after it is not code to run: a trap (Super Mario 3D All-Stars' launcher, main+0x10a58) or the next function (ROMANCE OF THE THREE KINGDOMS 8
+// REMAKE, main+0xa31914). A program with no row (Super Mario 3D All-Stars' Galaxy, 32-bit ARM, which Apple silicon cannot run): the application's first program starts instead, as after a
+// restart from HOME. No table (a program run by itself): ExecuteProgram of its own index starts this host again, with its own arguments and folder; another program cannot start, and this one ends.
+// oe::RequestToRelaunchApplication is the same start of program 0 with no parameter and no previous program (GetPreviousProgramIndex -1, as from HOME), and DM_RELAUNCH=1 instead of
+// DM_LAUNCH_PARAM and DM_PREV_PROGRAM (DM_CTL resumes at the end of its file after either, instead of replaying the presses that led here).
+// The iPhone cannot start a process: with DM_EXEC_OUT=<file> (main.m, an app holding several programs) the program index (4 bytes) and the parameters go to that file, the front end names the next
+// program and schedules a notification that opens the app (front_program_handoff), the app ends, and its next start reads the file and runs that program. A program the app lacks: its first
+// program, with no parameters. An app of one program cannot start itself again: the front end asks the player to open the app again (front_program_handoff with no DM_EXEC_OUT), and the app ends.
+#if defined(__APPLE__) && !TARGET_OS_IPHONE   // the Mac's execve of its own host (_NSGetExecutablePath, _NSGetArgv); elsewhere the path the iPhone takes
+// cwd NULL: stay in this folder. The plan owns what it allocates (prog_plan_free): env (its entries point into environ, tsv or own), the table tsv that exe, cwd and arg point into,
+// and own, the two start keys. The host makes one plan and replaces itself with it (execve); a caller that makes another frees the first
+typedef struct { const char *exe, *cwd; char **argv, **env; char *argv2[3]; char self[4096]; char *tsv, *own[2]; } prog_plan;
+static void prog_plan_free(prog_plan *p) { free(p->env); free(p->tsv); free(p->own[0]); free(p->own[1]); memset(p, 0, sizeof *p); }
+static int prog_row_sets(const char *row, const char *kv) {
+    size_t kl = strcspn(kv, "=");
+    for (const char *f = strchr(row, '\t'); f && f[1]; f = strchr(f + 1, '\t')) if (!strncmp(f + 1, kv, kl) && f[1 + kl] == '=') return 1;
+    return 0;
+}
+static int prog_start_key(const char *kv) { return !strncmp(kv, "DM_LAUNCH_PARAM=", 16) || !strncmp(kv, "DM_PREV_PROGRAM=", 16) || !strncmp(kv, "DM_RELAUNCH=", 12); }
+// The plan of the program that starts: rows[hit] of the table (hit -1: this host itself, again; the rows point into out->tsv). Its environment is this one less the keys a start sets and
+// every key a row sets, then the row's keys, then the start's own (DM_RELAUNCH=1, or DM_LAUNCH_PARAM and DM_PREV_PROGRAM with the parameters in <its folder>/launch_param.bin).
+// 0: no plan (out keeps what it holds, for the caller's prog_plan_free)
+static int prog_plan_make(char **rows, int nr, int hit, prog_plan *out, const void *param, size_t n, int relaunch, const char *call) {
+    extern char **environ;
+    size_t ne = 0; while (environ[ne]) ne++;
+    char **env = out->env = calloc(ne + 68, sizeof *env); size_t k = 0;
+    if (!env) die("%s: out of memory", call);
+    for (size_t i = 0; i < ne; i++) {
+        int drop = prog_start_key(environ[i]);
+        for (int r = 0; r < nr && !drop; r++) drop = prog_row_sets(rows[r], environ[i]);
+        if (!drop) env[k++] = environ[i];
+    }
+    char here[4096]; const char *dir = here;
+    if (hit >= 0) {
+        const char *arg = NULL; int field = 0, prog = atoi(rows[hit]);
+        for (char *f = strtok(rows[hit], "\t"); f; f = strtok(NULL, "\t")) {
+            if (!field++) continue;
+            if (!strncmp(f, "exe=", 4)) out->exe = f + 4;
+            else if (!strncmp(f, "arg=", 4)) arg = f + 4;
+            else if (!strncmp(f, "cwd=", 4)) out->cwd = f + 4;
+            else if (strchr(f, '=') && k < ne + 64) env[k++] = f;
+        }
+        if (!out->exe || !arg || !out->cwd) { LOG("[RED] %s: DM_PROGRAMS's row of program %d lacks exe=, arg= or cwd=", call, prog); return 0; }
+        out->argv2[0] = (char *)out->exe; out->argv2[1] = (char *)arg; out->argv = out->argv2; dir = out->cwd;
+    } else {
+        uint32_t sz = sizeof out->self;
+        if (_NSGetExecutablePath(out->self, &sz)) { LOG("[RED] %s: the host's path does not fit", call); return 0; }
+        if (!relaunch && !getcwd(here, sizeof here)) { LOG("[RED] %s: no current folder", call); return 0; }
+        out->exe = out->self; out->argv = *_NSGetArgv();   // main leaves its argv as it was given, and the host never changes folder
+    }
+    if (relaunch) env[k++] = "DM_RELAUNCH=1";
+    else {
+        char *pp = NULL, *pe = NULL, *pv = NULL;
+        if (asprintf(&pp, "%s/launch_param.bin", dir) < 0 || asprintf(&pe, "DM_LAUNCH_PARAM=%s", pp) < 0 || asprintf(&pv, "DM_PREV_PROGRAM=%d", (int)(DM_GAME_PROGRAM_ID & 0xf)) < 0) die("%s: out of memory", call);
+        FILE *po = fopen(pp, "wb");
+        if (!po || (n && fwrite(param, n, 1, po) != 1)) LOG("[RED] %s: cannot write %s", call, pp);
+        if (po) fclose(po);
+        free(pp); env[k++] = out->own[0] = pe; env[k++] = out->own[1] = pv;
+    }
+    env[k] = NULL;
+    return 1;
+}
+// The Mac's plan for starting program `index` in this one's place, into P (an earlier plan there is freed first); 0: nothing can start, this program just ends (P holds nothing)
+static int oe_plan(int index, const void *param, size_t n, int relaunch, prog_plan *P, const char *call) {
+    prog_plan_free(P);
+    int cur = (int)(DM_GAME_PROGRAM_ID & 0xf);   // the program index is the program ID less the application's
+    const char *pf = getenv("DM_PROGRAMS");
+    if (!pf || !*pf) {   // a program run by itself
+        if (!relaunch && index != cur) return 0;
+        if (!prog_plan_make(NULL, 0, -1, P, param, n, relaunch, call)) { prog_plan_free(P); return 0; }
+        LOG("%s: this program ends and starts again", call);
+        return 1;
+    }
+    char *tsv = NULL; FILE *fp = fopen(pf, "rb");
+    long sz = fp && !fseek(fp, 0, SEEK_END) ? ftell(fp) : -1;   // -1: no file, or one that cannot seek
+    if (sz >= 0 && (tsv = P->tsv = calloc(1, (size_t)sz + 1))) { fseek(fp, 0, SEEK_SET); if (fread(tsv, 1, (size_t)sz, fp) != (size_t)sz) tsv[0] = 0; }
+    if (fp) fclose(fp);
+    if (!tsv) { LOG("[RED] %s: cannot read DM_PROGRAMS %s", call, pf); return 0; }
+    char *rows[64]; int nr = 0, hit = -1, first = -1;
+    for (char *ln = strtok(tsv, "\n"); ln && nr < 64; ln = strtok(NULL, "\n")) {
+        if (*ln < '0' || *ln > '9') continue;
+        if (atoi(ln) == index) hit = nr;
+        if (atoi(ln) == 0) first = nr;
+        rows[nr++] = ln;
+    }
+    if (hit < 0) {
+        LOG("[RED] %s: this application has no such program here; its first program starts instead", call);
+        hit = first; param = NULL; n = 0;
+    }
+    if (hit < 0 || !prog_plan_make(rows, nr, hit, P, param, n, relaunch, call)) { prog_plan_free(P); return 0; }
+    if (relaunch) LOG("%s: the application starts again from its first program, %s", call, P->exe);
+    else LOG("%s: this program ends, %s starts", call, P->exe);
+    return 1;
+}
+static void prog_exec(void *p) {
+    const prog_plan *P = p;
+    if (P->cwd && chdir(P->cwd)) LOG("[RED] oe: cannot enter %s", P->cwd);
+    execve(P->exe, P->argv, P->env);
+    LOG("[RED] oe: cannot start %s (errno %d)", P->exe, errno);
+}
+#endif
+static const char *prog_name(int index) {   // the profile's name of a program of this app (game.py header_multi), NULL when it has no such program
+#ifdef DM_GAME_MULTI
+    for (size_t i = 0; i < sizeof dm_games / sizeof *dm_games; i++) if (dm_games[i].program == index) return dm_games[i].name;
+#endif
+    (void)index; return NULL;
+}
+__attribute__((weak)) void front_program_handoff(int index, const char *name) { (void)index; (void)name; }   // front.h; the iOS front end has it
+// End this program and start program `index` with the parameters in its place (oe::ExecuteProgram), or the application's first program afresh (relaunch, oe::RequestToRelaunchApplication)
+static void oe_start(int index, const void *param, size_t n, int relaunch) {
+    if (relaunch) { index = 0; param = NULL; n = 0; }
+    const char *what = relaunch ? "oe::RequestToRelaunchApplication" : "oe::ExecuteProgram";
+    char hex[3 * 32 + 1] = "", call[192]; for (size_t i = 0; i < n && i < 32; i++) snprintf(hex + 3 * i, 4, " %02x", ((const uint8_t *)param)[i]);
+    if (relaunch) snprintf(call, sizeof call, "%s", what); else snprintf(call, sizeof call, "%s(%d, %zu bytes of parameters:%s)", what, index, n, hex);
+    int cur = (int)(DM_GAME_PROGRAM_ID & 0xf);
+    dm_gfx_quit_begin();   // this program ends: the pipeline archive starts writing now, beside the iPhone's notice (front_program_handoff, 1.5-3 s), and the exit waits for the rest
+#if defined(__APPLE__) && !TARGET_OS_IPHONE   // the Mac's execve of its own host (_NSGetExecutablePath, _NSGetArgv); elsewhere the path the iPhone takes
+    static prog_plan P;
+    if (oe_plan(index, param, n, relaunch, &P, call)) { dm_host_shutdown_then(what, prog_exec, &P); for (;;) pause(); }
+#endif
+    const char *rec = getenv("DM_EXEC_OUT");
+    if (rec && *rec) {   // the iPhone, an app holding several programs
+        const char *name = prog_name(index); int32_t ix = name ? index : 0;
+        if (!name) LOG("[RED] %s: this application has no such program here; its first program starts instead", call);
+        FILE *fp = fopen(rec, "wb");
+        if (!fp || fwrite(&ix, 4, 1, fp) != 1 || (name && n && fwrite(param, n, 1, fp) != 1)) LOG("[RED] %s: cannot write DM_EXEC_OUT %s", call, rec);
+        if (fp) fclose(fp);
+        LOG("%s: program %d recorded, this program ends", call, ix);
+        front_program_handoff(ix, prog_name(ix));
+    } else if (relaunch || index == cur) {   // the iPhone, an app of one program
+        LOG("[RED] %s: this program cannot start itself again here; it ends", call);
+        front_program_handoff(cur, prog_name(cur));
+    } else LOG("[RED] %s: the host has only this program; it ends", call);
+    dm_host_shutdown(what);
+    for (;;) pause();   // another thread is ending the host
+}
+void dm_oe_execute(int index, const void *param, size_t n) { oe_start(index, param, n, 0); }
+HLE_FORCE("_ZN2nn2oe14ExecuteProgramEiPKvm", "end this program and start another of the application (DM_PROGRAMS on the Mac); never returns", void, h_oe_ExecProgram, int index, const void *param, size_t n) { dm_oe_execute(index, param, n); }
+// Super Smash Bros. Ultimate 13.0.5 calls it after Options > Language > Yes ("the software will restart"), once the new language is saved. The SDK asks the am application proxy, which the
+// host never opens: applet::RequestToLaunchApplication read through the null proxy (sdk+0x804c8, SIGSEGV at address 0)
+HLE_FORCE("_ZN2nn2oe28RequestToRelaunchApplicationEv", "end this application and start it again from its first program, no launch parameter (on the Mac an execve of the host); never returns", void, h_oe_Relaunch, void) { oe_start(0, NULL, 0, 1); }
 HLE_FORCE("_ZN2nn2oe16DisableRecordingEv", "video recording switch; the host has no system recording", void, h_oe_DisableRec, void) {}
 // Silence the game's sound in system video captures (through am; FINAL FANTASY RESONANCE imports both): the host records nothing
 HLE_FORCE("_ZN2nn2oe13MuteRecordingEv", "mute the sound of system video recording; the host has no system recording", void, h_oe_MuteRec, void) {}
@@ -137,6 +357,26 @@ HLE_FORCE("_ZN2nn2oe18GetPerformanceModeEv", "performance mode query; same as th
 static unsigned char g_cpu_oc;
 HLE_FORCE("_ZN2nn2oe21IsCpuOverclockEnabledEv", "CPU overclock state (through apm): what SetCpuOverclockEnabled set, off at start", unsigned, h_oe_CpuOc, void) { return g_cpu_oc; }
 HLE_FORCE("_ZN2nn2oe22SetCpuOverclockEnabledEb", "CPU overclock switch (through apm); the host does not scale clocks", void, h_oe_SetCpuOc, unsigned on) { g_cpu_oc = on & 0xff; }
+// Switch 2 SDKs: the graphics scale, which the SDK takes from am's IGraphicsScalingParametersFunctions (a session the host never opened: null read in
+// oe::GetGraphicsScalingParameters). The SDK maps the parameter's first word 10 / 20 / 30 to scale 0 / 1 / 2. Which tier a console reports when is not measured. The games that
+// read it render at full size and count their whole GPU time with tier 0, and less with 1 and 2, so it is taken as how much of the GPU the game may use, not as the operation
+// mode (an inference from their code; a system that needs the GPU itself, as for GameChat's video, would lower it, which the host never does): the host answers 0 in both
+// modes. Donkey Kong Bananza takes it as its display manager's scale index (+0x1c7, main+0x549348): its frame buffer is the display's size times {1.0, 0.8, 2/3}[tier]
+// (main+0x30f840; docked 2304x1296 with tier 1, 2880x1620 with 0), and as an index into {3, 12, 16} (main+0x1d1a604) whose value less 3 (0, 9, 13) its dynamic resolution
+// adds to its GPU time (main+0x549614). Star Fox keeps only "tier 0" (byte +0xa of its event 5, main+0xba69970) and renders 0.8 times smaller below it: docked, 768x432 for
+// its 1920x1080 window where tier 0 gives 960x540, its handheld size. Ocarina of Time draws 2048x1152 with tier 1 and 2560x1440 with 0. The host answered 1 docked until
+// these were found. DM_GFX_SCALE sets a tier, to see what a game does with a reduced one
+static int gfx_scale(void) { const char *e = getenv("DM_GFX_SCALE"); int v = e ? atoi(e) : 0; return v >= 0 && v <= 2 ? v : 0; }
+HLE_FORCE("_ZN2nn2oe23GetCurrentGraphicsScaleEv", "graphics scale (Switch 2, through am): 0, the whole GPU (DM_GFX_SCALE sets 1 or 2)", int, h_oe_GfxScale, void) { return gfx_scale(); }
+HLE_FORCE("_ZN2nn2oe42SetGraphicsScaleChangedNotificationEnabledEb", "graphics scale change notification (Switch 2, through am); the host's scale never changes",
+          void, h_oe_GfxScaleNotify, unsigned on) { (void)on; }
+// The frame length the game aims at (Switch 2 SDKs): oe::SetGraphicsTargetFrameRate maps up to 59 fps to mode 1, up to 119 to mode 2 and above to mode 3, SetGraphicsTargetFrameRateAuto
+// to mode 0, and both call this, which locks the gs graphics server's context and sends it the mode. The host has no graphics server (nv::InitializeGraphics), so the context is null and
+// the lock crashed: Hyrule Warriors: Age of Imprisonment sets 60 / its present interval at boot (main+0x1e5d244). The host paces by the window's present interval, so the mode is only noted
+HLE_FORCE("_ZN2nn2gs3sdk26SetGraphicsFrameLengthModeENS1_23GraphicsFrameLengthModeE", "target frame length (Switch 2, gs): noted; the host paces by the present interval",
+          void, h_gs_FrameLength, int mode) {
+    static int last = -1; if (mode != last) { LOG("gs: graphics frame length mode %d (0 auto, 1 30 fps, 2 60 fps, 3 120 fps)", mode); last = mode; }
+}
 HLE_FORCE("_ZN2nn2oe27GetDefaultDisplayResolutionEPiS1_", "default display resolution: 1920x1080 docked, 1280x720 handheld", void, h_oe_DefRes, int *w, int *h) {
     int con = opmode() == 1; if (w) *w = con ? 1920 : 1280; if (h) *h = con ? 1080 : 720;
 }
@@ -156,6 +396,11 @@ HLE_FORCE("_ZN2nn2oe33EnableAlbumImageTakenNotificationEv", "screenshot-taken no
 HLE_FORCE("_ZN2nn2oe24IsInStoreDemoModeEnabledEv", "retail store demo mode (through am); never", unsigned, h_oe_StoreDemo, void) { return 0; }
 HLE_FORCE("_ZN2nn2oe27SetPerformanceConfigurationENS0_15PerformanceModeEi", "set the CPU/GPU clock config; the host does not scale clocks", void, h_oe_SetPerfCfg, int mode, int cfg) {
     LOG("oe::SetPerformanceConfiguration mode=%d cfg=%#x (ignored)", mode, cfg);
+}
+// The one-argument overload sets the configuration of both modes (SDK 14.3, TUNIC's sdk+0x3a5630: a table lookup, then apm::SetPerformanceConfiguration for Normal and for Boost); SDK 21.4.7's
+// goes through oe::detail::ApmSetPerformanceConfiguration. Both read the apm session the host never opened (Warhammer Survivors: null read at sdk+0x40720c as a scene begins)
+HLE_FORCE("_ZN2nn2oe27SetPerformanceConfigurationEi", "set the CPU/GPU clock config of both modes (through apm); the host does not scale clocks", void, h_oe_SetPerfCfgBoth, int cfg) {
+    LOG("oe::SetPerformanceConfiguration cfg=%#x (ignored)", cfg);
 }
 
 // Scripted state changes (verify lifecycle / overheat downgrade without a window): DM_OE_SCRIPT="focus=3@10,focus=1@20,opmode=0@30" (second N); bg=1 / bg=0 run the whole background round trip (see script_bg)
@@ -188,7 +433,7 @@ static void oe_script_start(void) {
 }
 static pthread_once_t g_oe_once = PTHREAD_ONCE_INIT;
 
-HLE_FORCE("_ZN2nn2oe20GetCurrentFocusStateEv", "foreground / background state; driven by the front end's dm_focus_set", int, h_oe_GetFocus, void) { return g_focus; }
+HLE_FORCE("_ZN2nn2oe20GetCurrentFocusStateEv", "foreground / background state; the front end's dm_focus_set, out of focus while a library applet is open", int, h_oe_GetFocus, void) { return atomic_load(&g_seen); }
 HLE_FORCE("_ZN2nn2oe20SetFocusHandlingModeENS0_17FocusHandlingModeE", "focus handling mode; 1 and 2 get focus notifications, 0 and 3 none (see g_focus_mode)", void, h_oe_SetFocusMode, int m) {
     atomic_store(&g_focus_mode, m); LOG("oe::SetFocusHandlingMode %d (%s)", m, focus_notifies() ? "focus notifications" : "suspended out of focus, no focus notifications");
 }
@@ -207,6 +452,7 @@ HLE_FORCE("_ZN2nn2oe25TryPopNotificationMessageEPj", "system notification queue;
 // The blocking form (Link's Awakening pops on a thread of its own, main+0xfa1ff8): the SDK's version waits on the system event oe::Initialize would have created,
 // and the host's oe::Initialize is a no-op, so it aborted on an uninitialized event. Wait for the host queue instead, then take the message the Try path's way
 HLE_FORCE("_ZN2nn2oe22PopNotificationMessageEv", "system notification queue (blocking); waits on the host queue", uint32_t, h_oe_PopMsg, void) {
+    pthread_once(&g_oe_once, oe_script_start);   // DM_OE_SCRIPT also for games that only pop this way (Mario Kart 8 Deluxe): the wait below reaches the Try path only once a notification is queued
     uint32_t m = 0;
     for (;;) {
         pthread_mutex_lock(&g_mq_lock);
@@ -229,23 +475,46 @@ HLE_FORCE("_ZN2nn2oe28SetResumeNotificationEnabledEb", "resume notification swit
 HLE_FORCE("_ZN2nn2oe42SetOperationModeChangedNotificationEnabledEb", "operation mode change notification switch", void, h_oe_SetOpModeNtf, unsigned on) { g_ntf_opmode = on & 0xff; }
 HLE_FORCE("_ZN2nn2oe44SetPerformanceModeChangedNotificationEnabledEb", "performance mode change notification switch", void, h_oe_SetPerfModeNtf, unsigned on) { g_ntf_perfmode = on & 0xff; }
 
-// nn::settings::LanguageCode = struct { char string[8]; }, 8 bytes returned by value in x0
-HLE_FORCE("_ZN2nn2oe18GetDesiredLanguageEv", "system language query; value from DM_LANG", uint64_t, h_oe_GetLang, void) {
+// nn::settings::LanguageCode = struct { char string[8]; }, 8 bytes returned by value in x0.
+// When DM_LANG is unset, pick the first language supported in control.nacp's SupportedLanguageFlag
+// (+0x302C, NACP bit order matching dm/tools/nacp.py LANGUAGES: en-US, then en-GB, then the game's
+// first supported language), matching Horizon and build_ipa_from_nsp.py's game_language("en-US").
+static const char *oe_lang(void) {
     const char *e = getenv("DM_LANG");
+    if (e && *e) return e;
+    static const char *const k_nacp_lang[] = {
+        "en-US", "en-GB", "ja", "fr", "de", "es-419", "es", "it",
+        "nl", "fr-CA", "pt", "ru", "ko", "zh-Hant", "zh-Hans", "pt-BR",
+        "pl", "th",
+    };
+    uint8_t b[4];
+    if (!dm_control_read(0x302C, b, sizeof b, NULL, 0)) {
+        uint32_t flag = (uint32_t)b[0] | ((uint32_t)b[1] << 8) | ((uint32_t)b[2] << 16) | ((uint32_t)b[3] << 24);
+        for (unsigned i = 0; i < sizeof k_nacp_lang / sizeof *k_nacp_lang; i++)
+            if (flag & (1u << i)) return k_nacp_lang[i];
+    }
+    return "en-US";
+}
+HLE_FORCE("_ZN2nn2oe18GetDesiredLanguageEv", "system language query; value from DM_LANG, else control.nacp", uint64_t, h_oe_GetLang, void) {
+    const char *e = oe_lang();
     char code[8] = {0};
-    strncpy(code, e && *e ? e : "en-US", sizeof code - 1);
+    strncpy(code, e, sizeof code - 1);
     uint64_t v; memcpy(&v, code, 8);
     return v;
 }
 
 // The console's region (Animal Crossing: New Horizons 3.0.3): the SDK asks settings::system::GetRegionCode, which reaches set:sys. A region that fits the language the game is given:
 // 0 Japan, 1 the Americas, 2 Europe, 4 Hong Kong / Taiwan / Korea (nn::settings::system::RegionCode; 3 Australia and 5 China are left out, no language points at them alone)
-HLE_FORCE("_ZN2nn2oe13GetRegionCodeEv", "console region (set:sys); from DM_LANG", int, h_oe_GetRegion, void) {
-    const char *e = getenv("DM_LANG"); if (!e || !*e) e = "en-US";
+HLE_FORCE("_ZN2nn2oe13GetRegionCodeEv", "console region (set:sys); from DM_LANG, else control.nacp", int, h_oe_GetRegion, void) {
+    const char *e = oe_lang();
     int r = !strncmp(e, "ja", 2) ? 0 : !strncmp(e, "ko", 2) || !strncmp(e, "zh", 2) ? 4 : !strcmp(e, "en-US") || !strcmp(e, "fr-CA") || !strcmp(e, "es-419") || !strcmp(e, "pt-BR") ? 1 : 2;
     static int once; if (!once++) LOG("oe::GetRegionCode: %d for language %s", r, e);
     return r;
 }
+
+// Whether the console limits the game's own language choice: the SDK asks the am session at vtable +0x238, which the host does not open (oe::Initialize). Hyrule Warriors:
+// Age of Imprisonment asks at boot (main+0x1af4504), after picking its language from GetDesiredLanguage. The host's language is DM_LANG alone and limits nothing
+HLE_FORCE("_ZN2nn2oe26IsLanguageSelectionLimitedEv", "language selection limit (through am): none", unsigned, h_oe_LangLimited, void) { return 0; }
 
 // nn::util::Uuid 16 bytes: a fixed local value (only used to tell devices apart locally, networking is cut)
 HLE_FORCE("_ZN2nn2oe17GetPseudoDeviceIdEPNS_4util4UuidE", "pseudo device ID; a fixed host value", void, h_oe_GetDevId, uint8_t *uuid) {

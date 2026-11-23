@@ -471,14 +471,15 @@ static hvk_shader *shader_get_(const char *key, int stage) {   // under g_sh_mu
 
 // ---------- Programs ----------
 static nvn_hmap g_prog;   // serial → hvk_prog
-typedef struct { uint64_t serial; const prog_t *bst[5]; uint64_t bser[5]; } comp_t;
+// bst: copies of the programs bound per stage when the combination was made, not pointers: since upstream 90edd532 those are a queued job's snapshots (nvn_queue.inc), freed with it
+typedef struct { uint64_t serial; prog_t bst[5]; uint8_t has[5]; } comp_t;
 static nvn_hmap g_comp;   // serial → comp_t: a combined program (nvn_state_hook_compose)
 uint64_t hvk_prog_compose(uint64_t old_serial, const prog_t *const bst[5]) {
     if (!g_comp.klen) nvn_hm_init(&g_comp, 8);
     if (old_serial) { free(nvn_hm_del(&g_comp, &old_serial)); if (g_prog.klen) free(nvn_hm_del(&g_prog, &old_serial)); }
     comp_t *c = calloc(1, sizeof *c); if (!c) return nvn_new_serial();
     c->serial = nvn_new_serial();
-    for (int i = 0; i < 5; i++) { c->bst[i] = bst[i]; c->bser[i] = bst[i] ? bst[i]->serial : 0; }
+    for (int i = 0; i < 5; i++) if (bst[i]) { c->bst[i] = *bst[i]; c->has[i] = 1; }
     nvn_hm_put(&g_comp, &c->serial, c);
     return c->serial;
 }
@@ -499,7 +500,7 @@ hvk_prog *hvk_prog_get(const prog_t *p) {
     o->serial = p->serial;
     if (c) {   // a combined program: each stage from the program bound there
         // prog_load hands back a copy of its own (malloc), freed once its stage is taken: it leaked one hvk_prog per stage of every combined program made (found at step P5)
-        for (int st = 0; st < 5; st++) if (c->bst[st]) { hvk_prog *s = prog_load(c->bst[st]); if (s) { o->sh[st] = s->sh[st]; free(s); } }
+        for (int st = 0; st < 5; st++) if (c->has[st]) { hvk_prog *s = prog_load(&c->bst[st]); if (s) { o->sh[st] = s->sh[st]; free(s); } }
     } else {
         hvk_prog *s = prog_load(p);
         if (s) { memcpy(o->sh, s->sh, sizeof o->sh); free(s); }

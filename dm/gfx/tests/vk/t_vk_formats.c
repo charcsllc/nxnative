@@ -209,7 +209,7 @@ static void run_format(const hostvk_dev *dev, int f, int forced) {
         hv_rt(&g_c, 1, rt, NULL);
         p_set_pool tpp = {(const dpool_t *)&g_tp}, spp = {(const dpool_t *)&g_sp}; hv_emit(&g_c, OP_SET_TEX_POOL, &tpp, sizeof tpp); hv_emit(&g_c, OP_SET_SAMP_POOL, &spp, sizeof spp);
         hv_bind(&g_c, &g_prog[ti], 3); hv_depth(&g_c, 0, 0, NVN_DEPTH_FUNC_ALWAYS); hv_cull(&g_c, NVN_FACE_NONE);
-        p_bind_tex1 b = {1, 0, (uint64_t)(uint32_t)id | (uint64_t)1 << 20, nvn_dpool_base(&g_tp, 1), nvn_dpool_base(&g_sp, 0)}; hv_emit(&g_c, OP_BIND_TEX1, &b, sizeof b);
+        p_bind_tex1 b = {1, 0, (uint64_t)(uint32_t)id | (uint64_t)1 << 20}; hv_emit(&g_c, OP_BIND_TEX1, &b, sizeof b);
         hv_draw(&g_c, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3, 1);
         hv_submit(&g_q, &g_c);
         int ok = hv_read_blocks(&target, VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, W, H, 1, 1, 1, bpb, got);

@@ -25,6 +25,9 @@ int dm_aot_profile_write(void) {   // as aot_profile.c writes a file: the tempor
     return rename(tmp, path);
 }
 
+__attribute__((weak)) void dm_rec_finish(void) {}   // hle_hid.c: DM_REC, off here
+void dm_gfx_quit_begin(void) {}   // hle_nvn.c: the pipeline archive, which this fixture has none of
+void dm_gfx_quit(int wait_ms) { (void)wait_ms; }
 int main(void) {
     int fails = 0;
     char cwd[400];

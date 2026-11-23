@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # Game profiles: dm/games/<base game title ID>/game.tsv (key <TAB> values..., lines starting with # are comments) + the shader tables (and patches.py, the rewriter's patches of the game's builds) in the same folder. The shader tools, the host build, iOS packaging and the NSP script take each game's constants from here.
 # Usage: game.py list (list all profiles); game.py <id> <key> [<default>] (print that key's value, for shell; without a default a missing key is an error); game.py header <id> <out.h> (generate the host's game_profile.h);
+#   game.py modules <id> <folder of rewritten modules> (the modules to load from it: the build row of its main's build, else the profile's modules);
 #   game.py dir <id> (print the profile folder); game.py link <id> <link> (point a symlink at the profile folder: make cannot take paths with spaces)
 #   The port's host program nxhost-run is one program for every profile (RUNTIME_FIELDS below): game.py header --runtime <out.h> (its game_profile.h, the same for every profile);
 #   game.py table <out.c> <default id> (the table of every profile in dm/games compiled into it, and the default it starts with: cmake -DGAME); game.py runtime <id> <out.tsv>
@@ -47,6 +48,18 @@ class Game:
             out[ver] = dict([('display', disp)] + [tuple(m.split('=', 1)) for m in mods])
         return out
 
+    def build_modules(self):
+        """{main build ID: [modules]} for each build row with a main: the modules that build has, in the load order of modules (Mario Kart World: the base game's main subsdk0 sdk,
+        1.8.0's main subsdk0 subsdk1 sdk). A row may name modules the profile does not load (Hades' subsdk0 and subsdk1): they stay unloaded"""
+        order, out = self.words('modules'), {}
+        for b in self.builds().values():
+            if 'main' in b: out[b['main']] = [m for m in order if m in b]
+        return out
+
+    def modules_in(self, folder):   # the modules of the profile a version's ExeFS (or its rewritten modules' folder) holds, in load order: a game's versions may differ in modules
+        folder = Path(folder)
+        return [m for m in self.words('modules', 'main') if (folder / m).is_file() or (folder / f'{m}.patched.bin').is_file()]
+
     def pairs(self, key):   # "a=b c=d" → [(a, b), (c, d)]
         return [tuple(w.split('=', 1)) for w in self.words(key)]
 
@@ -76,40 +89,106 @@ def load(name=None):
     return Game(d)
 
 
-def all_games():
-    out, seen = [], set()
+def all_games(skip=()):   # skip: profile folders left out (the NSP script's own provisional and derived profiles, which it never takes as registered ones)
+    out, seen, skip = [], set(), {Path(d).resolve() for d in skip}
     for root in search_dirs():
-        if not root.is_dir(): continue
+        if not root.is_dir() or root.resolve() in skip: continue
         for d in sorted(root.iterdir()):
             if (d / 'game.tsv').exists() and d.name not in seen: seen.add(d.name); out.append(Game(d))
     return out
 
 
-def by_title(tid):
-    return next((g for g in all_games() if g.title_id == tid), None)
+def by_title(tid, skip=()):
+    return next((g for g in all_games(skip) if g.title_id == tid), None)
 
 
-def by_build(main_id):   # the profile whose build rows register this main build ID (a release of the same build under another title ID: the NSP script's same_build)
-    return next((g for g in all_games() if any(b.get('main') == main_id for b in g.builds().values())), None)
+def by_build(main_id, skip=()):   # the profile whose build rows register this main build ID (a release of the same build under another title ID: the NSP script's same_build)
+    return next((g for g in all_games(skip) if any(b.get('main') == main_id for b in g.builds().values())), None)
+
+
+# The upscaler network (NDSR), by where the shader map found each key: the compute shaders of an NDSR pack (shader_split.py ndsr_shaders: a source ending in #NDSR@<offset>), whatever
+# ships it. The pack is a library several engines carry under their own names: agl's agl_ndsr.pck (Donkey Kong Bananza, Splatoon Raiders, Mario Kart World, Nintendo Switch Sports Resort)
+# and its siblings agl_ndsr_vr.pck and agl_ndsr_vr_light.pck (Ocarina of Time), Kirby Air Riders' and Fast Fusion's .ndsr files (the same 20 networks), Star Fox's nested in a VIPR container
+# (Splatoon Raiders' 20), and the pack inside nn::ndve's movie file. Being named only lets the host read a shader's colour from its code; one whose colour it does not know, or a dispatch
+# it cannot draw, runs as the game's (nvn_mtl.m up_mfx_color, up_mfx_encode)
+UPSCALER_SOURCE = re.compile(r'#NDSR@0x[0-9a-f]+$')
+
+
+def upscaler_keys(g):
+    """the game's own upscaler shaders, from its shader map (shader_split.py's source column): sorted 16-digit keys, none without a map"""
+    p = g.table('shader_map.tsv')
+    if not p.exists(): return []
+    keys = set()
+    for line in p.read_text(encoding='utf-8').splitlines():
+        c = line.split('\t')
+        if len(c) >= 5 and c[2] == 'compute' and UPSCALER_SOURCE.search(c[4]) and re.fullmatch(r'[0-9a-f]{16}', c[3]): keys.add(c[3])
+    return sorted(keys)
+
+
+def header(g):
+    """game_profile.h of a profile: one profile's constants, or with the key programs (a multi-program application packed as one game: Super Mario 3D All-Stars) a table of its programs' profiles"""
+    return header_multi([(0, g)] + [(int(n), load(i)) for n, i in g.pairs('programs')]) if g.get('programs', '') else header_one(g)
+
+
+def header_multi(progs):
+    """One host over the programs of a multi-program application: every program's constants in one table, dm_games, and DM_GAME_* macros that read the entry of the running program
+    (dm_game_cur, main.c: DM_PROGRAM, program 0 without it). progs: [(program index, profile)], program 0 first. A host switches programs by starting again (hle_oe.c), so the entry never changes in a run"""
+    rows, keys = [], []
+    for n, g in progs:
+        d = {m[1]: m[2] for m in (re.match(r'#define (DM_GAME_\w+) (.*)$', ln) for ln in header_one(g).splitlines()) if m}
+        rows.append((n, g, d)); keys += [k for k in d if k not in keys]
+    ARR = {'DM_GAME_MODULES': 0, 'DM_GAME_BUILD_MODULES': 2, 'DM_GAME_DISPLAY_VERSIONS': 2}   # brace lists, of strings (their entries in rows of 2 for the two), each padded with NULLs in the table
+    for k in ('DM_GAME_SHARED_FONT_TTF', 'DM_GAME_NVN_API_MAJOR', 'DM_GAME_NVN_API_MINOR'):
+        if k in keys: sys.exit(f'{k}: a key behind this macro (shared_font, device_api) is tested by the preprocessor and cannot differ per program; not supported with programs')
+    typ = lambda v: 'const char *' if v.startswith('"') else 'uint64_t ' if v.endswith('ull') else 'int '
+    fld = lambda k: k[len('DM_GAME_'):].lower()
+    # A macro's size in the table: the longest list among the programs
+    strs = lambda v: re.findall(r'"(?:[^"\\]|\\.)*"', v)
+    sz = {k: max(len(strs(d.get(k, ''))) for _, _, d in rows) for k in ARR}
+    scalars = [k for k in keys if k not in ARR]
+    for k in scalars:
+        vs = {typ(d[k]) for _, _, d in rows if k in d}
+        if len(vs) > 1: sys.exit(f'{k}: different types among the programs')
+    L = [f'// Generated by dm/games/game.py from the profiles of programs {", ".join(f"{n} ({g.id})" for n, g, _ in rows)}; do not edit', '#pragma once', '#include <stdint.h>', '#include <stddef.h>', '#define DM_GAME_MULTI 1',
+         'typedef struct { int program; ' + ' '.join(f'{typ(next(d[k] for _, _, d in rows if k in d))}{fld(k)};' for k in scalars) + ' ' + ' '.join(f'const char *{fld(k)}[{sz[k] or 1}];' for k in ARR) + ' } dm_game_t;']
+    ents = []
+    for n, g, d in rows:
+        ents.append('    {' + f'.program = {n}, ' + ', '.join(f'.{fld(k)} = {d[k]}' for k in scalars if k in d) + ', ' + ', '.join(f'.{fld(k)} = {{{", ".join(strs(d.get(k, "")))}}}' for k in ARR) + '},')
+    L += ['static const dm_game_t dm_games[] __attribute__((unused)) = {', *ents, '};',
+          'const dm_game_t *dm_game_cur(void);   // main.c: the entry of the program DM_PROGRAM names']
+    L += [f'#define {k} (dm_game_cur()->{fld(k)})' for k in scalars]
+    L += [f'#define {k} {{' + ', '.join(f'dm_game_cur()->{fld(k)}[{i}]' for i in range(sz[k])) + '}' for k in ARR]
+    return '\n'.join(L + [''])
 
 
 def constants(g):
     """The profile constants the host uses, checked: {key: value} in game_profile.h's order. The key is the macro's name after DM_GAME_ in lower case, the value an int,
-    a str, a list (modules: the names; display_versions: (main build ID, display version) pairs) or None (shared_font_ttf, nvn_api_major / nvn_api_minor: the
-    profile has no such key, so the host decides by the SDK version). header() writes them as macros (Apple: one host per game), runtime() and table() as the port's
-    profile file and compiled-in table (one host for every game: RUNTIME_FIELDS)"""
+    a str, a list (modules: the names; build_modules: (main build ID, [module names]) pairs; display_versions: (main build ID, display version) pairs) or None
+    (shared_font_ttf, nvn_api_major / nvn_api_minor: the profile has no such key, so the host decides by the SDK version). header_one() writes them as macros (Apple: one
+    host per game), runtime() and table() as the port's profile file and compiled-in table (one host for every game: RUNTIME_FIELDS)"""
     mods = g.words('modules')
     vers = [(b['main'], b['display']) for b in g.builds().values() if 'main' in b]
     pi = g.get('present_interval', 'game')   # present interval: game = as the game sets it (as on the Switch), display = one frame per display tick
     if pi not in ('game', 'display'): sys.exit(f'{g.id}: present_interval must be game or display: {pi}')
     ft = g.get('fps_target', '0')   # frame rate cap of the rewriter's frame step (FRAME_STEP in the profile's patches.py: Tears of the Kingdom 1.4.3, Breath of the Wild 1.9.0) or of the engine's own frame limit (hle_fpslock.c): 0 = the game's own step, 30 / 60
     if ft not in ('0', '30', '60'): sys.exit(f'{g.id}: fps_target must be 0, 30 or 60: {ft}')
+    fm = g.get('fps_max', '60')   # the highest rate fps_target and the player's Frame rate may take: 120 only for a game checked at that speed (hle_nvn.c fps_high)
+    if fm not in ('60', '120'): sys.exit(f'{g.id}: fps_max must be 60 or 120: {fm}')
     fh = g.get('fps_hold', 'on')   # whether the frame step may hold a frame longer than the cap's vsyncs when frames come late (hle_nvn.c fstep_tick): on / off
     if fh not in ('on', 'off'): sys.exit(f'{g.id}: fps_hold must be on or off: {fh}')
+    utp = g.get('ue_texture_pool', '0')   # Unreal's r.Streaming.PoolSize in MB, raised to this on the Mac (hle_uecvar.c; DM_UE_TEXTURE_POOL overrides, and turns it on for iOS): 0 = the game's own pool
+    if not utp.isdigit(): sys.exit(f"{g.id}: ue_texture_pool must be megabytes (0 = the game's own pool): {utp}")
+    ufc = g.get('ue_fps_cvar', 't.MaxFPS')   # the Unreal console variable the host writes fps_target into (hle_fpslock.c; found by name by the rewriter, ue_cvar.py NAMES): a game's own frame limit its settings apply to t.MaxFPS
+    if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_.]{0,30}', ufc): sys.exit(f'{g.id}: ue_fps_cvar must be a console variable name: {ufc}')
     ps = g.get('present_snap', 'off')   # present snapshots by default (nvn_mtl.m mtl_snap_on; DM_PRESENT_SNAP and the iOS launcher's Frame buffering override it): on / off
     if ps not in ('on', 'off'): sys.exit(f'{g.id}: present_snap must be on or off: {ps}')
     p4 = g.get('pso_mtl4', 'off')   # render pipelines through MTL4Compiler on iOS by default, with the pipeline archive and hybrid pipelines (on by default on the Mac; DM_PSO_MTL4 overrides): on / off
     if p4 not in ('on', 'off'): sys.exit(f'{g.id}: pso_mtl4 must be on or off: {p4}')
+    pg = g.words('pso_gpu', '')   # GPU architectures the app gets the pipeline archive made offline for (the NSP script's --gpu, build_ipa.sh): when pso_mtl4 is on the app gets these instead of the default g18p, the A19 / A19 Pro of the iPhone 17 family (e.g. 'applegpu_g19p' for a device of the family after it); unset → the default. Whitespace-separated tokens, with or without the applegpu_ prefix
+    if pg and (len(pg) > 4 or any(w == 'none' or not re.fullmatch(r'(applegpu_)?[A-Za-z0-9]+', w) for w in pg)):
+        sys.exit(f"{g.id}: pso_gpu takes 1-4 whitespace-separated GPU architectures such as 'g18p applegpu_g19p' (each an optional applegpu_ prefix then an alphanumeric token; there is no none: omit the key for g18p with pso_mtl4 on, or no archive with pso_mtl4 off): {pg}")
+    et = g.get('enc_thread', 'off')   # Metal encoding on its own thread on the Mac by default (nvn_rec.h rec_on; on iOS it is on for every game; DM_NVN_ENC_THREAD overrides): on / off
+    if et not in ('on', 'off'): sys.exit(f'{g.id}: enc_thread must be on or off: {et}')
     cp = g.get('core_preempt', 'off')   # same-core preemption approximation (hle_thread.c): on / off
     if cp not in ('on', 'off'): sys.exit(f'{g.id}: core_preempt must be on or off: {cp}')
     aba = g.get('alloc_big_align', 'off')   # nn::mem::StandardAllocator::Allocate aligns blocks of 64 KB or more to 64 KB (hle_os.c; Vanillaware's memory pool storage): on / off
@@ -118,22 +197,29 @@ def constants(g):
     if sf not in ('bfttf', 'ttf'): sys.exit(f'{g.id}: shared_font must be bfttf or ttf: {sf}')
     pl = g.get('pad_layout', 'simple')   # the virtual gamepad's first layout (DmGamepad.m; afterwards whatever the player switched to in game is kept): simple = 2D, full = 3D (D-pad, right stick, L3 / R3),
     if pl not in ('simple', 'full', 'touch'): sys.exit(f'{g.id}: pad_layout must be simple, full or touch: {pl}')   # touch = Tap (no control: every touch goes to the game's touch screen)
-    fbs = g.words('feedback_snap', '')   # fragment shader key prefixes whose same-pass feedback sampling gets a snapshot first (nvn_mtl.m fb_prepare); none by default
-    if any(not re.fullmatch(r'[0-9a-f]{8,16}', k) for k in fbs): sys.exit(f'{g.id}: feedback_snap takes fragment shader keys (8-16 lowercase hex digits): {fbs}')
-    rcd = g.get('render_cond', 'off')   # NVN conditional rendering evaluated at replay, timestamp reports with counter 0 (nvn_mtl.m OP_RENDER_COND): on / off
-    if rcd not in ('on', 'off'): sys.exit(f'{g.id}: render_cond must be on or off: {rcd}')
+    sks = g.get('shader_key_skip', '')   # control-section bytes the shader keys hash as zeros, <offset>+<length> (hle_nvn.c keys_hash, shader_split.py key_ctl; Batman: Arkham Knight: GLSLC's compile information, 0x770+0x78)
+    m = re.fullmatch(r'(0x[0-9a-fA-F]+|\d+)\+(0x[0-9a-fA-F]+|\d+)', sks) if sks else None
+    if sks and (not m or not 0x30 <= int(m[1], 0) or not 0 < int(m[2], 0) or int(m[1], 0) + int(m[2], 0) > 0x880 or (int(m[1], 0) < 0x760 and int(m[1], 0) + int(m[2], 0) > 0x700)):   # not over +0x700..+0x75f, the code area and compute fields the tools read
+        sys.exit(f'{g.id}: shader_key_skip takes <offset>+<length> within the first 0x880 bytes of the control section, past its header (+0x30) and clear of +0x700..+0x75f: {sks}')
+    sko, skl = (int(m[1], 0), int(m[2], 0)) if m else (0, 0)
+    if g.get('render_cond', ''): print(f'{g.id}: render_cond is ignored: the host evaluates NVN conditional rendering for every game', file=sys.stderr)   # a profile written before the key went (a build folder's derived one)
     tfu = g.get('tex_flush_upload', 'off')   # textures written by the CPU into a pool and published with nvnMemoryPoolFlushMappedRange are uploaded like packaged ones (hle_nvn.c): on / off
     if tfu not in ('on', 'off'): sys.exit(f'{g.id}: tex_flush_upload must be on or off: {tfu}')
+    stage_copy = g.get('tex_copy_staging', '')
+    sc = re.fullmatch(r'([0-9a-f]{32}):(0x[0-9a-f]+)', stage_copy) if stage_copy else None
+    if stage_copy and (not sc or not 0 < int(sc[2], 16) <= 0x7ffffffc or int(sc[2], 16) % 4):
+        sys.exit(f'{g.id}: tex_copy_staging takes a main build ID and an aligned return address offset: {stage_copy}')
     tdu = g.get('tex_dirty_upload', 'off')   # with tex_flush_upload: a registered texture the CPU writes after init without any flush is uploaded too (dirty pages, hle_nvn.c nvn_ft_written): on / off
     if tdu not in ('on', 'off') or (tdu == 'on' and tfu != 'on'): sys.exit(f'{g.id}: tex_dirty_upload must be on or off, and needs tex_flush_upload on: {tdu}')
     tds = g.get('tex_dyn_slots', 'off')   # shaders whose texture handle the translator could not trace to one slot: slot indices in c2, the bound slots in the fallback arrays (nvn_mtl.m): on / off
     if tds not in ('on', 'off'): sys.exit(f'{g.id}: tex_dyn_slots must be on or off: {tds}')
     vcr = g.get('vconv_range', 'off')   # vertex attributes converted on the CPU only over the vertices each draw reads (nvn_mtl.m vc_draw_range): on / off
     if vcr not in ('on', 'off'): sys.exit(f'{g.id}: vconv_range must be on or off: {vcr}')
-    mml = g.get('mem_map_limit', 'off')   # MapPhysicalMemory refused beyond the application pool, as on Horizon (hle_svc.c): on / off
-    if mml not in ('on', 'off'): sys.exit(f'{g.id}: mem_map_limit must be on or off: {mml}')
-    gts = g.get('gpu_timestamps', 'submission')   # counter timestamps (nvn_mtl.m rep_ticks): submission = one time per submission, segment = the GPU start / end of the segment holding the report
-    if gts not in ('submission', 'segment'): sys.exit(f'{g.id}: gpu_timestamps must be submission or segment: {gts}')
+    mml = g.get('mem_map_limit', '')   # MapPhysicalMemory refused beyond the application pool, as on Horizon (hle_svc.c): on / off (unset: on for Switch 2, off for Switch 1)
+    if mml not in ('', 'on', 'off'): sys.exit(f'{g.id}: mem_map_limit must be on or off: {mml}')
+    ups = upscaler_keys(g)   # the game's own upscaler shaders, which DM_UPSCALER=metalfx (the launcher's Game's upscaler) replaces with MetalFX's spatial scaler (nvn_mtl.m up_mfx_encode)
+    dbr = g.get('draw_barriers', 'full')   # how draw passes are ordered (nvn_mtl.m barrier_game): full = each waits for all earlier GPU work, game = by the game's own barriers, so vertex work overlaps the previous pass's fragments
+    if dbr not in ('full', 'game'): sys.exit(f'{g.id}: draw_barriers must be full or game: {dbr}')
     om = g.get('op_mode', 'console')   # the operation mode reported at start (hle_oe.c dm_opmode; DM_OPMODE overrides): console = docked, handheld = touch screen in use (Super Mario Galaxy's pointer)
     if om not in ('console', 'handheld'): sys.exit(f'{g.id}: op_mode must be console or handheld: {om}')
     if pl == 'touch' and om != 'handheld': sys.exit(f'{g.id}: pad_layout touch needs op_mode handheld (the touch screen reaches the game only in handheld mode)')
@@ -143,20 +229,35 @@ def constants(g):
     if dmo not in ('gl', 'zero'): sys.exit(f'{g.id}: depth_mode must be gl or zero: {dmo}')
     api = g.get('device_api', '55.15')   # the NVN API major.minor version nvnDeviceGetInteger reports (hle_nvn.c)
     if not re.fullmatch(r'\d+\.\d+', api): sys.exit(f'{g.id}: device_api must be major.minor: {api}')
-    return {'id': g.id, 'name': g.get('name'), 'program_id': int(g.get('program_id'), 16), 'modules': mods, 'romfs_marker': g.get('romfs_marker'),
+    scov = g.words('shader_covers', '')   # additional registered builds verified to be covered by shader_versions' committed tables (Hades II v655360, FIFA 23 v196608)
+    if scov:
+        builds, sv = g.builds(), set(g.words('shader_versions', ''))
+        if bad := [v for v in scov if v not in builds]: sys.exit(f'{g.id}: shader_covers names unregistered build(s): {" ".join(bad)}')
+        if dup := [v for v in scov if v in sv]: sys.exit(f'{g.id}: shader_covers repeats shader_versions: {" ".join(dup)}')
+    return {'id': g.id, 'name': g.get('name'), 'program_id': int(g.get('program_id'), 16), 'modules': mods,
+            # each build's own modules (main.c picks the row of main's build ID, else DM_GAME_MODULES): a version may lack a module another has
+            'build_modules': [(bid, list(ms)) for bid, ms in g.build_modules().items()],
+            'romfs_marker': g.get('romfs_marker'),
             'mem_reserve': g.int('mem_reserve'), 'mem_alias': g.int('mem_alias'), 'mem_stack': g.int('mem_stack'), 'app_pool': g.int('app_pool'),
             'mem_used': int(g.get('mem_used', '0x4000000'), 0),   # used memory reported beside the heap (hle_svc.c GetInfo UsedMemorySize)
             'sys_resource': int(g.get('sys_resource', '0x2000000'), 0),   # the NPDM's system resource size (hle_svc.c GetInfo TotalSystemResourceSize; 0 = no virtual address memory)
             'args': g.get('game_args', ''),   # game arguments when the command line gives none (main.c; Octopath Traveler 0: Unreal's -SwitchVirtualAddressSpaceSize=)
             'env': g.get('game_env', ''),   # KEY=VALUE pairs getenv answers (hle_os.c; Absolum: .NET's DOTNET_GCRegionRange)
-            'mem_map_limit': int(mml == 'on'),
+            'launch_param': g.get('launch_param', ''),   # what oe::TryPopLaunchParameter hands over once (hle_oe.c; a program another program of the application launches: Super Mario 3D All-Stars)
+            'mem_map_limit': -1 if not mml else int(mml == 'on'),   # -1: not set (the host decides by the console: on for Switch 2, off for Switch 1)
             'stdalloc_cap': int(g.get('stdalloc_cap', '0'), 0),   # StandardAllocator's address space with virtual address memory (hle_svc.c); 0 = what the alias region has room for
+            'screen_aspect': ('off', 'on').index(g.get('screen_aspect', 'off')),   # stubs that follow a screen taller than 16:9 (DM_SCREEN_ASPECT): off / on
             'display_versions': vers, 'present_display': int(pi == 'display'), 'core_preempt': int(cp == 'on'), 'alloc_big_align': int(aba == 'on'), 'fps_target': int(ft),
-            'fps_hold': int(fh == 'on'), 'present_snap': int(ps == 'on'), 'pso_mtl4': int(p4 == 'on'),
+            'fps_max': int(fm), 'fps_hold': int(fh == 'on'), 'ue_texture_pool': int(utp), 'ue_fps_cvar': ufc,
+            'present_snap': int(ps == 'on'), 'pso_mtl4': int(p4 == 'on'), 'enc_thread': int(et == 'on'),
             'shared_font_ttf': int(sf == 'ttf') if g.get('shared_font', '') else None,   # without the key the host decides by the SDK version (hle_sdk16.c)
-            'pad_layout': ('simple', 'full', 'touch').index(pl), 'opmode': int(om == 'console'), 'perf_boost': int(pm == 'boost'), 'feedback_snap': ' '.join(fbs),
-            'tex_flush_upload': int(tfu == 'on'), 'render_cond': int(rcd == 'on'), 'tex_dirty_upload': int(tdu == 'on'), 'tex_dyn_slots': int(tds == 'on'),
-            'gpu_ts_segment': int(gts == 'segment'), 'vconv_range': int(vcr == 'on'),
+            'pad_layout': ('simple', 'full', 'touch').index(pl), 'opmode': int(om == 'console'), 'perf_boost': int(pm == 'boost'),
+            'tex_flush_upload': int(tfu == 'on'),
+            'tex_copy_staging_build': sc[1] if sc else '', 'tex_copy_staging_pc': int(sc[2], 16) if sc else 0,
+            'shader_key_skip_off': sko, 'shader_key_skip_len': skl,
+            'tex_dirty_upload': int(tdu == 'on'), 'tex_dyn_slots': int(tds == 'on'), 'draw_barriers_game': int(dbr == 'game'),
+            'upscaler_keys': ','.join(ups), 'upscaler_n': len(ups),
+            'vconv_range': int(vcr == 'on'),
             'nvn_api_major': int(api.split('.')[0]) if g.get('device_api', '') else None,   # without the key: by the SDK version (hle_nvn.c nvn_api)
             'nvn_api_minor': int(api.split('.')[1]) if g.get('device_api', '') else None}
 
@@ -169,7 +270,7 @@ def cq(s):   # a C string literal
     return '"' + s.replace('\\', '\\\\').replace('"', '\\"') + '"'
 
 
-def header(g):
+def header_one(g):
     """the host's game_profile.h: the profile constants the host uses, as macros (Apple's form: the host is compiled for one profile)"""
     c, q = constants(g), cq
     vers = ', '.join('{' + q(b) + ', ' + q(d) + '}' for b, d in c['display_versions'])
@@ -180,6 +281,8 @@ def header(g):
          f'#define DM_GAME_PROGRAM_ID 0x{c["program_id"]:016X}ull',
          f'#define DM_GAME_MODULES {{{", ".join(map(q, c["modules"]))}}}',
          f'#define DM_GAME_NMOD {len(c["modules"])}',
+         # each build's own modules (main.c picks the row of main's build ID, else DM_GAME_MODULES): a version may lack a module another has
+         f'#define DM_GAME_BUILD_MODULES {", ".join("{" + q(bid) + ", " + q(" ".join(ms)) + "}" for bid, ms in c["build_modules"]) or "{0}"}',
          f'#define DM_GAME_ROMFS_MARKER {q(c["romfs_marker"])}',
          f'#define DM_GAME_MEM_RESERVE {c["mem_reserve"]:#x}ull',
          f'#define DM_GAME_MEM_ALIAS {c["mem_alias"]:#x}ull',
@@ -189,26 +292,34 @@ def header(g):
          f'#define DM_GAME_SYS_RESOURCE {c["sys_resource"]:#x}ull',
          f'#define DM_GAME_ARGS {q(c["args"])}',
          f'#define DM_GAME_ENV {q(c["env"])}',
+         f'#define DM_GAME_LAUNCH_PARAM {q(c["launch_param"])}',
          f'#define DM_GAME_MEM_MAP_LIMIT {c["mem_map_limit"]}',
          f'#define DM_GAME_STDALLOC_CAP {c["stdalloc_cap"]:#x}ull',
+         f'#define DM_GAME_SCREEN_ASPECT {c["screen_aspect"]}',
          f'#define DM_GAME_DISPLAY_VERSIONS {vers}',
          f'#define DM_GAME_PRESENT_DISPLAY {c["present_display"]}',
          f'#define DM_GAME_CORE_PREEMPT {c["core_preempt"]}',
          f'#define DM_GAME_ALLOC_BIG_ALIGN {c["alloc_big_align"]}',
          f'#define DM_GAME_FPS_TARGET {c["fps_target"]}',
+         f'#define DM_GAME_FPS_MAX {c["fps_max"]}',
          f'#define DM_GAME_FPS_HOLD {c["fps_hold"]}',
+         f'#define DM_GAME_UE_TEXTURE_POOL {c["ue_texture_pool"]}',
+         f'#define DM_GAME_UE_FPS_CVAR {q(c["ue_fps_cvar"])}',
          f'#define DM_GAME_PRESENT_SNAP {c["present_snap"]}',
          f'#define DM_GAME_PSO_MTL4 {c["pso_mtl4"]}',
+         f'#define DM_GAME_ENC_THREAD {c["enc_thread"]}',
          *([f'#define DM_GAME_SHARED_FONT_TTF {c["shared_font_ttf"]}'] if c['shared_font_ttf'] is not None else []),
          f'#define DM_GAME_PAD_LAYOUT {c["pad_layout"]}',
          f'#define DM_GAME_OPMODE {c["opmode"]}',
          f'#define DM_GAME_PERF_BOOST {c["perf_boost"]}',
-         f'#define DM_GAME_FEEDBACK_SNAP {q(c["feedback_snap"])}',
          f'#define DM_GAME_TEX_FLUSH_UPLOAD {c["tex_flush_upload"]}',
-         f'#define DM_GAME_RENDER_COND {c["render_cond"]}',
+         f'#define DM_GAME_TEX_COPY_STAGING_BUILD "{c["tex_copy_staging_build"]}"',
+         f'#define DM_GAME_TEX_COPY_STAGING_PC {c["tex_copy_staging_pc"]:#x}' if c['tex_copy_staging_pc'] else '#define DM_GAME_TEX_COPY_STAGING_PC 0',
+         f'#define DM_GAME_SHADER_KEY_SKIP_OFF {c["shader_key_skip_off"]:#x}', f'#define DM_GAME_SHADER_KEY_SKIP_LEN {c["shader_key_skip_len"]:#x}',
          f'#define DM_GAME_TEX_DIRTY_UPLOAD {c["tex_dirty_upload"]}',
          f'#define DM_GAME_TEX_DYN_SLOTS {c["tex_dyn_slots"]}',
-         f'#define DM_GAME_GPU_TS_SEGMENT {c["gpu_ts_segment"]}',
+         f'#define DM_GAME_DRAW_BARRIERS_GAME {c["draw_barriers_game"]}',
+         f'#define DM_GAME_UPSCALER_KEYS {q(c["upscaler_keys"])}', f'#define DM_GAME_UPSCALER_N {c["upscaler_n"]}',
          f'#define DM_GAME_VCONV_RANGE {c["vconv_range"]}',
          *([f'#define DM_GAME_NVN_API_MAJOR {c["nvn_api_major"]}', f'#define DM_GAME_NVN_API_MINOR {c["nvn_api_minor"]}'] if c['nvn_api_major'] is not None else []),
          '']
@@ -219,38 +330,58 @@ def header(g):
 # Each constant is a field of struct dm_game_profile, which the host fills at start from a profile file (runtime(): key<TAB>value rows, --profile / DM_GAME_PROFILE), from
 # the table of every profile in dm/games compiled into it (table(), --game <title ID>) or from the profile it was configured with (cmake -DGAME, the default). Kinds:
 #   str      any text without a tab or a line break, empty allowed          u64   0x<hex> (or decimal) up to 2^64 - 1
-#   flag     0 or 1        fps   0, 30 or 60        pad   0, 1 or 2 (pad_layout: simple, full, touch)
+#   flag     0 or 1        fps   0, 30 or 60        fpsmax   60 or 120        pad   0, 1 or 2 (pad_layout: simple, full, touch)
+#   tri      -1 (not set: the host decides), 0 or 1                          int   a decimal number below 2^31
 #   optflag  0, 1 or - (not set: the host decides by the SDK version)      optint   a decimal number below 65536, or - (not set)
 #   modules  the module names, separated by spaces: 1 to MAX_MODULES       versions   <main build ID>=<display version> pairs, separated by spaces: 0 to MAX_VERSIONS
-# The lists' bounds: Horizon's ExeFS holds at most 13 code modules (rtld, main, subsdk0 to subsdk9, sdk); a profile registers each build it was brought up on
-# (89 profiles: at most 4 modules and 3 builds today). A profile beyond either bound is refused here and by the host, never cut short
+#            (a blank inside a display version written %20, a % written %25)
+#   buildmods  <main build ID>=<module>,<module>... pairs, separated by spaces: 0 to MAX_VERSIONS (a build's own modules, each one of modules)
+# The lists' bounds: Horizon's ExeFS holds at most 13 code modules (rtld, main, subsdk0 to subsdk9, sdk); a profile registers each build it was brought up on.
+# A profile beyond either bound is refused here and by the host, never cut short. Every constant of Apple's game_profile.h (header_one) is a field: a new one is added to
+# constants() and to RUNTIME_FIELDS with its kind, and runtime_constants() refuses a profile whose constants and RUNTIME_FIELDS differ
 MAX_MODULES, MAX_VERSIONS = 16, 32
-RUNTIME_FIELDS = (('id', 'str'), ('name', 'str'), ('program_id', 'u64'), ('modules', 'modules'), ('romfs_marker', 'str'), ('mem_reserve', 'u64'), ('mem_alias', 'u64'),
-                  ('mem_stack', 'u64'), ('app_pool', 'u64'), ('mem_used', 'u64'), ('sys_resource', 'u64'), ('args', 'str'), ('env', 'str'), ('mem_map_limit', 'flag'),
-                  ('stdalloc_cap', 'u64'), ('display_versions', 'versions'), ('present_display', 'flag'), ('core_preempt', 'flag'), ('alloc_big_align', 'flag'),
-                  ('fps_target', 'fps'), ('fps_hold', 'flag'), ('present_snap', 'flag'), ('pso_mtl4', 'flag'), ('shared_font_ttf', 'optflag'), ('pad_layout', 'pad'),
-                  ('opmode', 'flag'), ('perf_boost', 'flag'), ('feedback_snap', 'str'), ('tex_flush_upload', 'flag'), ('render_cond', 'flag'), ('tex_dirty_upload', 'flag'),
-                  ('tex_dyn_slots', 'flag'), ('gpu_ts_segment', 'flag'), ('vconv_range', 'flag'), ('nvn_api_major', 'optint'), ('nvn_api_minor', 'optint'))
+RUNTIME_FIELDS = (('id', 'str'), ('name', 'str'), ('program_id', 'u64'), ('modules', 'modules'), ('build_modules', 'buildmods'), ('romfs_marker', 'str'),
+                  ('mem_reserve', 'u64'), ('mem_alias', 'u64'), ('mem_stack', 'u64'), ('app_pool', 'u64'), ('mem_used', 'u64'), ('sys_resource', 'u64'), ('args', 'str'),
+                  ('env', 'str'), ('launch_param', 'str'), ('mem_map_limit', 'tri'), ('stdalloc_cap', 'u64'), ('screen_aspect', 'flag'), ('display_versions', 'versions'),
+                  ('present_display', 'flag'), ('core_preempt', 'flag'), ('alloc_big_align', 'flag'), ('fps_target', 'fps'), ('fps_max', 'fpsmax'), ('fps_hold', 'flag'),
+                  ('ue_texture_pool', 'int'), ('ue_fps_cvar', 'str'), ('present_snap', 'flag'), ('pso_mtl4', 'flag'), ('enc_thread', 'flag'), ('shared_font_ttf', 'optflag'),
+                  ('pad_layout', 'pad'), ('opmode', 'flag'), ('perf_boost', 'flag'), ('tex_flush_upload', 'flag'), ('tex_copy_staging_build', 'str'),
+                  ('tex_copy_staging_pc', 'u64'), ('shader_key_skip_off', 'u64'), ('shader_key_skip_len', 'u64'), ('tex_dirty_upload', 'flag'), ('tex_dyn_slots', 'flag'),
+                  ('draw_barriers_game', 'flag'), ('upscaler_keys', 'str'), ('upscaler_n', 'int'), ('vconv_range', 'flag'), ('nvn_api_major', 'optint'),
+                  ('nvn_api_minor', 'optint'))
 
 
 def runtime_constants(g):
     """constants() checked for the port's form: the lists within their bounds, no tab or line break in a value (the profile file's rows could not hold it)"""
     c = constants(g)
-    assert [k for k, _ in RUNTIME_FIELDS] == list(c), 'RUNTIME_FIELDS and constants() list different keys'
+    if [k for k, _ in RUNTIME_FIELDS] != list(c):
+        sys.exit(f'{g.id}: game.py RUNTIME_FIELDS and constants() list different keys (a constant of game_profile.h the port\'s host does not take): '
+                 f'{sorted(set(c) ^ {k for k, _ in RUNTIME_FIELDS})}')
     if len(c['modules']) > MAX_MODULES: sys.exit(f'{g.id}: {len(c["modules"])} modules, more than the port\'s host takes ({MAX_MODULES}: game.py MAX_MODULES)')
     if len(c['display_versions']) > MAX_VERSIONS: sys.exit(f'{g.id}: {len(c["display_versions"])} build rows with a main build ID, more than the port\'s host takes ({MAX_VERSIONS}: game.py MAX_VERSIONS)')
+    if len(c['build_modules']) > MAX_VERSIONS: sys.exit(f'{g.id}: {len(c["build_modules"])} build rows with their own modules, more than the port\'s host takes ({MAX_VERSIONS}: game.py MAX_VERSIONS)')
     for b, d in c['display_versions']:
-        if not b or not d or re.search(r'[\s=]', b) or re.search(r'\s', d): sys.exit(f'{g.id}: build {b} display version {d!r}: the port\'s profile file needs a main build ID without "=" or blanks and a display version without blanks')
+        if not b or not d or re.search(r'[\s=]', b): sys.exit(f'{g.id}: build {b} display version {d!r}: the port\'s profile file needs a main build ID without "=" or blanks and a display version')
+    for b, ms in c['build_modules']:
+        if not b or re.search(r'[\s=,]', b) or not ms or any(m not in c['modules'] for m in ms):
+            sys.exit(f'{g.id}: build {b} modules {ms}: the port\'s profile file needs a main build ID without "=", "," or blanks and one module or more of the profile\'s modules')
     for k, v in c.items():
         if isinstance(v, str) and re.search(r'[\t\r\n]', v): sys.exit(f'{g.id}: {k} holds a tab or a line break, which the port\'s profile file cannot carry: {v!r}')
+    for k in ('ue_texture_pool', 'upscaler_n'):
+        if not 0 <= c[k] < 2 ** 31: sys.exit(f'{g.id}: {k} {c[k]} is outside the port\'s int field (0 to 2^31 - 1)')
     return c
+
+
+def pct(s):   # a display version in the profile file: its blanks ("1.0.2 b723") as %20 and % as %25, since the pairs are separated by spaces (game_rt.c decodes them)
+    return s.replace('%', '%25').replace(' ', '%20')
 
 
 def runtime_value(kind, v):   # a constant as the profile file writes it
     if v is None: return '-'
     if kind == 'u64': return f'{v:#x}'
     if kind == 'modules': return ' '.join(v)
-    if kind == 'versions': return ' '.join(f'{b}={d}' for b, d in v)
+    if kind == 'versions': return ' '.join(f'{b}={pct(d)}' for b, d in v)
+    if kind == 'buildmods': return ' '.join(f'{b}={",".join(ms)}' for b, ms in v)
     return str(v)
 
 
@@ -262,8 +393,10 @@ def runtime(g):
                      [f'{k}\t{runtime_value(kind, c[k])}' for k, kind in RUNTIME_FIELDS] + [''])
 
 
-CTYPE = {'str': 'const char *{}', 'u64': 'uint64_t {}', 'flag': 'int {}', 'fps': 'int {}', 'pad': 'int {}', 'optflag': 'int {}', 'optint': 'int {}',
-         'modules': 'int nmod; const char *{}[DM_GAME_MAX_MODULES]', 'versions': 'int nversions; struct dm_game_version {}[DM_GAME_MAX_VERSIONS]'}
+CTYPE = {'str': 'const char *{}', 'u64': 'uint64_t {}', 'flag': 'int {}', 'fps': 'int {}', 'fpsmax': 'int {}', 'pad': 'int {}', 'tri': 'int {}', 'int': 'int {}',
+         'optflag': 'int {}', 'optint': 'int {}', 'modules': 'int nmod; const char *{}[DM_GAME_MAX_MODULES]',
+         'versions': 'int nversions; struct dm_game_version {}[DM_GAME_MAX_VERSIONS]',
+         'buildmods': 'int nbuild_modules; struct dm_game_build_modules {}[DM_GAME_MAX_VERSIONS]'}
 
 
 def runtime_header():
@@ -278,6 +411,7 @@ def runtime_header():
          f'#define DM_GAME_MAX_MODULES {MAX_MODULES}   // ExeFS holds at most 13 code modules (game.py MAX_MODULES)',
          f'#define DM_GAME_MAX_VERSIONS {MAX_VERSIONS}   // build rows with a main build ID (game.py MAX_VERSIONS)',
          'struct dm_game_version { const char *build, *ver; };   // a main build ID and its display version (the build rows)',
+         'struct dm_game_build_modules { const char *build, *mods; };   // a main build ID and its own modules, separated by spaces (main.c profile_modules\' rows)',
          'struct dm_game_profile {']
     L += [f'    {CTYPE[kind].format(k)};' + ('   // -1: not set' if kind.startswith('opt') else '') for k, kind in RUNTIME_FIELDS]
     L += ['};',
@@ -290,6 +424,7 @@ def runtime_header():
         L.append(f'#define DM_GAME_{k.upper()} (dm_game.{k})')
         if kind == 'modules': L.append('#define DM_GAME_NMOD (dm_game.nmod)')
         if kind == 'versions': L.append('#define DM_GAME_NVERSIONS (dm_game.nversions)   // the port\'s form only: DM_GAME_DISPLAY_VERSIONS is an array here, not an initializer list')
+        if kind == 'buildmods': L.append('#define DM_GAME_NBUILD_MODULES (dm_game.nbuild_modules)   // the port\'s form only: DM_GAME_BUILD_MODULES is an array here, not an initializer list')
     return '\n'.join(L + [''])
 
 
@@ -301,6 +436,7 @@ def table_row(g):   # one profile as a designated initializer of struct dm_game_
         elif kind == 'u64': out.append(f'.{k} = {v:#x}ull')
         elif kind == 'modules': out.append(f'.nmod = {len(v)}, .{k} = {{{", ".join(map(cq, v))}}}')
         elif kind == 'versions': out.append(f'.nversions = {len(v)}, .{k} = {{{", ".join("{" + cq(b) + ", " + cq(d) + "}" for b, d in v)}}}')
+        elif kind == 'buildmods': out.append(f'.nbuild_modules = {len(v)}, .{k} = {{{", ".join("{" + cq(b) + ", " + cq(" ".join(ms)) + "}" for b, ms in v)}}}')
         else: out.append(f'.{k} = {-1 if v is None else v}')
     return '{' + ', '.join(out) + '}'
 
@@ -350,6 +486,9 @@ if __name__ == '__main__':
         write_if_changed(a[2], runtime(load(a[1])))
     elif len(a) == 3 and a[0] == 'table':
         write_if_changed(a[1], table(load(a[2])))
+    elif len(a) == 3 and a[0] == 'modules':   # the modules to load from a folder of rewritten modules: its main build's row, else all the profile's (main.c profile_modules)
+        g, bid = load(a[1]), re.search(r'^# BUILD_ID\s+(\w+)', (Path(a[2]) / 'main.fixups.tsv').read_text(errors='replace'), re.M)
+        print(' '.join(g.build_modules().get(bid.group(1) if bid else '', g.words('modules'))))
     elif len(a) == 2 and a[0] == 'dir':
         print(load(a[1]).dir)
     elif len(a) == 3 and a[0] == 'link':   # link → the profile folder (replaced when it points elsewhere)
@@ -361,4 +500,4 @@ if __name__ == '__main__':
         print(load(a[0]).get(*a[1:]))
     else:
         sys.exit(__doc__ or 'usage: game.py list | game.py <id> <key> [<default>] | game.py header <id> <out.h> | game.py header --runtime <out.h> | game.py runtime <id> <out.tsv> | '
-                 'game.py runtime --all <folder> | game.py table <out.c> <default id> | game.py dir <id> | game.py link <id> <link>')
+                 'game.py runtime --all <folder> | game.py table <out.c> <default id> | game.py modules <id> <rewritten modules> | game.py dir <id> | game.py link <id> <link>')

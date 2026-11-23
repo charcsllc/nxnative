@@ -15,7 +15,7 @@
 // The entry points under test, declared with their own types: each NVNT_<name> (nvn_protos.h) is the type its h_<name> is checked against in hle_nvn.c
 #define DECL(name) extern __typeof__(*(NVNT_##name)0) h_##name
 DECL(nvnDeviceBuilderSetDefaults); DECL(nvnDeviceBuilderSetFlags); DECL(nvnDeviceInitialize); DECL(nvnDeviceGetInteger); DECL(nvnDeviceFinalize);
-DECL(nvnQueueBuilderSetDevice); DECL(nvnQueueBuilderSetDefaults); DECL(nvnQueueInitialize); DECL(nvnQueueSubmitCommands); DECL(nvnQueueFenceSync); DECL(nvnQueueFinalize);
+DECL(nvnQueueBuilderSetDevice); DECL(nvnQueueBuilderSetDefaults); DECL(nvnQueueInitialize); DECL(nvnQueueSubmitCommands); DECL(nvnQueueFinish); DECL(nvnQueueFenceSync); DECL(nvnQueueFinalize);
 DECL(nvnMemoryPoolBuilderSetDefaults); DECL(nvnMemoryPoolBuilderSetDevice); DECL(nvnMemoryPoolBuilderSetStorage); DECL(nvnMemoryPoolBuilderSetFlags);
 DECL(nvnMemoryPoolInitialize); DECL(nvnMemoryPoolFinalize); DECL(nvnMemoryPoolGetBufferAddress);
 DECL(nvnCommandBufferInitialize); DECL(nvnCommandBufferAddCommandMemory); DECL(nvnCommandBufferBeginRecording); DECL(nvnCommandBufferEndRecording);
@@ -38,6 +38,14 @@ void dm_guest_frame_tick(void) {}
 module_t *module_of(const void *p) { (void)p; return NULL; }
 void dm_backtrace(uint64_t fp) { (void)fp; }
 int front_screen_max_fps(void) { return 60; }
+// The host functions upstream's frontend added calls to (90edd532): hle_svc.c's device sharing, hle_vi.c's layer crop and frame history, the front end's focus clock and its
+// capable frame rate, hle_cheats.c's per-frame cheats; none is linked here (dm/gfx/tests/t_host_stubs.c holds the same for the Mac's tests)
+void dm_device_share(const void *p, uint64_t size, int share) { (void)p; (void)size; (void)share; }
+void dm_vi_layer_crop(int c[4]) { c[0] = c[1] = c[2] = c[3] = 0; }
+void dm_vi_frame_queued(uint64_t frame) { (void)frame; }
+uint64_t dm_focus_in_since(void) { return 0; }
+int front_screen_capable_fps(void) { return 60; }
+void dm_cheats_present(void) {}
 static int (*g_fault_hook)(void *, int, void *);
 void dm_fault_hook_register(int (*fn)(void *, int, void *)) { g_fault_hook = fn; }   // nvn_dirty.c registers its page-fault hook at the first pool
 static unsigned g_preps;
@@ -92,10 +100,13 @@ int main(void) {
     h_nvnCommandBufferDrawArrays(&cb, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3);
     h_nvnCommandBufferSignalEvent(&cb, &ev, NVN_EVENT_SIGNAL_MODE_WRITE, NVN_EVENT_SIGNAL_LOCATION_TOP, 0, 7);
     NVNcommandHandle hd = h_nvnCommandBufferEndRecording(&cb);
-    check("the handle is the first record, in the pool", (long long)(uintptr_t)mem, (long long)hd);
+    // The handle is the recording's control list since upstream 90edd532 (nvn_obj.h ctl_e; the host lends control memory, as the test gives none): one piece, the records from
+    // the start of the pool's command memory
+    { uint64_t e0; memcpy(&e0, (const void *)(uintptr_t)hd, 8);
+      check("the handle is a control list: one last piece, at the first record in the pool", 1, ctl_kind(e0) == CTL_CHUNK && (e0 & CTL_LAST) && ctl_addr(e0) == mem); }
 
-    // Submitted: the decoder walks the list and hands every record to the null backend; the submission's fence is complete at once
-    h_nvnQueueSubmitCommands(&q, 1, &hd);
+    // Submitted: the queue copies the records into a job its worker replays (nvn_queue.inc); once the queue is finished, the decoder has handed every record to the null backend
+    h_nvnQueueSubmitCommands(&q, 1, &hd); h_nvnQueueFinish(&q);
     REACHED(be_queue_activate); REACHED(be_sub_begin); REACHED(be_exec); REACHED(be_sub_commit);
     REACHED(be_list_begin); REACHED(be_rec_pre); REACHED(be_state_dirty); REACHED(be_clear_color); REACHED(be_draw); REACHED(be_signal_event); REACHED(be_end);
     check("not reached: no texture copy was recorded", 0, nvn_null_reached("be_copy_t2t"));
@@ -104,11 +115,11 @@ int main(void) {
     NVNsync sync; check("SyncInitialize", 1, h_nvnSyncInitialize(&sync, &dev));
     h_nvnQueueFenceSync(&q, &sync, NVN_SYNC_CONDITION_ALL_GPU_COMMANDS_COMPLETE, 0);
     check("the fence of the submission is complete", NVN_SYNC_WAIT_RESULT_ALREADY_SIGNALED, h_nvnSyncWait(&sync, 0));
-    REACHED(be_last_fence); REACHED(be_wait);
+    REACHED(be_wait);   // FenceSync takes the queue's receipt for the submission (nvn_queue.inc, upstream 90edd532), no longer the backend's last fence; the wait reaches the backend
 
     // A second submission of the same list: another fence, the event written again
     *(volatile uint32_t *)(mem + 0x8000) = 0;
-    h_nvnQueueSubmitCommands(&q, 1, &hd);
+    h_nvnQueueSubmitCommands(&q, 1, &hd); h_nvnQueueFinish(&q);
     check("resubmitted list signals again", 7, h_nvnEventGetValue(&ev));
 
     // The pool goes: out of the table
