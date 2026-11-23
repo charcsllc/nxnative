@@ -147,7 +147,7 @@ struct Game {
 // ---- A pack the host refuses (dm/host/aot.h DM_AOT_REPACK) ----
 // nxhost-run ends with kRepackStatus when it refuses a pack of the game's module set at the start for a reason that packing the game again with this bundle cures (aot.h
 // dm_aot_pack_refused: the pack missing or no library it loads, no descriptor, another ABI, another image, another host's PLT bindings, another nxaot's imports, another
-// manifest's gates), after a [RED] line with the reason. After Play the launcher says so and offers the repack (exit_problem). One of them can be told before a start without
+// manifest's gates, a game profile file whose keys are another version's: game_rt.c), after a [RED] line with the reason. After Play the launcher says so and offers the repack (exit_problem). One of them can be told before a start without
 // loading a module: a pack built with the loader's bindings of its PLT slots to its own module (nxaot build --bind) has their names beside it, <pack folder>/<module>.bind.tsv
 // (the packer copies the file it gave nxaot there: `0x<slot> 0x<target> <symbol>` rows), and a name this host takes over (its HLE_FORCE list, nxhost-run --takeovers) binds
 // elsewhere, so the host would refuse that pack (bindings_problem). The others need the pack's descriptor, which the launcher does not load: they show after Play only

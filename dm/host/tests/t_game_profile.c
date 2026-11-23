@@ -124,6 +124,15 @@ int main(int argc, char **argv) {
     expect("an unknown key", with_row(base, "zzz", "bogus_key\t1"), 0, "unknown key 'bogus_key'");
     expect("a missing key", with_row(base, "mem_reserve", NULL), 0, "missing key 'mem_reserve'");
     expect("two missing keys", with_row(with_row(base, "mem_reserve", NULL), "opmode", NULL), 0, "missing keys|'mem_reserve'|'opmode'");
+    {   // another game.py's field set (a pack made before this program) returns -2, the caller's DM_AOT_REPACK; a malformed file of this field set -1, its usage status
+        struct dm_game_profile p; char err[1200];
+        int unknown = dm_game_profile_read(write_file("set1.tsv", with_row(base, "zzz", "bogus_key\t1")), &p, err, sizeof err);
+        int missing = dm_game_profile_read(write_file("set2.tsv", with_row(base, "mem_reserve", NULL)), &p, err, sizeof err);
+        int malformed = dm_game_profile_read(write_file("set3.tsv", with_row(base, "mem_stack", "mem_stack\t")), &p, err, sizeof err);
+        int twice = dm_game_profile_read(write_file("set4.tsv", with_row(base, "zzz", "name\tAnother")), &p, err, sizeof err);
+        check(unknown == -2 && missing == -2 && malformed == -1 && twice == -1, "another field set: -2 (an unknown key %d, a missing key %d); this one malformed: -1 (an empty "
+              "number %d, a key given twice %d)", unknown, missing, malformed, twice);
+    }
     expect("a key given twice", with_row(base, "zzz", "name\tAnother"), 0, "key 'name' given twice");
     expect("a row without a tab", with_row(base, "zzz", "name Another"), 0, "has no tab");
     expect("a malformed number", with_row(base, "mem_reserve", "mem_reserve\t0x14000000g"), 0, "key 'mem_reserve'|malformed");
@@ -225,7 +234,7 @@ int main(int argc, char **argv) {
     }
     {
         char *a[] = {"nxhost-run", "--profile", (char *)write_file("bad.tsv", with_row(base, "zzz", "bogus_key\t1")), "dir", NULL}; char **av = a; int ac = 4;
-        check(dm_game_profile_select(&ac, &av) == -1, "--profile of a file with an unknown key: refused");
+        check(dm_game_profile_select(&ac, &av) == -2, "--profile of a file with an unknown key: refused with -2 (another field set: the repack status)");
     }
     printf("t_game_profile: %d checks, %d failed\n", checks, fails);
     return fails != 0;

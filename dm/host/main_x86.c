@@ -13,7 +13,7 @@
 //   The engine: the JIT fallback is in the program when it was built with NXHOST_JIT (CMake option); without it guest code that has no compiled entry stops the process with
 //   status 3 and a [RED] line naming the address. The exit status is the run's (aot.h: 0 the process ended, 1 a trap, 3 the JIT needed, 4 a fault, 6 guest code returned to the
 //   host, 7 guest threads that did not stop), or 8 when the program refuses a pack at the start for a reason a repack cures (aot.h DM_AOT_REPACK: another image, ABI, host's
-//   PLT bindings, nxaot's imports, manifest's gates; the launcher offers the repack for it).
+//   PLT bindings, nxaot's imports, manifest's gates, a game profile file of another field set; the launcher offers the repack for it).
 // nxhost-run --takeovers prints the names of the forced take-overs (HLE_FORCE) and nothing else: what the launcher checks a pack's PLT bindings against before a start.
 // nxhost-run [--profile <file>] --bindings <folder> <dir> maps and relocates the module set as a start does, writes each module's loader bindings to <folder> (the profile's
 // <module>.bind.tsv) and ends before any pack loads: the packer's bindings for a first pack (scripts/build_ipa_from_nsp.py).
@@ -258,7 +258,9 @@ int main(int argc, char **argv) {
     // over), with no game files; 0 when it holds (CTest nxhost_check_tables)
     if (argc == 2 && !strcmp(argv[1], "--check-tables")) { int dm_check_tables(void); return dm_check_tables(); }
     // The game profile first, before anything reads a DM_GAME_* constant (the loading thread of DM_PRELOAD too): --profile / --game are taken off the arguments here
-    if (dm_game_profile_select(&argc, &argv)) return DM_AOT_USAGE;
+    int profile = dm_game_profile_select(&argc, &argv);
+    if (profile == -2) dm_aot_pack_refused("the game profile file is not this program's: its keys are another version's (game.py runtime writes it at the pack)");
+    if (profile) return DM_AOT_USAGE;
     // --bindings <folder>: the module set's loader bindings written there, the process ended before any pack loads (aot.h dm_aot_write_module_bindings)
     if (argc >= 3 && !strcmp(argv[1], "--bindings")) {
         void loader_bindings_only(const char *dir);

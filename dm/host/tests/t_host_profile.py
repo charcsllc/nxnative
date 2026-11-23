@@ -10,8 +10,8 @@ the frame step (fps_target: loader.c's line for the module's state page), and th
   3. --profile <file>: game.py runtime writes the file of a profile found through DM_GAMES_DIR in a temporary folder, a copy of the default's game.tsv with another title ID,
      name, mem_reserve and fps_target, the module list "main" (so the run names no module: the list is the profile's) and game_args (main_x86.c logs them as the profile's);
      then the same file through DM_GAME_PROFILE=<file>.
-And the refusals, each a [RED] line naming what is wrong and status 2 before any module is read: --game of an unknown title ID, a file with an unknown key, a file without a
-key, a malformed number, --game and a file together.
+And the refusals, each a [RED] line naming what is wrong before any module is read: status 2 for --game of an unknown title ID, a malformed number and --game and a file
+together; status 8 (DM_AOT_REPACK, with the repack line) for a file with an unknown key and a file without a key, another version's field set, which a repack writes again.
 Without the packs (--packs empty and NXAOT_PACKS unset: the Windows runner without them, a tree built without them) only the refusals run, and a note says so.
   t_host_profile.py --build <build folder> [--packs <folder>]
 """
@@ -83,16 +83,20 @@ def main():
         print(f't_host_profile: {exe}, default {default_id} ({dc["name"]})')
         # Refusals: before any module is read (no "modules from" line), whatever the folder
         nowhere = str(tmp / 'no-such-folder')
-        for what, args, extra, want in (
-                ('an unknown title ID', ['--game', '0123456789ABCDEF', nowhere], None, ['[RED] --game 0123456789ABCDEF: no such game profile']),
-                ('a file with an unknown key', ['--profile', str(changed('unknown.tsv', 'bogus_key', 'bogus_key\t1')), nowhere], None, ['[RED] game profile file', "unknown key 'bogus_key'"]),
-                ('a file without a key', ['--profile', str(changed('missing.tsv', 'mem_alias', None)), nowhere], None, ['[RED] game profile file', "missing key 'mem_alias'"]),
+        repack = '[RED] aot: this host refuses the game\'s pack'
+        for what, args, extra, want, status in (
+                ('an unknown title ID', ['--game', '0123456789ABCDEF', nowhere], None, ['[RED] --game 0123456789ABCDEF: no such game profile'], 2),
+                ('a file with an unknown key', ['--profile', str(changed('unknown.tsv', 'bogus_key', 'bogus_key\t1')), nowhere], None,
+                 ['[RED] game profile file', "unknown key 'bogus_key'", 'another version of game.py', repack], 8),
+                ('a file without a key', ['--profile', str(changed('missing.tsv', 'mem_alias', None)), nowhere], None,
+                 ['[RED] game profile file', "missing key 'mem_alias'", 'another version of game.py', repack], 8),
                 ('a malformed number', ['--profile', str(changed('malformed.tsv', 'mem_reserve', 'mem_reserve\t0x14000000g')), nowhere], None,
-                 ['[RED] game profile file', "key 'mem_reserve'", 'malformed']),
-                ('--game and a file together', ['--game', default_id, nowhere], {'DM_GAME_PROFILE': str(good)}, ['[RED] --game', 'both name the game profile'])):
+                 ['[RED] game profile file', "key 'mem_reserve'", 'malformed'], 2),
+                ('--game and a file together', ['--game', default_id, nowhere], {'DM_GAME_PROFILE': str(good)}, ['[RED] --game', 'both name the game profile'], 2)):
             st, out = run(args, extra)
             print(f'      {line_with(out, "[RED]")}')
-            check(st == 2 and all(w in out for w in want) and 'modules from' not in out, f'{what}: refused with a [RED] line naming it, status {st} (2), no module read')
+            check(st == status and all(w in out for w in want) and (status == 8 or repack not in out) and 'modules from' not in out,
+                  f'{what}: refused with a [RED] line naming it, status {st} ({status}{": a repack writes the file again" if status == 8 else ""}), no module read')
 
         packs = a.packs or os.environ.get('NXAOT_PACKS', '')
         module = Path(packs) / 'module' if packs else None

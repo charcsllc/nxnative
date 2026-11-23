@@ -130,7 +130,9 @@ static int set_field(struct dm_game_profile *p, const struct field *f, char *v, 
     *why = "?"; return -1;
 }
 
-// Reads a profile file (game.py runtime) into *p: key<TAB>value rows, # lines and blank lines skipped, a CR before the line end allowed. 0, or -1 with the reason in err
+// Reads a profile file (game.py runtime) into *p: key<TAB>value rows, # lines and blank lines skipped, a CR before the line end allowed. 0; -2 with the reason in err when the
+// file's keys are not this program's (an unknown or a missing key: the field set of another game.py, as a pack made before this program carries, which a repack writes
+// again); -1 with the reason in err otherwise
 int dm_game_profile_read(const char *path, struct dm_game_profile *p, char *err, size_t errn) {
     FILE *f = fopen(path, "rb");
     if (!f) { snprintf(err, errn, "cannot open it: %s", strerror(errno)); return -1; }
@@ -153,7 +155,7 @@ int dm_game_profile_read(const char *path, struct dm_game_profile *p, char *err,
         if (!tab) { snprintf(err, errn, "line %d has no tab: the rows are key<TAB>value", line); return -1; }
         *tab = 0;
         int k = 0; while (k < NFIELDS && strcmp(k_fields[k].key, s)) k++;
-        if (k == NFIELDS) { snprintf(err, errn, "unknown key '%s' (line %d)", s, line); return -1; }
+        if (k == NFIELDS) { snprintf(err, errn, "unknown key '%s' (line %d)", s, line); return -2; }
         if (line_of[k]) { snprintf(err, errn, "key '%s' given twice (lines %d and %d)", s, line_of[k], line); return -1; }
         line_of[k] = line;
         const char *why = NULL;
@@ -161,7 +163,7 @@ int dm_game_profile_read(const char *path, struct dm_game_profile *p, char *err,
     }
     char missing[1024] = ""; int nmiss = 0;
     for (int k = 0; k < NFIELDS; k++) if (!line_of[k]) { size_t m = strlen(missing); snprintf(missing + m, sizeof missing - m, "%s'%s'", nmiss++ ? ", " : "", k_fields[k].key); }
-    if (nmiss) { snprintf(err, errn, "missing key%s %s (the file must give every constant: game.py runtime writes them all)", nmiss > 1 ? "s" : "", missing); return -1; }
+    if (nmiss) { snprintf(err, errn, "missing key%s %s (the file must give every constant: game.py runtime writes them all)", nmiss > 1 ? "s" : "", missing); return -2; }
     // What game.py checks across keys (constants())
     if (!is_id(p->id)) { snprintf(err, errn, "key 'id': malformed value '%s': the base game's title ID, 16 hex digits, expected", p->id); return -1; }
     if (p->tex_dirty_upload && !p->tex_flush_upload) { snprintf(err, errn, "key 'tex_dirty_upload': 1 needs tex_flush_upload 1"); return -1; }
@@ -173,7 +175,8 @@ int dm_game_profile_read(const char *path, struct dm_game_profile *p, char *err,
 static void say(const char *how) { LOG("game profile %s (%s): %s", dm_game.id, dm_game.name, how); }
 
 // Takes --profile <file> and --game <title ID> from the front of the arguments (*argc and *argv are moved past them: argv[1] is then the module folder as before), picks the
-// profile into dm_game and logs it. 0, or -1 after a [RED] line: the caller stops with its usage status
+// profile into dm_game and logs it. 0; -2 after a [RED] line when the profile file has another field set (dm_game_profile_read): the caller stops with DM_AOT_REPACK, so the
+// launcher offers the repack that writes the file again; -1 after a [RED] line otherwise: the caller stops with its usage status
 int dm_game_profile_select(int *argc, char ***argv) {
     const char *file = NULL, *game = NULL, *from = NULL;
     int i = 1;
@@ -190,7 +193,8 @@ int dm_game_profile_select(int *argc, char ***argv) {
     char how[1200];
     if (file) {
         struct dm_game_profile p; char err[1100];
-        if (dm_game_profile_read(file, &p, err, sizeof err)) { LOG("[RED] game profile file %s (%s): %s", file, from, err); return -1; }
+        int r = dm_game_profile_read(file, &p, err, sizeof err);
+        if (r) { LOG("[RED] game profile file %s (%s): %s%s", file, from, err, r == -2 ? " (written by another version of game.py)" : ""); return r; }
         dm_game = p;
         snprintf(how, sizeof how, "the file %s (%s)", file, from);
     } else if (game) {
