@@ -21,14 +21,17 @@
 #include "hle.h"
 #include <pthread.h>
 #include <stdbool.h>
-// A blank image's storage is guest memory, which the game makes a texture on: anonymous pages on Apple (plat_vm_alloc, as mmap), the arena's on the x86-64 engine (aot.h)
+// A blank image's storage is guest memory, which the game makes a texture on: anonymous pages on Apple (plat_vm_alloc, as mmap), the arena's on the x86-64 engine (aot.h).
+// A call of the SDK's own nn::os functions (guest code) is GUEST_CALL: the plain call where the guest's code is native, aot.h DM_GUEST_CALL on the x86-64 engine
 #if DM_NATIVE_EXEC || defined(DM_TEST_GUEST_C)
 #define BLANK_ALLOC(n) plat_vm_alloc(n)
 #define BLANK_FREE(p, n) plat_vm_release(p, n)
+#define GUEST_CALL(f, ...) f(__VA_ARGS__)
 #else
 #include "aot.h"
 #define BLANK_ALLOC(n) dm_guest_alloc(n)
 #define BLANK_FREE(p, n) dm_guest_free(p, n)
+#define GUEST_CALL DM_GUEST_CALL
 #endif
 #include "vpx/vpx_decoder.h"
 #include "vpx/vp8dx.h"
@@ -336,7 +339,7 @@ static Result cv_dec_fin(void *t) {
     // The submission-ready event goes with the decoder, as in the SDK. Kept, it stayed in the host's bound-event table, so the next decoder initialised in the same memory found its
     // event "bound" and was not given one: the game had cleared that memory, and nn::os aborted on the uninitialised event (Donkey Kong Bananza, its second movie)
     static void (*destroy)(void *); if (!destroy && !(destroy = guest_sym("_ZN2nn2os18DestroySystemEventEPNS0_15SystemEventTypeE"))) die("nn::os::DestroySystemEvent missing");
-    destroy(d->event);
+    GUEST_CALL(destroy, d->event);
     pthread_cond_destroy(&d->work); pthread_mutex_destroy(&d->mu); free(d); *(cv_dec **)t = NULL;
     return 0;
 }
@@ -695,7 +698,7 @@ HLE_FORCE("_ZN2nn6syncpt3sdk20CreateSyncPointEventEPNS1_18SyncPointEventTypeE", 
 }
 HLE_FORCE("_ZN2nn6syncpt3sdk25InitializeMultiWaitHolderEPNS_2os19MultiWaitHolderTypeEPNS1_18SyncPointEventTypeE", "links the event's SystemEvent", void, h_spt_holder, void *holder, void *e) {
     static void (*init)(void *, void *); if (!init && !(init = guest_sym("_ZN2nn2os25InitializeMultiWaitHolderEPNS0_19MultiWaitHolderTypeEPNS0_15SystemEventTypeE"))) die("nn::os::InitializeMultiWaitHolder(SystemEventType) missing");
-    init(holder, e);
+    GUEST_CALL(init, holder, e);
 }
 HLE_FORCE("_ZN2nn6syncpt3sdk21RequestSyncPointEventEPNS1_18SyncPointEventTypeERKNS1_15SyncPointHandleE", "signalled when the decoder fills the awaited buffer",
           Result, h_spt_request, void *e, const cv_sync *s) {
@@ -711,10 +714,10 @@ HLE_FORCE("_ZN2nn6syncpt3sdk20CancelSyncPointEventEPNS1_18SyncPointEventTypeE", 
 // request (main+0x19e779c, SDK 19.3.3); the SDK's own went through the same null table as CreateSyncPointEvent (pc 0)
 HLE_FORCE("_ZN2nn6syncpt3sdk21TryWaitSyncPointEventEPKNS1_18SyncPointEventTypeE", "the event's SystemEvent is signalled", bool, h_spt_trywait, const void *e) {
     static uint32_t (*tw)(void *); if (!tw && !(tw = guest_sym("_ZN2nn2os18TryWaitSystemEventEPNS0_15SystemEventTypeE"))) die("nn::os::TryWaitSystemEvent missing");
-    return (tw((void *)e) & 0xff) != 0;
+    return (GUEST_CALL(tw, (void *)e) & 0xff) != 0;
 }
 HLE_FORCE("_ZN2nn6syncpt3sdk21DestroySyncPointEventEPNS1_18SyncPointEventTypeE", "destroys the event's SystemEvent", void, h_spt_destroy, void *e) {
     spt_unarm(e);
     static void (*destroy)(void *); if (!destroy && !(destroy = guest_sym("_ZN2nn2os18DestroySystemEventEPNS0_15SystemEventTypeE"))) die("nn::os::DestroySystemEvent missing");
-    destroy(e); SPT(e)->magic = 0;
+    GUEST_CALL(destroy, e); SPT(e)->magic = 0;
 }

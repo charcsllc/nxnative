@@ -369,7 +369,7 @@ static Result ar_open(void **handle, void *ev, const uint8_t *param, void *work,
             if (!attach) { attach = gsym("_ZN2nn2os33AttachReadableHandleToSystemEventEPNS0_15SystemEventTypeEjbNS0_14EventClearModeE");
                            getr = gsym("_ZN2nn2os30GetReadableHandleOfSystemEventEPKNS0_15SystemEventTypeE"); }
             GUEST_CALL(destroy, sev); hle_bind_system_event(sev, 1);
-            attach(ev, hle_dup_readable_handle(getr(sev)), 1, 1);   // managed (the game's DestroySystemEvent closes its copy), EventClearMode_AutoClear
+            GUEST_CALL(attach, ev, hle_dup_readable_handle(GUEST_CALL(getr, sev)), 1, 1);   // managed (the game's DestroySystemEvent closes its copy), EventClearMode_AutoClear
             rev_set(sev, handle[0]);
         } else { GUEST_CALL(destroy, ev); hle_bind_system_event(ev, 1); }   // no free renderer event: the earlier behaviour, which needs the game's object to live
     }

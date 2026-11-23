@@ -4,6 +4,13 @@
 #include "hle.h"
 #include <stdatomic.h>
 #include <time.h>
+// A call of the SDK's own code (guest code) is GUEST_CALL: the plain call where the guest's code is native, aot.h DM_GUEST_CALL on the x86-64 engine
+#if DM_NATIVE_EXEC || defined(DM_TEST_GUEST_C)
+#define GUEST_CALL(f, ...) f(__VA_ARGS__)
+#else
+#include "aot.h"
+#define GUEST_CALL DM_GUEST_CALL
+#endif
 
 typedef struct { int16_t year; int8_t month, day, hour, minute, second; int8_t pad; } CalendarTime;
 typedef struct { uint32_t wday, yday; char tzname[8]; uint32_t dst; int32_t offset; } CalendarAdditionalInfo;
@@ -227,7 +234,7 @@ HLE_FORCE("_ZN2nn4time39ClaimPeriodicBenefitWithUserSystemClockEPNS0_27PeriodicB
     static uint64_t (*impl)(void *, const uint8_t *, const int64_t *, const int64_t *, const void *);
     if (!impl && !(impl = guest_sym("_ZN2nn4time6detail39ClaimPeriodicBenefitWithUserSystemClockEPNS0_27PeriodicBenefitClaimContextERKNS0_13ClockSnapshotERKNS_8TimeSpanES9_PKNS0_25CheckCalendarTimeCallbackE")))
         die("time: the sdk has ClaimPeriodicBenefitWithUserSystemClock but not its detail:: implementation");
-    uint64_t r = impl(ctx, snap, max_penalty, acceptable, callback);
+    uint64_t r = GUEST_CALL(impl, ctx, snap, max_penalty, acceptable, callback);
     LOG("time: periodic benefit claim → %u", (unsigned)r);
     return r;
 }
