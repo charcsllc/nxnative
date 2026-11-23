@@ -3,10 +3,10 @@
 # chain makes these changes in the MSL text (dmsh_build.py); on Vulkan the translator's SPIR-V is the output, so they are made on the SPIR-V binary here, in plain Python: no stock
 # spirv-opt pass does any of them. The one external tool is spirv-link (SPIRV-Tools), which merges the integer-output translations into one module (merge_entries).
 #   precise         GLSL.std.450 FMin / FMax / FClamp → NMin / NMax / NClamp: the F forms leave the result of a NaN operand undefined, Maxwell's FMNMX returns the other operand and
-#                   its saturation gives 0, as the N forms do (dmsh_build.py precise; shaders.md "min, max and clamp with a NaN operand")
+#                   its saturation gives 0, as the N forms do (dmsh_rewrite.py precise; shaders.md "min, max and clamp with a NaN operand")
 #   invariant       the Invariant decoration on every Position output (the translator adds it only with relaxed precision): identical position math gives identical depth across
 #                   shaders and pipelines (dmsh_build.py -fpreserve-invariance; shaders.md "Position invariance across shaders")
-#   vs_init         a vertex shader stores (0, 0, 0, 1) into every generic output at entry, what an unwritten component reads on the hardware (dmsh_build.py vs_init)
+#   vs_init         a vertex shader stores (0, 0, 0, 1) into every generic output at entry, what an unwritten component reads on the hardware (dmsh_entry.py vs_init)
 #   vs_pad          a vertex shader declares the generic outputs its paired pixel shaders read but it does not write, written with (0, 0, 0, 1) (dmsh_build.py vs_pad)
 #   formatless      the capabilities StorageImageReadWithoutFormat / StorageImageWriteWithoutFormat when the module reads or writes a storage image declared without a format. The
 #                   translator declares one so when the shader's instruction names no texel size and the device takes the format from the bound view (Ryujinx's
@@ -16,7 +16,8 @@
 #                   it: a device without shaderSignedZeroInfNanPreserveFloat32 refuses such a module, so the Vulkan backend patches it in per device when it creates the module
 #   shadow_inputs   the <key>_bv variant: every integer vertex input also declared as a float4 and as the integer of the other sign at locations 16-30, ORed into the input the body
 #                   reads (dmsh_vin.py, the MSL form; Vulkan, like Metal, fetches a format only into an input of its own numeric type [A: check with the validation layers])
-#   merge_entries   main, main_u and main_m (dmsh_build.py fs_uint's entry points; on Vulkan made by translating again with fout facts) as entry points of one module (spirv-link)
+#   merge_entries   main and main_u (the typed-output entry point dmsh_entry.py fs_uint gives every pixel shader; on Vulkan made by translating again with fout facts) as entry points
+#                   of one module (spirv-link)
 # Usage: dmsh_spv.py passes <in.spv> <out.spv> [--stage vs|ps|...] [--float-controls]   the passes the build applies (and float_controls when asked); prints what each did
 #        dmsh_spv.py resources <spv>   the descriptor bindings as dmsh_build_vk.py reads them;   dmsh_spv.py census <spv>   the float-declared image reads and how their bits are used
 import json, os, struct, subprocess, sys, tempfile

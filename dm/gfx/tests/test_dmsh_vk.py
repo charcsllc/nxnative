@@ -104,8 +104,8 @@ GRAPHICS = {
     'ps_cbuf': ('ps', code([ipa(0, GENERIC0), ldc(1, 4, 0x20), ldc(2, 1, 0x200)], sph(5, omap=0xF, imap=[(0, PERSPECTIVE)])), {}),   # c1 + 0x200: past a shared bank's 256 bytes
     'ps_minmax': ('ps', code([ipa(0, GENERIC0), ipa(1, GENERIC0 + 4), fmnmx(2, 0, 1), fmnmx(3, 0, 1, low=False), mov(1, 0)], sph(5, omap=0xF, imap=[(0, PERSPECTIVE)])), {}),
     'ps_tex': ('ps', code([ipa(0, GENERIC0), ipa(1, GENERIC0 + 4), tex2d(0, 0, 8, mask=1), iadd32i(0, 0, 1)], sph(5, omap=0xF, imap=[(0, PERSPECTIVE)])), {'tex': {'0': '2d'}}),
-    'ps_uint': ('ps', code([ipa(0, GENERIC0), iadd32i(0, 0, 1)], sph(5, omap=0xF, imap=[(0, FLAT)])), {}),          # an output from integer bits: main_u
-    'ps_mixed': ('ps', code([ipa(0, GENERIC0), ipa(1, GENERIC1), iadd32i(4, 1, 1)], sph(5, omap=0xFF, imap=[(0, PERSPECTIVE), (1, FLAT)], mrt=True)), {}),   # main_u and main_m
+    'ps_uint': ('ps', code([ipa(0, GENERIC0), iadd32i(0, 0, 1)], sph(5, omap=0xF, imap=[(0, FLAT)])), {}),          # an output from integer bits
+    'ps_mixed': ('ps', code([ipa(0, GENERIC0), ipa(1, GENERIC1), iadd32i(4, 1, 1)], sph(5, omap=0xFF, imap=[(0, PERSPECTIVE), (1, FLAT)], mrt=True)), {}),   # two outputs, one from integer bits
     'gs_pass': ('gs', struct.pack('<5I', (1 << 24) | (4 << 10) | (3 << 5) | 1, 0, 1 << 24, 7 << 24, 1) + bytes(0x3c) + struct.pack('<QQ', 0, exit_()), {}),   # passthrough header
 }
 TF = [{'stride': 16, 'outputs': [[0, 4]]}, [], [], []]
@@ -189,10 +189,18 @@ class Portable(unittest.TestCase):   # no tools needed
 
     def test_vulkan_version_covers_its_files(self):
         for f in ('tools/dmsh_build_vk.py', 'tools/dmsh_spv.py', 'tools/dmsh_xlate_vk/Program.cs', 'tools/dmsh_xlate_vk/dmsh_xlate_vk.csproj', 'tools/dmsh_build.py',
-                  'tools/dmsh_chain_vk.lock', 'tools/dmsh_facts.py', 'tools/c1_guard.py', 'tools/cb_extent.py'):
+                  'tools/dmsh_chain_vk.lock', 'tools/dmsh_facts.py', 'tools/c1_guard.py', 'tools/cb_extent.py', 'tools/dmsh_reflect.py', 'tools/dmsh_entry.py', 'nvn/dmsh_abi.h'):
             self.assertIn(f, dmsh_chain_vk.FILES)
         self.assertTrue(set(f for f in dmsh_chain.FILES if 'third_party' in f) <= set(dmsh_chain_vk.FILES))
+        self.assertTrue(set(dmsh_chain_vk.SHARED) <= set(dmsh_chain.FILES), 'a SHARED file that is not the Metal chain\'s')
         self.assertIn(f'"{dmsh_chain_vk.version()}"', Path(dmsh_chain_vk.HEADER).read_text(), 'dm/gfx/nvn/dmsh_chain_vk.h is stale: run dm/gfx/tools/dmsh_chain_vk.py --header')
+
+    def test_version_covers_the_modules_it_runs(self):   # every module of the chain's folder the build loads is hashed into DMSH_CHAIN_VK (upstream moved code into new modules once)
+        r = subprocess.run([sys.executable, '-B', '-c', 'import sys; sys.path.insert(0, sys.argv[1]); import dmsh_build_vk; '
+                            'print("\\n".join(m.__file__ for m in list(sys.modules.values()) if getattr(m, "__file__", None)))', str(TOOLS)], capture_output=True, text=True, check=True)
+        loaded = {'tools/' + Path(p).name for p in r.stdout.split() if Path(p).resolve().parent == TOOLS.resolve()}
+        self.assertIn('tools/dmsh_reflect.py', loaded)
+        self.assertEqual(loaded - set(dmsh_chain_vk.FILES), {'tools/tool_lock.py'})   # tool_lock checks the tools against the lock and decides no output (as for DMSH_CHAIN)
 
     def test_lock_rows(self):   # the dlls and the source hash, and per-platform tool rows; no Metal compiler
         lock = dmsh_chain_vk.lock()
@@ -285,6 +293,43 @@ OpFunctionEnd
         self.assertNotEqual(copy.data(), before)
         self.assertTrue(m.consistent())
         m.ins[0] = m.ins[0] + [0]; self.assertFalse(m.consistent())
+
+    # Handle names whose decoding upstream changed (dm/gfx/tests/test_dmsh_reflect.py has them): c2 arrays with a separate sampler word (EA SPORTS FC 27), a uniform buffer's handles
+    # with their sampler word in c2 (Kirby Air Riders), type-2 sampler IDs in a uniform buffer (The Witcher 3), a type-1 handle's two words in one uniform buffer, type-3 constant samplers
+    HANDLES = (('array<texture2d_array<float>, 301>', 'fp_t2das_cb2_0'), ('array<texture2d<float>, 301>', 'fp_t2d_cb196610_10570000'), ('array<depth2d<float>, 32>', 'fp_t2ds_cb196614_10570000'),
+               ('texture2d<float>', 'fp_t_cb720898_2000005A'), ('texture2d<float>', 'fp_t_cb720898_2000405C'), ('texture2d<float>', 'fp_t_cb720898_2004005A'),
+               ('texture2d<float>', 'fp_t_cb720898_1000005A'), ('texture2d<float>', 'fp_t_cb262147_10010002'), ('texture2d<float>', 'fp_t_cb5_3041005C'),
+               ('texture2d<float>', 'fp_t_cb65538_3041005C'), ('texture2d<float>', 'fp_t_cb7_2A'))
+
+    def test_handle_names_decided_as_metal_reflect(self):   # each combined binding's texture and sampler entries as dmsh_reflect.py reflect makes them of the same names, extra words and IDs included
+        import dmsh_reflect
+        src, resources, aid = 'struct spvDescriptorSetBuffer0\n{\n', [], 0
+        for k, (ty, nm) in enumerate(self.HANDLES):
+            n = int(ty.rsplit(', ', 1)[1].rstrip('>')) if ty.startswith('array<') else 1
+            src += f'    {ty} {nm} [[id({aid})]];\n    {f"array<sampler, {n}>" if n > 1 else "sampler"} {nm}Smplr [[id({aid + n})]];\n'; aid += 2 * n
+            resources.append({'set': 2, 'binding': 4 * 512 + k, 'name': nm, 'class': 'combined', 'array': n, 'used': True, 'id': 100 + k})
+        fields = ('kind', 'reg', 'off', 'soff', 'sreg', 'raw_id')
+        metal = {(b['msl_name'].removesuffix('Smplr'), b['msl_name'].endswith('Smplr'), *(b.get(f) for f in fields))
+                 for b in dmsh_reflect.reflect('k', 'ps', src + '};\n', {'cbufs': [], 'sbufs': [], 'textures': [], 'images': []})}
+        with mock.patch.object(dmsh_spv, 'resources', lambda m: resources), mock.patch.object(dmsh_spv, 'image_uses', lambda m: {}):
+            vk = {(b['name'], b['class'] == 'sampler', *(b.get(f) for f in fields)) for b in dmsh_build_vk.Build.bindings(None, 'ps', None, {'sbufs': []})}
+        self.assertEqual(vk, metal)
+        self.assertEqual(len(vk), 2 * len(self.HANDLES))
+
+    def test_prepare_refuses_what_it_cannot_translate(self):   # a reason, not a job: NVN2 code (dmsh_build.py job_for's arch), a stage-8 record job_for refuses, a ray-tracing key of the map
+        import dmsh_ampere
+        def rec(key, stage8=False):   # an NVN2 pixel shader's record: its key, a 0x80-byte SPH and one instruction, the control section (magic, version, the instructions' length, the stage byte)
+            ctl = bytearray(0x60); struct.pack_into('<II', ctl, 0, dmsh_ampere.CTL_MAGIC, dmsh_ampere.CTL_VERSION); struct.pack_into('<I', ctl, 0x38, 0x88); ctl[0x56] = 8 if stage8 else 0
+            return b'BTCDBTCD' + bytes.fromhex(key) + bytes(0x28) + bytes(0x88) + bytes(ctl)
+        nvn2, stage8, rt = '00000000000000a0', '00000000000000a1', '00000000000000a2'
+        recs = {nvn2: rec(nvn2), stage8: rec(stage8, stage8=True), rt: b''}
+        b = dmsh_build_vk.Build.__new__(dmsh_build_vk.Build); b.rt = {rt}
+        b.s = dmsh_build_vk.shared(dmsh_build_vk.Build.scope()); b.s['FACTS'] = {}
+        jobs, c1s, refused = {}, {}, {}
+        with tempfile.TemporaryDirectory() as w:
+            for k in recs: b.prepare(k, lambda k: ('ps.bin', recs[k]), w, jobs, c1s, refused)
+        self.assertEqual((jobs, sorted(refused)), ({}, sorted(recs)))
+        self.assertIn('decodes Maxwell code only', refused[nvn2]); self.assertIn('stage8 RT record', refused[stage8]); self.assertIn('ray-tracing', refused[rt])
 
     def test_balanced_batches(self):   # every job once, in at most n batches of about equal cost (apart by less than the costliest job), the costliest first, the same for the same input
         items = list(range(1, 101)); b = dmsh_build_vk.balanced(items, 8, lambda x: x)
@@ -396,25 +441,23 @@ class Translator(unittest.TestCase):
         self.assertEqual([(b['set'], b['binding'], b['cb_slot'], b['cb_offset']) for b in res['sbufs']], [(1, 0, 0, 0x110 // 4)])
 
     @unittest.skipIf(missing(SPIRV_CROSS), 'needs ' + missing(SPIRV_CROSS))
-    def test_same_decisions_as_metal_reflect(self):   # the Vulkan reflection's kinds and slots are what dmsh_build.py reflect makes of the analysis rendering of the same module
-        import ast, dmsh_geometry
-        shared = dmsh_build_vk.shared({'re': re, 'os': os, 'sys': sys, 'struct': struct, 'json': json, 'hashlib': __import__('hashlib'), 'collections': __import__('collections'),
-                                       'inspect': __import__('inspect'), 'dmsh_geometry': dmsh_geometry})
-        node = next(n for n in ast.parse((TOOLS / 'dmsh_build.py').read_text()).body if isinstance(n, ast.FunctionDef) and n.name == 'reflect')   # the Metal reflection
-        exec(compile(ast.Module(body=[node], type_ignores=[]), str(TOOLS / 'dmsh_build.py'), 'exec'), shared)
-        REFLECT, scope = shared['reflect'], types.SimpleNamespace(s=shared)
+    def test_same_decisions_as_metal_reflect(self):   # the Vulkan reflection's kinds and slots are what dmsh_reflect.py reflect (the Metal reflection) makes of the analysis rendering of the same module
+        import dmsh_reflect
+        scope = types.SimpleNamespace(s=dmsh_build_vk.shared(dmsh_build_vk.Build.scope()))   # XC, the analysis rendering's options, as the build takes them
         compared = 0
         for job in self.jobs:
             if job['stage'] not in ('vs', 'ps', 'cs'): continue
             spv = self.work / (job['key'] + '.spv'); flat = self.work / (job['key'] + '.flat.spv')
             dmsh_spv.flatten(dmsh_spv.Module.read(spv)).write(str(flat))
-            r = subprocess.run([SPIRV_CROSS, *dmsh_build_vk.dmsh_atomic.cross_args(scope.s['XC'], str(flat)), str(flat)], capture_output=True, text=True)
+            r = subprocess.run([SPIRV_CROSS, *scope.s['XC'], str(flat)], capture_output=True, text=True)
             self.assertEqual(r.returncode, 0, job['key'] + ': ' + r.stderr)
             res = json.loads((self.work / (job['key'] + '.res.json')).read_text())
-            metal = {(b['msl_name'][:-5] if b['msl_name'].endswith('Smplr') else b['msl_name'], b['kind'], b.get('reg'), b.get('off')) for b in REFLECT(job['key'], job['stage'], r.stdout, res)}
+            # reflect reads each uniform slot's fixed reads from the Metal translator's cbufs (Program.cs), which the Vulkan translator does not report: none, for the comparison
+            metal_res = dict(res, cbufs=[dict(b, fixed=b.get('fixed', 0)) for b in res['cbufs']])
+            metal = {(b['msl_name'][:-5] if b['msl_name'].endswith('Smplr') else b['msl_name'], b['kind'], b.get('reg'), b.get('off')) for b in dmsh_reflect.reflect(job['key'], job['stage'], r.stdout, metal_res)}
             vk = {(b['name'], b['kind'], b.get('reg'), b.get('off')) for b in dmsh_build_vk.Build.bindings(scope, job['stage'], dmsh_spv.Module.read(spv), res)}
             self.assertEqual(vk, metal, job['key']); compared += len(vk)
-        print(f'\nreflection: {compared} bindings decided as dmsh_build.py reflect decides them on the analysis MSL')
+        print(f'\nreflection: {compared} bindings decided as dmsh_reflect.py reflect decides them on the analysis MSL')
 
     def test_target_neutral_atomics(self):   # no Metal image-atomics guard: the coordinate is not compared with the image size before the atomic
         m = self.module('cs_dim_2d_0')
@@ -516,14 +559,15 @@ class Published(unittest.TestCase):
 GAME_ID = '0100FFFFFFFF0000'   # a title ID no game has: the synthetic profile
 
 
-def record(data, stage, tf=None):
-    """A shader package record (dmsh_build.py records / job_for): the magic, a header to +0x38, the code area (graphics: a 0x30-byte header, then the program), the control section"""
+def record(data, stage, key, tf=None):
+    """A shader package record (dmsh_build.py record_index / job_for): the magic, the shader's key at +0x08 (shader_split.py writes it there; the build finds a record by it), a header
+    to +0x38, the code area (graphics: a 0x30-byte header, then the program), the control section"""
     ctl = bytearray(0x880); ctl[0:4] = bytes.fromhex('34127698')
     for b, e in enumerate(tf or []):
         if not e: continue
         struct.pack_into('<H', ctl, 0x6dc + 2 * b, e['stride']); ctl[0x6e8 + b] = len(e['outputs'])
         for k, (loc, n) in enumerate(e['outputs']): ctl[0xdc + 0x80 * b + k] = 0x20 + loc; ctl[0x4dc + 0x80 * b + k] = n
-    return b'BTCDBTCD' + bytes(0x30) + (data if stage == 'cs' else bytes(0x30) + data) + bytes(ctl)
+    return b'BTCDBTCD' + bytes.fromhex(key) + bytes(0x28) + (data if stage == 'cs' else bytes(0x30) + data) + bytes(ctl)
 
 
 @unittest.skipIf(missing('xlate', 'spirv-val', 'spirv-link', SPIRV_CROSS), 'needs ' + missing('xlate', 'spirv-val', 'spirv-link', SPIRV_CROSS))
@@ -540,7 +584,7 @@ class Build(unittest.TestCase):
         rows, facts, packs = [], [], {}
         for n, (name, (stage, data, f)) in enumerate(shapes.items()):
             key = '%016x' % (0xa0 + n); cls.keys[name] = key
-            packs.setdefault(stage, []).append(record(data, stage, TF if name == 'vs_tf' else None))
+            packs.setdefault(stage, []).append(record(data, stage, key, TF if name == 'vs_tf' else None))
             rows.append(f'{stage}.bin\t{len(packs[stage]) - 1}\t{stage}\t{key}\tsynthetic {name}')
             if f: facts.append(f'{key}\t{json.dumps(f, sort_keys=True, separators=(",", ":"))}')
         for stage, recs in packs.items(): (cls.pkg / f'{stage}.bin').write_bytes(b''.join(recs))
@@ -587,12 +631,14 @@ class Build(unittest.TestCase):
         ext = dict(l.split('\t') for l in (self.profile / 'cb_extent_vk.tsv').read_text().splitlines()[2:])
         self.assertEqual((ext[self.keys['vs_cbuf']], ext[self.keys['ps_cbuf']]), ('0:32', '1:48'))
 
-    def test_integer_outputs(self):
-        self.assertEqual(self.refl('ps_uint')['entries'], ['main', 'main_u'])
-        r = self.refl('ps_mixed'); self.assertEqual((r['entries'], r['entry_m'], r['uint_mask_m']), (['main', 'main_u', 'main_m'], 'main_m', 0b10))
+    def test_integer_outputs(self):   # every pixel shader with a colour output gets main_u, as dmsh_entry.py fs_uint gives every one main0_u; no build-time mask, so no main_m
+        for name in ('ps_uint', 'ps_mixed', 'ps_minmax', 'ps_tex', 'ps_cbuf'):
+            r = self.refl(name)
+            self.assertEqual((r['entries'], r.get('entry_u'), 'entry_m' in r), (['main', 'main_u'], 'main_u', False), name)
         m = dmsh_spv.Module.read(self.lib / (self.keys['ps_mixed'] + '.spv'))
-        self.assertEqual(sorted(e[1] for e in m.entry_points()), ['main', 'main_m', 'main_u'])
-        self.assertEqual(self.refl('ps_minmax')['entries'], ['main'])
+        self.assertEqual(sorted(e[1] for e in m.entry_points()), ['main', 'main_u'])
+        r = self.refl('ps_mixed')['raster']
+        self.assertEqual((r['colors'], r['omap']), ([0, 1], 0xFF))   # the raster facts of dmsh_reflect.py raster_facts and the output map of dmsh_build.py ps_omap
 
     def test_integer_inputs(self):
         r = self.refl('vs_int')
@@ -642,6 +688,21 @@ class Build(unittest.TestCase):
         self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
         self.assertIn(f'shader cache: hit {len(self.keys)}, built 0', r.stdout)
         self.assertEqual({p.name: p.read_bytes() for p in self.lib.glob('*.spv')}, before)
+
+    def test_records_by_key(self):   # a shader's record is the one its key names (dmsh_build.py record_index), not the map row's index (issue #1841); a key the package lacks stops the build
+        key = self.keys['ps_tex']; data = (self.pkg / 'ps.bin').read_bytes()
+        offs = [m.start() for m in re.finditer(b'BTCDBTCD', data)] + [len(data)]
+        recs = [data[a:b] for a, b in zip(offs, offs[1:])]
+        with tempfile.TemporaryDirectory(dir=self.tmp.name) as d:
+            d = Path(d); pkg = d / 'pkg'; shutil.copytree(self.pkg, pkg)
+            build = [sys.executable, str(TOOLS / 'dmsh_build_vk.py'), str(pkg), str(d / 'cache'), key]
+            (pkg / 'ps.bin').write_bytes(b''.join(reversed(recs)))   # every pixel shader at another index than its map row's
+            r = subprocess.run(build, env=self.env, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertEqual((d / 'cache' / self.lib.name / (key + '.spv')).read_bytes(), (self.lib / (key + '.spv')).read_bytes())
+            (pkg / 'ps.bin').write_bytes(b''.join(x for x in recs if x[8:16] != bytes.fromhex(key)))
+            r = subprocess.run(build, env=self.env, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 1); self.assertIn(f'holds no record of shader {key}', r.stderr)
 
 
 if __name__ == '__main__':

@@ -6,7 +6,9 @@
 # Usage: DM_GAME=<id> dmsh_build_vk.py <Switch package dir> <output cache dir> [key...]   (no keys = all; a full build also stamps vk-<V>/inputs.tsv with the profile inputs digest
 #                                                                                      and writes the profile's c1_full_vk.tsv and cb_extent_vk.tsv; one output directory per game)
 #        DM_GAME=<id> dmsh_build_vk.py --census <output cache dir> [<out.tsv>]           (the census below over vk-<V>/, by default into vk-<V>/census.tsv)
-# Outputs in vk-<V>/: <key>.spv (entry point main; main_u and main_m for a pixel shader that writes integer bits, dmsh_build.py fs_uint), <key>_bv.spv (a vertex shader with integer
+# Outputs in vk-<V>/: <key>.spv (entry point main; main_u, every colour output an unsigned integer, for each pixel shader dmsh_entry.py fs_uint gives its typed-output entry point,
+#   which is every pixel shader of a shape it knows with a colour output; main0_u's per-pipeline choice of float, unsigned or signed per output has no counterpart here: the backend
+#   takes main_u for a pipeline with an integer target), <key>_bv.spv (a vertex shader with integer
 #   inputs: their float and other-sign shadows at locations 16-30, dmsh_spv.py shadow_inputs), <key>_fp32.spv (a module with doubles, FP64 lowered for devices without shaderFloat64),
 #   <key>.json (the reflection: the neutral binding kinds of nvn_refl.h as KINDS names them, each with its set and binding; the entry points; the vertex inputs; the fragment
 #   interpolation mask; the raster facts; chain), analysis/<key>_b.metal and analysis/<key>_b.json (the analysis rendering, as c1_guard.py and cb_extent.py read a Metal library),
@@ -30,9 +32,10 @@
 #   a 'times:' line, each step's seconds.
 # Environment: DM_GAME (required), XLATE_VK (a dll or a published translator), SPIRV_CROSS_VK, DOTNET (dmsh_chain_vk.py), DMSH_CAS, J (concurrency: worker processes and translator
 #   processes, default 8), WORK (the temporary folder's parent), XLATE_DEBUG / XLATE_REDUCED (dmsh_chain.py options)
-import ast, collections, concurrent.futures as cf, hashlib, heapq, json, os, re, shutil, struct, subprocess, sys, tempfile, threading, time
+import ast, collections, concurrent.futures as cf, hashlib, heapq, json, mmap, os, re, shutil, struct, subprocess, sys, tempfile, threading, time
 HERE = os.path.dirname(os.path.abspath(__file__)); sys.path.insert(0, HERE)
-import dmsh_chain, dmsh_chain_vk, dmsh_spv, dmsh_atomic   # noqa: E402
+import dmsh_chain, dmsh_chain_vk, dmsh_spv   # noqa: E402
+import dmsh_reflect, dmsh_entry, dmsh_abi as abi, dmsh_ampere, dmsh_meshstage, dmsh_tess   # noqa: E402   the Metal chain's modules whose decisions this build shares (shared, below)
 sys.path.insert(0, os.path.join(HERE, "..", "..", "tools")); import shader_lib   # noqa: E402   dm/tools: a library's stamp (read_stamp, which upstream moved out of dmsh_chain.py)
 
 # The binding kinds the reflection names, and the nvn_refl.h kind each is (the strings are the ones nvn_refl.c reads from the Metal reflection, plus tex_dyn / samp_dyn, which the
@@ -41,11 +44,13 @@ KINDS = {'cbuf': 'NVN_RB_CBUF', 'samp': 'NVN_RB_SAMP', 'tex': 'NVN_RB_TEX', 'img
          'c1': 'NVN_RB_C1', 'drvcb': 'NVN_RB_DRV0', 'samp_tex': 'NVN_RB_SAMPT', 'ubo_ptr': 'NVN_RB_UBOP', 'tex_ubo': 'NVN_RB_TEXU', 'samp_ubo': 'NVN_RB_SAMPU', 'samp_id': 'NVN_RB_SAMPI',
          'sbuf_ubo': 'NVN_RB_SBUFU', 'tex_dyn': 'NVN_RB_TEXD', 'samp_dyn': 'NVN_RB_SAMPD', 'tex_c2a': 'NVN_RB_TEXA', 'samp_c2a': 'NVN_RB_SAMPA'}   # drvcb: NVN_RB_DRV2 for bank 2
 
-# Code of dmsh_build.py, executed from its source: importing it would run the Metal build (it parses its arguments and checks the Metal tools at import). The same functions decide
-# for both targets; the Metal chain's tests take them the same way (dm/gfx/tests/test_dmsh_reflect.py, test_subgroup.py)
-SHARED_FUNCTIONS = ('records', 'vertex_ab', 'job_for', 'tf_layout', 'int_inputs', 'fs_uint', 'raster_facts', 'drv_reads', 'unfillable', 'decode_tex', 'const_sampler', 'decode_ubo_tex',
-                    'c2_array', 'load_pairs', 'shader_key', 'pair_keyed', 'shader_rule_source')
-SHARED_NAMES = ('TEX_BASE', 'SSBO', 'DRV_FILL', '_CAST', 'XC', 'RULES')
+# The same code decides for both targets. What the Metal build imports, this build imports: dmsh_reflect.py (the reflection's name decoding, decode_tex, decode_ubo_tex,
+# decode_ubo_samp_id, const_sampler, c2_array and SSBO; the driver reads, drv_reads and unfillable; the raster facts) and dmsh_entry.py (int_inputs, fs_uint), as the Metal chain's
+# tests import them (dm/gfx/tests/test_dmsh_reflect.py, test_dmsh_typed.py). What is still in dmsh_build.py is executed from its source: importing it would run the Metal build (it
+# parses its arguments and checks the Metal tools at import), and its tests take it the same way (test_subgroup.py). The records are found by key, as the Metal build finds them
+# (record_index; dmsh_build.py's own rec_of, which reads with os.pread, has no Windows form)
+SHARED_FUNCTIONS = ('record_index', 'vertex_ab', 'early_fragment_tests', 'ps_omap', 'job_for', 'tf_layout', 'load_pairs', 'shader_key', 'pair_keyed', 'shader_rule_source')
+SHARED_NAMES = ('NVN2_STAGE_INDEX', 'XC', 'RULES')
 
 
 def shared(scope):
@@ -62,10 +67,12 @@ def shared(scope):
     return scope
 
 
-def code_fingerprint():   # the part of every shader key the chain's code makes (dmsh_build.py CODE_FP's counterpart)
+def code_fingerprint():   # the part of every shader key the chain's code makes (dmsh_build.py CODE_FP's counterpart): this build's files and the Metal chain's it runs (dmsh_chain_vk.SHARED)
     h = hashlib.sha256()
-    for f in ('dmsh_build_vk.py', 'dmsh_spv.py', 'dmsh_build.py', 'dmsh_chain.py', 'dmsh_chain_vk.py', 'dmsh_atomic.py'):
+    for f in ('dmsh_build_vk.py', 'dmsh_spv.py', 'dmsh_build.py', 'dmsh_chain.py', 'dmsh_chain_vk.py'):
         with open(os.path.join(HERE, f), 'rb') as fh: h.update(f.encode() + b'\0' + fh.read() + b'\0')
+    for f in dmsh_chain_vk.SHARED:
+        with open(os.path.join(dmsh_chain_vk.GFX, f), 'rb') as fh: h.update(f.encode() + b'\0' + fh.read() + b'\0')
     return h.hexdigest()
 
 
@@ -192,15 +199,16 @@ class Build:
         self.s['PAIRS'] = self.pairs = self.s['load_pairs'](self.game, dm_dir)
 
     @staticmethod
-    def scope():   # the globals the shared functions of dmsh_build.py read
-        return {'re': re, 'os': os, 'sys': sys, 'struct': struct, 'json': json, 'hashlib': hashlib, 'collections': collections, 'inspect': __import__('inspect')}
+    def scope():   # the globals the shared code of dmsh_build.py reads (FACTS, PAIRS and the shader key's parts are added by __init__)
+        return {'re': re, 'os': os, 'sys': sys, 'struct': struct, 'json': json, 'hashlib': hashlib, 'collections': collections, 'mmap': mmap, 'inspect': __import__('inspect'),
+                'dmsh_chain': dmsh_chain, 'abi': abi, 'dmsh_ampere': dmsh_ampere, 'dmsh_meshstage': dmsh_meshstage, 'dmsh_tess': dmsh_tess}
 
     def spec(self, w):   # what a worker process's Build holds (_worker): what analyse and finish_one read
         return {'chain': self.chain, 'out': self.out, 'cas': self.cas, 'cross': self.cross, 'w': w, 'loc': self.loc, 'pc_of': self.pc_of, 'pairs': self.pairs}
 
-    def read_map(self):   # the shader map, as dmsh_build.py reads it: key → (package, index), its PC pair, and the rows that enter its cache key
+    def read_map(self):   # the shader map, as dmsh_build.py reads it: key → (package, index), its PC pair, the rows that enter its cache key, and the ray-tracing keys
         path = str(self.game.table('shader_map.tsv'))
-        self.pc_of, self.loc, self.map_rows, self.map_conflict_rows = {}, {}, {}, {}
+        self.pc_of, self.loc, self.map_rows, self.map_conflict_rows, self.rt = {}, {}, {}, {}, set()
         with open(path, 'rb') as f:
             for raw in f:
                 c = raw.rstrip(b'\n').split(b'\t')
@@ -214,7 +222,9 @@ class Build:
         with open(path) as f:
             for ln in f:
                 c = ln.rstrip('\n').split('\t')
-                if len(c) > 4 and c[0].endswith('.bin'): self.pc_of.setdefault(c[3], c[4]); self.loc.setdefault(c[3], (c[0], int(c[1])))
+                if len(c) > 4 and c[0].endswith('.bin'):
+                    self.pc_of.setdefault(c[3], c[4]); self.loc.setdefault(c[3], (c[0], int(c[1])))
+                    if c[2] in ('rt', 'raytracing'): self.rt.add(c[3])   # the Metal build makes these one library of their own (dmsh_rt_build.py), not shader jobs (job_for refuses them)
         if os.path.exists(conflicts):
             with open(conflicts) as f:
                 for ln in f:
@@ -256,10 +266,10 @@ class Build:
 
     # The analysis rendering
     def render(self, spv_path, w):
-        """The MSL of a module for analysis (the descriptors flattened into set 0, the Metal chain's SPIRV-Cross options); None when SPIRV-Cross does not render it
-        (a geometry or tessellation stage, or what MSL cannot express)"""
+        """The MSL of a module for analysis (the descriptors flattened into set 0, the Metal chain's SPIRV-Cross options, dmsh_build.py XC: MSL 3.2 for every shader, which
+        covers the image atomics dmsh_atomic.py cross_args once rendered at 3.1); None when SPIRV-Cross does not render it (a geometry or tessellation stage, or what MSL cannot express)"""
         flat = spv_path[:-4] + '.flat.spv'; dmsh_spv.flatten(dmsh_spv.Module.read(spv_path), copy=False).write(flat)
-        r = subprocess.run([self.cross, *dmsh_atomic.cross_args(self.s['XC'], flat), flat], capture_output=True, text=True)
+        r = subprocess.run([self.cross, *self.s['XC'], flat], capture_output=True, text=True)
         os.unlink(flat)
         return r.stdout if r.returncode == 0 else None
 
@@ -270,13 +280,15 @@ class Build:
 
     # The reflection
     def bindings(self, stage, m, res):
-        """The reflection's bindings: dmsh_build.py reflect's decisions taken from the SPIR-V resources (their names are the MSL member names reflect reads), each with its set
-        and binding; a combined image sampler gives a texture and a sampler entry on one binding"""
-        s, uses = self.s, dmsh_spv.image_uses(m)
-        sb = {b['slot']: b for b in res['sbufs']}; base = s['SSBO'].get(stage); fetch1d = set(res.get('fetch1d', ()))
+        """The reflection's bindings: dmsh_reflect.py reflect's decisions taken from the SPIR-V resources (their names are the MSL member names reflect reads), each with its set
+        and binding; a combined image sampler gives a texture and a sampler entry on one binding. Not taken, as nothing here makes them: reflect's kinds for the Metal translator's own
+        resources and rewrites (pools and handle tables, border colours, geometry helpers, the uniform size, buffer bias and storage length banks, the global memory map, push banks),
+        its bindless buffer textures and images (tbuf_ubo, img_ubo: a kind the Vulkan backend does not bind, '?' here) and a uniform slot's fixed reads"""
+        R, uses = dmsh_reflect, dmsh_spv.image_uses(m)
+        sb = {b['slot']: b for b in res['sbufs']}; base = R.SSBO.get(stage); fetch1d = set(res.get('fetch1d', ()))
         out, seen = [], set()
         for r in sorted(dmsh_spv.resources(m), key=lambda r: (r['set'], r['binding'])):
-            if (r['set'], r['binding']) in seen or not r['used']: continue   # one variable per entry point in a merged module (main_u, main_m): one descriptor; a
+            if (r['set'], r['binding']) in seen or not r['used']: continue   # one variable per entry point in a merged module (main_u): one descriptor; a
             # descriptor no function uses is left out, as SPIRV-Cross leaves it out of the Metal argument buffer (the translator declares the support buffer in every shader)
             seen.add((r['set'], r['binding'])); nm, cls = r['name'], r['class']
             e = {'name': nm, 'set': r['set'], 'binding': r['binding'], 'class': cls}
@@ -292,14 +304,15 @@ class Build:
             if cls == 'ssbo':   # storage buffers: the translator's index → its c0 offset → the NVN slot (as reflect)
                 c = re.fullmatch(r'[a-z]+_s(\d+)', nm); b = sb.get(int(c.group(1))) if c else None
                 off = b['cb_offset'] * 4 if b and b['cb_slot'] == 0 else None
-                if stage == 'cs' and off is not None and 0x210 <= off < 0x310 and (off - 0x210) % 16 == 0: e.update(kind='ubo_ptr', reg=(off - 0x210) // 16)
+                if stage == 'cs' and off is not None and abi.C0_CS_UBO <= off < abi.C0_CS_UBO + abi.C0_ROW * abi.C0_CS_UBO_SLOTS and (off - abi.C0_CS_UBO) % abi.C0_ROW == 0:
+                    e.update(kind='ubo_ptr', reg=(off - abi.C0_CS_UBO) // abi.C0_ROW)
                 elif b and b['cb_slot'] >= 3: e.update(kind='sbuf_ubo', reg=b['cb_slot'] - 3, off=b['cb_offset'] * 4)
-                else: e.update(kind='sbuf', reg=(off - base) // 16 if off is not None and base is not None and 0 <= off - base < 0x100 and (off - base) % 16 == 0 else None)
+                else: e.update(kind='sbuf', reg=(off - base) // abi.C0_ROW if off is not None and base is not None and 0 <= off - base < abi.C0_ROW * abi.C0_SSBO_SLOTS and (off - base) % abi.C0_ROW == 0 else None)
                 e['rw'] = bool(b and b['flags'] & 1)
                 out.append(e); continue
             ty = 'array<' if r['array'] != 1 else ''
             if cls in ('storage_image', 'storage_texel_buffer'):
-                d = s['decode_tex'](nm)
+                d = R.decode_tex(nm)
                 e.update(kind='img', reg=d[0] if d else None) if d and re.match(r'[a-z]+_i', nm) else e.update(kind='?')
                 u = uses.get(r['id'], set())
                 e['rw'] = bool(u & {'write', 'atomic'})
@@ -309,20 +322,26 @@ class Build:
                 out.append({**e, 'kind': 'samp_dyn' if cls == 'sampler' else 'tex_dyn'}); continue
             if cls == 'sampler': out.append({**e, 'kind': '?'}); continue
             sampler = None
-            u = s['decode_ubo_tex'](nm)
-            if u:   # bindless: the handle is in a uniform buffer
+            u = R.decode_ubo_tex(nm)
+            c2a = R.c2_array(nm, ty)
+            if u:   # bindless: the handle is in a uniform buffer. Handle type 1: the other half's word, which the host ORs in (soff, sreg; reflect's other), or one in the driver table c2
                 ut, us = u
-                e.update(kind='?') if cls == 'texel_buffer' else e.update(kind='tex_ubo', reg=ut[0], off=ut[1])
-                sampler = {'kind': 'samp_id', 'reg': us[1]} if us[0] == 'id' else {'kind': 'samp_ubo', 'reg': us[0], 'off': us[1]}
-            elif s['c2_array'](nm, ty) is not None:
-                e.update(kind='tex_c2a', off=s['c2_array'](nm, ty)); sampler = {'kind': 'samp_c2a', 'off': s['c2_array'](nm, ty)}
+                other = {} if us[0] in ('id', 'c2') or us == ut else {'soff': us[1], 'sreg': us[0]}
+                e.update(kind='?') if cls == 'texel_buffer' else e.update(kind='tex_ubo', reg=ut[0], off=ut[1], **other)
+                sampler = ({'kind': 'samp_id', 'reg': us[1]} if us[0] == 'id' else {'kind': 'samp_ubo', 'reg': ut[0], 'off': ut[1], 'soff': us[1], 'sreg': abi.SREG_C2} if us[0] == 'c2' else
+                           {'kind': 'samp_ubo', 'reg': us[0], 'off': us[1], **({'soff': ut[1], 'sreg': ut[0]} if other else {})})
+            elif c2a is not None:   # element k from the c2 word at off + 8k; handle type 1 ORs in the sampler word at c2 byte soff
+                off, soff = c2a; so = {} if soff is None else {'soff': soff}
+                e.update(kind='tex_c2a', off=off, **so); sampler = {'kind': 'samp_c2a', 'off': off, **so}
             else:
-                d = s['decode_tex'](nm)
+                d = R.decode_tex(nm)
                 if not d: e['kind'] = '?'
                 else:
                     t, sl, hty = d
                     e.update(kind='tbuf' if cls == 'texel_buffer' else 'tex', reg=t)
-                    sampler = {'kind': 'samp_id', 'reg': s['const_sampler'](nm)} if hty == 3 else {'kind': 'samp', 'reg': sl} if hty else {'kind': 'samp_tex', 'reg': t}
+                    si = R.decode_ubo_samp_id(nm)   # handle type 2: the texture in c2, the sampler ID itself in a uniform buffer word, which the host shifts into a handle (raw_id)
+                    sampler = ({'kind': 'samp_ubo', 'reg': si[0], 'off': si[1], 'raw_id': True} if si else {'kind': 'samp_id', 'reg': R.const_sampler(nm)} if hty == 3 else
+                               {'kind': 'samp', 'reg': sl} if hty else {'kind': 'samp_tex', 'reg': t})
                     if e['kind'] == 'tex' and t in fetch1d:
                         e['fetch1d'] = True
                         if 'size' in uses.get(r['id'], set()): e['fetch1d_size'] = True
@@ -333,13 +352,15 @@ class Build:
     def reflection(self, key, j, c1, m, res, msl, extra):
         name, k = self.loc[key]; stage = j['stage']
         io = dmsh_spv.interface(m)
-        dr = self.s['drv_reads'](msl) if msl else {}
+        dr = dmsh_reflect.drv_reads(msl) if msl else {}
+        with open(j['code'], 'rb') as f: code = f.read()   # the program job_for wrote: a pixel shader's output map is in its SPH (ps_omap), as dmsh_build.py finish takes it
+        raster = {**(dmsh_reflect.raster_facts(stage, msl) if msl else {}), **({'omap': self.s['ps_omap'](code)} if stage == 'ps' else {})}
         refl = {'key': key, 'target': 'vk', 'chain': self.chain, 'dm_ctl': key, 'source': f'{name}#{k}', 'pc_paired': self.pc_of.get(key, ''), 'stage': stage,
                 'entry': 'main', 'entries': [e[1] for e in m.entry_points()], 'threadgroup_size': j.get('local'), 'c1': c1.hex(),
                 'notes': res['notes'] + (['not in the answer table, queries use defaults'] if j.get('no_facts') else []) + extra.pop('notes', []),
-                'drv_reads': dr, 'drv_unfillable': self.s['unfillable'](dr), 'bindings': self.bindings(stage, m, res), 'sbuf_align': res.get('sbuf_align'),
+                'drv_reads': dr, 'drv_unfillable': dmsh_reflect.unfillable(dr, stage), 'bindings': self.bindings(stage, m, res), 'sbuf_align': res.get('sbuf_align'),
                 'vertex_inputs': sorted({x['location']: {'location': x['location'], 'type': x['base'], 'n': x['n']} for x in io if x['storage'] == 'in' and stage == 'vs'}.values(), key=lambda v: v['location']),
-                'raster': self.s['raster_facts'](stage, msl) if msl else {}, 'analysis': msl is not None, **extra}
+                'raster': raster, 'analysis': msl is not None, **extra}
         if stage == 'ps':   # the interpolation of each input location (section 3.2: pipeline libraries without independent interpolation decorations need it to match)
             refl['interp'] = {q: sum(1 << l for l in {x['location'] for x in io if x['storage'] == 'in' and (x['interp'] == q if q in ('flat', 'noperspective') else x[q])})
                               for q in ('flat', 'noperspective', 'centroid', 'sample')}   # a set: a merged module has each input once per entry point
@@ -349,30 +370,27 @@ class Build:
     # One shader, in two halves around the second translations (run_steps): analyse, then finish
     def analyse(self, key, j):
         """The analysing step of one translated shader: its analysis rendering, kept as <work>/<key>_b.metal for finish, and the second translations it calls for.
-        → {'msl': whether it rendered, 'more': the inputs only used as integers (a vertex shader), 'fs': (fs_uint's mask, the float colour outputs) (a pixel shader that writes
-        integer bits)}, or {'error': what failed, as the old one-step build reported it}"""
+        → {'msl': whether it rendered, 'more': the inputs only used as integers (a vertex shader), 'fs': the float colour outputs (a pixel shader that gets main_u)},
+        or {'error': what failed, as the old one-step build reported it}"""
         try:
             stage, w = j['stage'], self.w
             msl = self.render(os.path.join(w, key + '.spv'), w) if stage in ('vs', 'ps', 'cs') else None
             a = {'msl': msl is not None}
             if msl is not None: self.keep_msl(key, msl)
-            if stage == 'vs' and msl:   # inputs only used as integers: translated again with them reported as uint (dmsh_build.py int_inputs)
-                more = {l: t for l, t in self.s['int_inputs'](msl).items() if l not in j['attr']}
+            if stage == 'vs' and msl:   # inputs only used as integers: translated again with them reported as uint (dmsh_entry.py int_inputs)
+                more = {l: t for l, t in dmsh_entry.int_inputs(msl).items() if l not in j['attr']}
                 if more: a['more'] = more
-            if stage == 'ps' and msl:   # an output written from integer bits: main_u (every colour output uint) and, for a mix, main_m (dmsh_build.py fs_uint), by translating again
-                fu, mask = self.s['fs_uint'](msl)
-                if fu: a['fs'] = (mask, self.colors(msl))
+            if stage == 'ps' and msl and dmsh_entry.fs_uint(msl) is not None:   # the typed-output entry point, as dmsh_entry.py fs_uint gives main0_u: main_u, every float colour output uint, by translating again
+                cols = self.colors(msl)
+                if cols: a['fs'] = cols
             return a
         except Exception as e: return {'error': f'{type(e).__name__}: {e}'[:160]}
 
     @staticmethod
-    def second_jobs(key, j, a):   # the second translations analyse asked for (translate_one's jobs): the vertex shader's own key, a pixel shader's <key>_u and <key>_m
+    def second_jobs(key, j, a):   # the second translations analyse asked for (translate_one's jobs): the vertex shader's own key, a pixel shader's <key>_u
         out = []
         if 'more' in a: out.append(dict(j, attr={**j['attr'], **a['more']}))
-        if 'fs' in a:
-            mask, cols = a['fs']
-            for sfx, targets in (('u', cols), ('m', [c for c in cols if mask >> c & 1] if mask else [])):
-                if targets: out.append(dict(j, key=f'{key}_{sfx}', fout={**j['fout'], **{str(c): 'uint' for c in targets}}))
+        if 'fs' in a: out.append(dict(j, key=f'{key}_u', fout={**j['fout'], **{str(c): 'uint' for c in a['fs']}}))
         return out
 
     def keep_msl(self, key, msl):   # the rendering in the work folder, as the output file will hold it (written in text mode, as the build always wrote it; finish renames it)
@@ -386,7 +404,7 @@ class Build:
         try: result = self.finish(key, j, c1, self.w, a, again, pad_known)
         except Exception as e: result = ('failed', f'{type(e).__name__}: {e}'[:160], None, None)   # a key that fails is reported, the others still build (as the translator does)
         if result[0] == 'ok': self.publish(key, digest)
-        for k in (key, key + '_u', key + '_m'):
+        for k in (key, key + '_u'):
             for sfx in self.WORK_FILES: unlink(os.path.join(self.w, k + sfx))
         return result
 
@@ -408,19 +426,13 @@ class Build:
             extra['int_inputs'] = sorted(int(l) for l in a['more'])
         res = read_json(os.path.join(w, key + '.res.json'))
         if 'fs' in a:
-            mask, cols = a['fs']
-            parts = [(spv, 'main')]
-            for sfx, targets in (('u', cols), ('m', [c for c in cols if mask >> c & 1] if mask else [])):
-                if not targets: continue
-                sk = f'{key}_{sfx}'; err = again.get(sk)
-                if err: notes.append(f'[RED] no main_{sfx} ({err})'); continue
-                parts.append((os.path.join(w, sk + '.spv'), 'main_' + sfx))
-            if len(parts) > 1:
+            err = again.get(key + '_u')
+            if err: notes.append(f'[RED] no main_u ({err})')
+            else:
                 merged = os.path.join(w, key + '.merged.spv')
-                ok, why = dmsh_spv.merge_entries(parts, merged)
-                if ok: os.replace(merged, spv); extra.update({'entry_u': 'main_u'} if any(p[1] == 'main_u' for p in parts) else {})
-                else: notes.append(f'[RED] the integer-output entry points do not link ({why}): built without them')
-                if ok and any(p[1] == 'main_m' for p in parts): extra.update(entry_m='main_m', uint_mask_m=mask)
+                ok, why = dmsh_spv.merge_entries([(spv, 'main'), (os.path.join(w, key + '_u.spv'), 'main_u')], merged)
+                if ok: os.replace(merged, spv); extra['entry_u'] = 'main_u'
+                else: notes.append(f'[RED] the integer-output entry point does not link ({why}): built without it')
         pad_want = {}
         if stage == 'vs' and self.pairs.get(key):   # the inputs of the paired pixel shaders already built (vs_pad; pairs whose pixel module is missing are skipped, as on Metal)
             for ps in sorted(self.pairs[key]):
@@ -499,25 +511,38 @@ class Build:
                 if mk and (not self.want or mk.group(1) in self.want): os.unlink(os.path.join(d, n))
         if (not self.want or stamp_before != self.inputs) and os.path.exists(os.path.join(self.out, dmsh_chain.STAMP)): os.unlink(os.path.join(self.out, dmsh_chain.STAMP))
         w = tempfile.mkdtemp(prefix='dmsh_vk_', dir=os.environ.get('WORK'))
-        packs, recs, digests, jobs, c1s, hits = {}, {}, {}, {}, {}, set()
+        packs, size, digests, jobs, c1s, hits, refused = {}, {}, {}, {}, {}, set(), {}
         def rec_of(key):
-            name, k = self.loc[key]
+            """→ (package name, the shader's record), found by its key in the package's index (dmsh_build.py record_index), as dmsh_build.py rec_of finds it, and read each time, not
+            kept: the map row's index read a neighbour's bytes from a package of another shader_split.py run (issue #1841), and a package held in memory made the process as large
+            (issue #1036). The bytes are read through a file of this build's: os.pread, dmsh_build.py's read, is POSIX only, and an os.open descriptor reads in text mode on Windows"""
+            name = self.loc[key][0]
             if name not in packs:
-                with open(os.path.join(self.dm_dir, name), 'rb') as f: packs[name] = s['records'](f.read())
-            return name, packs[name][k]
+                path = os.path.join(self.dm_dir, name)
+                fd, index = s['record_index'](path); os.close(fd)
+                packs[name] = (open(path, 'rb'), index)
+            f, index = packs[name]
+            if key not in index:
+                sys.exit(f'[RED] {name} holds no record of shader {key}, which the shader map names: the package and the map come from different shader_split.py runs; split the shaders again')
+            o, e = index[key]; f.seek(o)
+            return name, f.read(e - o)
         def digest_of(key, name, rec): return hashlib.sha256(b'target\0vk\0' + s['shader_key'](key, name, rec).encode()).hexdigest()
-        for key in keys: recs[key] = rec_of(key); digests[key] = digest_of(key, *recs[key])
-        def plain(k): return digests[k] if k in digests else digest_of(k, *rec_of(k)) if k in self.loc else 'missing'
-        for key in keys:
-            if self.pairs.get(key): digests[key] = s['pair_keyed'](digests[key], [plain(p) for p in sorted(self.pairs[key])])
         t, times = time.monotonic(), {}
-        count = Count('preparing', len(keys))   # each shader from the content store, or its translation job
-        for key in keys:
-            if self.restore(key, digests[key]): hits.add(key); self.count('cache hit')
-            else: jobs[key], c1s[key] = s['job_for'](key, recs[key][0], recs[key][1], w); self.count('cache miss')
-            count.add()
+        try:
+            for key in keys:
+                name, rec = rec_of(key); size[key] = len(rec); digests[key] = digest_of(key, name, rec)
+            def plain(k): return digests[k] if k in digests else digest_of(k, *rec_of(k)) if k in self.loc else 'missing'
+            for key in keys:
+                if self.pairs.get(key): digests[key] = s['pair_keyed'](digests[key], [plain(p) for p in sorted(self.pairs[key])])
+            count = Count('preparing', len(keys))   # each shader from the content store, or its translation job
+            for key in keys:
+                if self.restore(key, digests[key]): hits.add(key); self.count('cache hit')
+                else: self.prepare(key, rec_of, w, jobs, c1s, refused); self.count('cache miss')
+                count.add()
+        finally:
+            for f, _ in packs.values(): f.close()
         times['preparing'] = time.monotonic() - t
-        res = self.run_steps(keys, hits, jobs, c1s, digests, {k: len(recs[k][1]) for k in keys}, w, times)
+        res = self.run_steps(keys, hits, jobs, c1s, digests, size, w, times, refused)
         shutil.rmtree(w, ignore_errors=True)
         self.summary(res)
         atomic_json(os.path.join(self.out, '_vk_build.json'), [{'key': r[0], 'st': r[1], 'err': r[2]} for r in res])
@@ -527,11 +552,23 @@ class Build:
         print('times: ' + ', '.join(f'{k} {v:.1f} s' for k, v in times.items()), flush=True)
         return 0 if all(r[1] == 'ok' for r in res) else 1
 
-    def run_steps(self, keys, hits, jobs, c1s, digests, size, w, times):
-        """The steps of the file header over the shaders not taken from the cache (jobs); size: each shader's record size, the cost the batches and the order go by.
-        → [(key, status, error, reflection)] in the order of keys, the pixel shaders and the other unpaired keys first, then the paired vertex shaders (vs_pad), each in key order"""
-        misses = [k for k in keys if k not in hits]
+    def prepare(self, key, rec_of, w, jobs, c1s, refused):
+        """A shader the cache does not hold: its translation job (dmsh_build.py job_for) into jobs and c1s, or why this chain does not translate it into refused: a ray-tracing
+        shader, a record job_for refuses, or NVN2 (Switch 2) code, which job_for marks for the Metal translator's Ampere decoder (arch); the Vulkan translator decodes Maxwell code only"""
+        if key in self.rt: refused[key] = 'a ray-tracing shader: the Vulkan chain has no ray-tracing path (the Metal build makes them one library, dmsh_rt_build.py)'; return
+        try: j, c1 = self.s['job_for'](key, *rec_of(key), w)
+        except ValueError as e: refused[key] = str(e)[:160]; return
+        if j.get('arch'): refused[key] = f'NVN2 code (arch {j["arch"]}): the Vulkan translator decodes Maxwell code only'; return
+        jobs[key], c1s[key] = j, c1
+
+    def run_steps(self, keys, hits, jobs, c1s, digests, size, w, times, refused=None):
+        """The steps of the file header over the shaders not taken from the cache (jobs; refused: those prepare gave no job, with the reason); size: each shader's record size,
+        the cost the batches and the order go by. → [(key, status, error, reflection)] in the order of keys, the pixel shaders and the other unpaired keys first, then the paired
+        vertex shaders (vs_pad), each in key order"""
+        refused = refused or {}
+        misses = [k for k in keys if k not in hits and k not in refused]
         out, xerr = {k: (k, 'ok', '', read_json(os.path.join(self.out, k + '.json'))) for k in keys if k in hits}, {}
+        out.update({k: (k, 'not translated', why, None) for k, why in refused.items()})
         t = time.monotonic()
         if misses:
             for _, r in self.translate_all([jobs[k] for k in misses], w, 'translating', lambda j: size[j['key']]):
@@ -558,7 +595,7 @@ class Build:
                 for phase in ([k for k in todo if k not in self.pairs], [k for k in todo if k in self.pairs]):   # paired vertex shaders read their pixel shaders' inputs (vs_pad), so they go last
                     futures = {}
                     for k in phase:
-                        ag = {x: rx[x] for x in (k, k + '_u', k + '_m') if x in rx}
+                        ag = {x: rx[x] for x in (k, k + '_u') if x in rx}
                         known = {p: pin[p] for p in self.pairs.get(k, ()) if p in pin}
                         futures[ex.submit(_finish, k, jobs[k], c1s[k], an[k], ag, known, digests[k])] = 1
                     wait_counting(futures, count)

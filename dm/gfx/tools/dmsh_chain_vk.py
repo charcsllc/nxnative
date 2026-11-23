@@ -2,9 +2,10 @@
 # Translation chain version of the Vulkan shader libraries, DMSH_CHAIN_VK (docs/design/vulkan-backend.md, 2.4): what DMSH_CHAIN (dmsh_chain.py) is for Metal, in a file of its own,
 # because dmsh_chain.py hashes its own bytes into DMSH_CHAIN, so a Vulkan option there would change the Metal version (the reason chain_tools.py sits beside it, step M0).
 # V = the first 12 digits of the sha256 of the files in FILES + the translation options (dmsh_chain.py's: XLATE_DEBUG, XLATE_REDUCED): this script, the build script, the SPIR-V
-# passes, the Vulkan translator's sources, the Metal chain modules the build takes code or decisions from (dmsh_build.py's analysis functions, dmsh_chain.py's inputs digest and
-# stamp, dmsh_facts.py, dmsh_atomic.py, c1_guard.py, cb_extent.py), the Ryujinx sources of DMSH_CHAIN's list, and the tool lock dmsh_chain_vk.lock. A change to a shared file
-# changes both versions; a Vulkan-only change changes this one alone.
+# passes, the Vulkan translator's sources, the Metal chain modules the build takes code or decisions from (dmsh_build.py's job model, dmsh_chain.py's inputs digest and stamp,
+# dmsh_facts.py, c1_guard.py, cb_extent.py, and SHARED: the modules the build imports or the dmsh_build.py code it runs reads, dmsh_reflect.py and dmsh_entry.py with
+# theirs and the library ABI, dm/gfx/nvn/dmsh_abi.h), the Ryujinx sources of DMSH_CHAIN's list, and the tool lock dmsh_chain_vk.lock. A change to a shared file changes both
+# versions; a Vulkan-only change changes this one alone.
 # The build (dmsh_build_vk.py) writes into <cache dir>/vk-<V>/ and each reflection json records chain = V; the Vulkan host takes V from dm/gfx/nvn/dmsh_chain_vk.h and loads
 # only from vk-<V>/. The profile inputs digest and the stamp (vk-<V>/inputs.tsv) are dmsh_chain.py's: one digest for both targets.
 # Usage: dmsh_chain_vk.py                 print V
@@ -22,8 +23,13 @@ import hashlib, os, platform, shutil, subprocess, sys
 HERE = os.path.dirname(os.path.abspath(__file__)); GFX = os.path.dirname(HERE); REPO = os.path.dirname(os.path.dirname(GFX))
 sys.path.insert(0, HERE); import dmsh_chain, tool_lock   # noqa: E402   (tool_lock: the fingerprints, sha16, upstream moved out of dmsh_chain.py)
 FILES = ['tools/dmsh_chain_vk.py', 'tools/dmsh_build_vk.py', 'tools/dmsh_spv.py', 'tools/dmsh_xlate_vk/Program.cs', 'tools/dmsh_xlate_vk/dmsh_xlate_vk.csproj',
-         'tools/dmsh_build.py', 'tools/dmsh_chain.py', 'tools/dmsh_facts.py', 'tools/dmsh_atomic.py', 'tools/c1_guard.py', 'tools/cb_extent.py']
-FILES += [f for f in dmsh_chain.FILES if f.startswith('../third_party/ryujinx/')] + ['tools/dmsh_chain_vk.lock']
+         'tools/dmsh_build.py', 'tools/dmsh_chain.py', 'tools/dmsh_facts.py', 'tools/c1_guard.py', 'tools/cb_extent.py']
+# The Metal chain's modules whose code dmsh_build_vk.py runs, all in DMSH_CHAIN's list too (dmsh_chain.py FILES), which its code_fingerprint also hashes: the reflection's decodes, driver reads
+# and raster facts (dmsh_reflect.py, which imports dmsh_fetch.py and dmsh_geometry.py), the integer inputs and the typed outputs (dmsh_entry.py: dmsh_side.py, which imports dmsh_pull.py, dmsh_alpha.py,
+# dmsh_logic.py), the library ABI (dmsh_abi.py and its header, which cb_extent.py reads too), and what dmsh_build.py job_for reads (dmsh_ampere.py, dmsh_meshstage.py, dmsh_tess.py)
+SHARED = ['tools/dmsh_reflect.py', 'tools/dmsh_entry.py', 'tools/dmsh_fetch.py', 'tools/dmsh_geometry.py', 'tools/dmsh_side.py', 'tools/dmsh_pull.py', 'tools/dmsh_alpha.py',
+          'tools/dmsh_logic.py', 'tools/dmsh_abi.py', 'nvn/dmsh_abi.h', 'tools/dmsh_ampere.py', 'tools/dmsh_meshstage.py', 'tools/dmsh_tess.py']
+FILES += SHARED + [f for f in dmsh_chain.FILES if f.startswith('../third_party/ryujinx/')] + ['tools/dmsh_chain_vk.lock']
 LOCK = os.path.join(HERE, 'dmsh_chain_vk.lock'); HEADER = os.path.join(GFX, 'nvn/dmsh_chain_vk.h')
 PREFIX = 'vk-'   # the library directory <cache dir>/vk-<V>/
 XLATE_VK = os.environ.get('XLATE_VK', os.path.join(REPO, 'build/xlate_vk/bin/dmsh_xlate_vk/release/dmsh_xlate_vk.dll'))
