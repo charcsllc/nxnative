@@ -4,11 +4,11 @@ spirv-tools_win-x64	SPIRV-Tools v2025.1 unknown hash, 2025-02-25T20:54:39+00:00
 glslang_win-x64	Glslang Version: 11:15.1.0
 spirv-cross_win-x64	Git commit: vulkan-sdk-1.4.363.0 Timestamp: 2026-09-16T11:27:19
 dmsh_xlate_vk.dll	570f4dec6874764e
-Ryujinx.Graphics.Shader.dll	98193cdf93713992
+Ryujinx.Graphics.Shader.dll	e8121ac8d9f89331
 Ryujinx.Common.dll	696a8a00dacdb9fd
 xlate_source	bfb967eda4f4468d
 spirv-tools_linux-x64	SPIRV-Tools v2025.1 unknown hash, 2025-02-25T20:54:39+00:00
 glslang_linux-x64	Glslang Version: 11:15.1.0
 spirv-cross_linux-x64	Git commit: vulkan-sdk-1.4.363.0 Timestamp: 2026-09-16T11:27:19
-dmsh_xlate_vk_linux-x64	cd9ae1d9c2d5303f
-dmsh_xlate_vk_win-x64	5c7b4152ef8890c5
+dmsh_xlate_vk_linux-x64	788aa175e654e489
+dmsh_xlate_vk_win-x64	409b7bba93381543

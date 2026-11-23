@@ -37,8 +37,9 @@ mkdir -p "$out/licenses" || die "cannot create $out"
 
 # The publish options: the commit stays out of the assemblies (Source Link would put HEAD's into their informational version) and no PDB, so no path is in the program
 common="-c Release -r $rid -nologo -p:IncludeSourceRevisionInInformationalVersion=false -p:DebugType=none"
+# (windows: PublishAot=false over nx_extract.csproj's PublishAot=true, which the Mac's native executable needs, dm/tools/native_tools.sh; Native AOT does not cross-compile)
 if [ "$platform" = linux ]; then form="-p:PublishAot=true" xlate_form=$form
-else form="--self-contained true -p:PublishSingleFile=true -p:PublishTrimmed=true" xlate_form="$form -p:PublishReadyToRun=true"
+else form="--self-contained true -p:PublishAot=false -p:PublishSingleFile=true -p:PublishTrimmed=true" xlate_form="$form -p:PublishReadyToRun=true"
 fi
 
 publish() {   # publish <name> <project> <artifacts path> <options...>: the program alone into $out, else an error naming what else the publish wrote
