@@ -17,6 +17,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import types
 import unittest
 from unittest import mock
@@ -403,6 +404,28 @@ class Linux(Pack):
         (self.prof / 'game.tsv').write_text((self.prof / 'game.tsv').read_text().replace('fps_target\t30\n', 'fps_target\t45\n'))
         with self.assertRaisesRegex(nsp.BuildError, r'game\.py exit code 1 \(full output: .*game_profile_linux\.log\)'): self.pack()
         self.assertIn('fps_target must be 0, 30 or 60: 45', (self.work / 'logs/game_profile_linux.log').read_text())
+
+    def test_the_players_work_folder_is_never_packed(self):
+        """cli tidies a developer's work folders (tree_tar.pack_quiet) after an Apple build; a port pack's <id>-work is the player's: run/ (the save, the log, env.txt) and profile/,
+        which the launch file names, and aot-cache/. Made quiet here (pack_quiet asked for a moment's quiet and one file), none of them becomes a tar after a Linux or a Windows pack"""
+        real, calls = nsp.tree_tar.pack_quiet, []
+        room = mock.patch.object(nsp.tree_tar, 'QUIET_FREE', 0); room.start(); self.addCleanup(room.stop)   # the 20 GB to spare: these folders are a few bytes
+        def quiet(w, say=print):
+            calls.append(w); return real(w, say, days=0.0000001, min_files=1)
+        for platform in ('linux', 'windows'):
+            for d in ('run/save', 'profile', 'aot-cache/units'): (self.wdir / d).mkdir(parents=True, exist_ok=True); (self.wdir / d / 'f').write_text('x')
+            (self.wdir / 'profile/main.tsv').write_text('# samples\n')
+            time.sleep(0.05)
+            with mock.patch.object(nsp.tree_tar, 'pack_quiet', side_effect=quiet):
+                code = nsp.cli([str(self.nsp_dir), '-k', str(self.keys), '--platform', platform, '--nxaot', str(self.nxaot)])
+            self.assertEqual(code, 0, self.said[-3:])
+            self.assertIsNone(nsp.NSP_FOLDER, platform)
+            self.assertEqual(calls, [], platform)
+            self.assertEqual(sorted(p.name for p in self.wdir.iterdir()), ['aot-cache', 'profile', 'run'], platform)
+            rows = {n: v for k, n, v in launch_rows(self.work / f'launch-{platform}.tsv') if k == 'path'}
+            for name in ('cwd', 'profile'): self.assertTrue(Path(rows[name]).is_dir(), (platform, name, rows[name]))
+        time.sleep(0.05)
+        self.assertEqual(real(self.wdir, self.said.append, days=0.0000001, min_files=1), ['aot-cache', 'profile', 'run'], 'what cli did before: each became a tar')
 
     def test_sample_profiles(self):   # <NSP folder>/<id>-work/profile/<module>.tsv (dm/host/aot_profile.c writes them): nxaot build --profile, part of the pack's key; --no-profile
         self.pack()
@@ -988,6 +1011,22 @@ class Apple(unittest.TestCase):   # what the Apple builds run is as it was: no -
         self.assertIn('dmsh_build_vk.py', notes[2])
         self.assertNotIn('DLL', nsp.port_notes('linux', S, ro=True)[0]); self.assertIn('(<name>.aot.so)', nsp.port_notes('linux', S, ro=True)[1])
         self.assertTrue(notes[3].startswith('the GLSLC capture boots the game in the Mac host, which windows does not have'))
+
+
+class VkTables(unittest.TestCase):   # vk_tables_current: c1_full_vk.tsv and cb_extent_vk.tsv taken beside the library whose stamp their first line names
+    def test_head_alone_or_followed_by_more(self):   # c1_guard.py and cb_extent.py write shader_lib.table_head exactly, with nothing after it
+        tmp = Path(tempfile.mkdtemp()).resolve(); self.addCleanup(shutil.rmtree, tmp)
+        lib = tmp / 'cache/vk-6b7c2a9429b6'; lib.mkdir(parents=True); (lib / 'inputs.tsv').write_text(f'# stamp\ngame\t{ID}\ninputs\te0bec987b384\n')
+        prof = tmp / 'profile'; prof.mkdir(); g = types.SimpleNamespace(table=lambda n: prof / n)
+        head = '# chain vk-6b7c2a9429b6 inputs e0bec987b384'
+        self.assertEqual(nsp.lib_head(lib), head)
+        self.assertFalse(nsp.vk_tables_current(lib, g), 'no tables')
+        for first, ok in ((head, True), (head + ' 2026-11-01T00:00:00+00:00', True), (head + '0', False), ('# chain vk-6b7c2a9429b6 inputs none', False)):
+            for n in nsp.CHAIN_TABLES_VK: (prof / n).write_text(first + '\n0123456789abcdef\n')
+            self.assertEqual(nsp.vk_tables_current(lib, g), ok, first)
+        (prof / nsp.CHAIN_TABLES_VK[0]).write_text(head)   # the head with no line after it
+        (prof / nsp.CHAIN_TABLES_VK[1]).write_text(head + '\n')
+        self.assertTrue(nsp.vk_tables_current(lib, g))
 
 
 class ProfileStatus(unittest.TestCase):   # report_profile_status's red line for a version the profile was not brought up on: what to do first, then the details

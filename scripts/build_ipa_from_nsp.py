@@ -34,7 +34,7 @@
 # SEEN_SHADERS / --seen-shaders, with PLATFORM 'mac' or 'mac-app': only the shaders the profile's shader_seen.tsv lists and the last runs' logs reported missing, in minutes instead of hours; the rest do not draw (build_shaders).
 # Two ways to run it: open this file in Spyder and press F5 (it uses the values under "Settings" below; an empty NSP folder or prod.keys is asked for at run time);
 #   or in a terminal: python3 scripts/build_ipa_from_nsp.py <NSP folder> -k <prod.keys> [options] (values given on the command line override "Settings", -h lists every option;
-#   without keyboard input a missing value is not asked for but reported as an error; exit code 0 on success, 1 on error, 130 when interrupted, 143 when stopped by SIGTERM, 129 when the terminal closed (SIGHUP)). Command-line options entered in Spyder's run configuration work the same way.
+#   without keyboard input a missing value is not asked for but reported as an error; exit code 0 on success, 1 on error, 130 when interrupted, 143 when stopped by SIGTERM, 129 when the terminal closed (SIGHUP), on Windows 149 on Ctrl+Break (SIGBREAK)). Command-line options entered in Spyder's run configuration work the same way.
 # Uses only three things: this repository, a folder holding one game's NSPs (the base game, with or without an update; DLC NSPs, when present, are packed too and unlock the add-on content already in the game), and prod.keys.
 #   Instead of NSPs, the folder may hold the game's files as a dump (base/, updates/<version>/, dlc/; scripts/pack_dump.py lists the layout): that needs no prod.keys. A game with no profile is surveyed from those files. A dump has no control data: the name comes from the profile (a provisional one takes the folder's name), and the app has no icon unless --icon / ICON gives it one (--fallback-icon / FALLBACK_ICON: only when the game has none).
 #   Or the folder may hold the game as one NUP container (a .nup file: base game, updates and DLC; scripts/pack_nup.py), or the .nup file may be given in its place: it needs no prod.keys, like a dump; a game with no profile is surveyed from the container's files (its newest version's code modules and RomFS file headers),
@@ -63,7 +63,8 @@ import run_saves   # cloud saves off for the build's host runs (tool_env, the pr
 import nso   # the code module loader: nso.Error is a damaged module (its file cut short or not what its header says)
 import tree_tar   # one file in place of a build's folders of many small files
 import shader_lib   # the shader libraries as one file, read in place
-import shader_cache   # the compile cache as one file, read in place
+if os.name != 'nt': import shader_cache   # the compile cache as one file, read in place
+else: shader_cache = None   # Windows: shader_cache.py locks with fcntl, which Windows has not; it is the Metal shader build's (build_shaders, prune_shader_cache), which a Windows pack never runs
 import vol_space   # the space a build may write, with what APFS frees on demand
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import pack_dump   # a folder of a game's files instead of NSPs
@@ -3520,7 +3521,7 @@ def vk_tables_current(lib, g):   # both Vulkan tables name the stamp of the libr
     for name in CHAIN_TABLES_VK:
         try: head = g.table(name).read_text(errors='replace').partition('\n')[0]
         except OSError: return False
-        if not head.startswith(want + ' '): return False
+        if head != want and not head.startswith(want + ' '): return False   # the head alone (c1_guard.py and cb_extent.py write shader_lib.table_head exactly), or followed by more, as chain_tables reads Metal's
     return True
 
 
@@ -4578,7 +4579,7 @@ def main(args=None):
         aoc_dir = Path(args.aoc_dir).expanduser().resolve()
         if not aoc_dir.is_dir(): raise BuildError(f'no such DLC image directory (--aoc-dir): {aoc_dir}')
     if nsp_dir.is_file(): nsp_dir = nsp_dir.parent
-    global NSP_FOLDER; NSP_FOLDER = nsp_dir
+    global NSP_FOLDER; NSP_FOLDER = None if port else nsp_dir   # a port pack's <id>-work is the player's: its run/ and profile/ (the launch file's cwd and profile) and aot-cache/
     dump = 'nup' if nup else 'folder' if dump_folder(nsp_dir) else None   # their files are not encrypted, so they need no keys
     keys = None if dump else Path(os.path.expanduser(args.keys or PROD_KEYS or ask('path of prod.keys: ', 'prod.keys (-k)'))).resolve()
     if keys and not keys.is_file(): raise BuildError(f'no such file: {keys}')
@@ -4984,7 +4985,9 @@ def main(args=None):
     report_profile_status(g, reg, pkg_ver, derived, provisional, patched=patched)
 
 
-NSP_FOLDER = None   # main's: the folder whose work folders cli tidies after a build that succeeded
+NSP_FOLDER = None   # main's: the folder whose work folders cli tidies after a build that succeeded. None after a port pack (--platform linux / windows): its NSP folder is a
+# player's, whose <id>-work holds run/ (the save, the log, env.txt) and profile/ (the AOT sample profiles), which the launch file names and the launcher, run.sh / run.cmd and
+# nxhost-run read by path, and aot-cache/, which the next pack's nxaot reads by path: pack_quiet would turn a quiet one into a tar none of them reads
 
 
 class Stopped(BaseException):   # a SIGTERM or SIGHUP, raised by cli's handler: not an Exception, so no `except Exception` on the way keeps it from cli
@@ -4994,10 +4997,13 @@ class Stopped(BaseException):   # a SIGTERM or SIGHUP, raised by cli's handler: 
 def _sigterm(sig, frame): raise Stopped(sig)
 
 
-STOPS = (signal.SIGTERM, signal.SIGHUP)   # the signals cli turns into Stopped
+# The signals cli turns into Stopped, those the platform has. Windows has no SIGHUP, and no SIGTERM comes from another process there (os.kill is TerminateProcess; only a
+# raise in this process sends one): its console's Ctrl+Break is SIGBREAK (exit code 149). The launcher's Cancel is Ctrl+C on both (SIGINT to the packer's process group on
+# Linux, CTRL_C_EVENT on its console on Windows: KeyboardInterrupt, 130); the tool's group takes neither (proc_group), and run stops it
+STOPS = (signal.SIGTERM, signal.SIGBREAK) if os.name == 'nt' else (signal.SIGTERM, signal.SIGHUP)
 
 
-def cli(argv):   # returns the exit code: 0 done, 1 error, 130 interrupted, 143 stopped by SIGTERM, 129 by SIGHUP
+def cli(argv):   # returns the exit code: 0 done, 1 error, 130 interrupted, 143 stopped by SIGTERM, 129 by SIGHUP (149 by SIGBREAK on Windows)
     # main points DM_GAMES_DIR (and DM_GAMES_FIRST) at this run's provisional or derived profile for its tools. Spyder runs the next F5 in the same process, where the game lookup
     # (game.py by_title) then found that profile and took it for a registered one: ASTRAL CHAIN's second run skipped every provisional step and stopped with no dmsh_chain.h
     environ = dict(os.environ)
@@ -5013,7 +5019,7 @@ def cli(argv):   # returns the exit code: 0 done, 1 error, 130 interrupted, 143 
     try:
         main(parse_args(argv))
         for w in sorted(BUILD_FOLDERS): empty_obsolete(w)
-        if NSP_FOLDER:   # a developer's work folder, which a player's NSP folder does not have (tree_tar.py)
+        if NSP_FOLDER:   # a developer's work folder, which a player's NSP folder does not have (tree_tar.py); never after a port pack (NSP_FOLDER)
             for w in NSP_FOLDER.glob('*-work'):
                 if re.fullmatch(r'[0-9A-Fa-f]{16}-work', w.name): tree_tar.pack_quiet(w, say)
     except (BuildError, nso.Error, pack_nup.Error) as e:   # a damaged module, read in this process (the survey, the heap and region checks), or a NUP's version it cannot pack (no RomFS, read for the disk check before extraction) stops the build the same way

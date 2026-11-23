@@ -1,13 +1,26 @@
 #!/usr/bin/env python3
 # tree_tar.py: a folder becomes one tar and comes back the same, and every state a stopped build can leave is taken up by the next one.
-import fcntl, os, shutil, subprocess, sys, tempfile, time, unittest
+import importlib.util, os, shutil, subprocess, sys, tempfile, time, unittest
 from unittest import mock
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import tree_tar
+try: import fcntl
+except ImportError: fcntl = None
 
 
+class NoFlock(unittest.TestCase):   # Windows has no fcntl: the module imports there (the NSP script imports it), and takes no lock, as on a drive without flock
+    def test_imports_without_fcntl(self):
+        spec = importlib.util.spec_from_file_location('tree_tar_no_fcntl', tree_tar.__file__)
+        mod = importlib.util.module_from_spec(spec)
+        with mock.patch.dict(sys.modules, {'fcntl': None}): spec.loader.exec_module(mod)   # None in sys.modules: its import raises ImportError
+        self.assertIsNone(mod.fcntl)
+        d = Path(tempfile.mkdtemp(prefix='tree_tar_')); self.addCleanup(shutil.rmtree, d, True)
+        self.assertTrue(mod._lock(d / 'x')); self.assertEqual(mod._locks, {})
+
+
+@unittest.skipIf(fcntl is None, 'flock and tar --xattrs: macOS and Linux')
 class TreeTar(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp(prefix='tree_tar_'))
@@ -91,6 +104,7 @@ class TreeTar(unittest.TestCase):
         self.assertEqual(self.names(), ['x.tar'])
 
 
+@unittest.skipIf(fcntl is None, 'tar --xattrs: macOS and Linux')
 class PackQuiet(unittest.TestCase):
     OLD = time.time() - 30 * 86400
 
@@ -106,6 +120,7 @@ class PackQuiet(unittest.TestCase):
         time.sleep(0.05)
         return tree_tar.pack_quiet(self.w, self.lines.append, days=0.0000001, **k)
 
+    @unittest.skipUnless(shutil.which('xattr'), "macOS's xattr command sets and reads the attribute")
     def test_packs_a_quiet_folder_and_keeps_its_attributes(self):
         d = self.folder('issue1')
         subprocess.run(['xattr', '-w', 'org.d2rmobile.guest-name', 'Foo.txt', d / 'sub/f0'], check=True)

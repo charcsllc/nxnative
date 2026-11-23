@@ -33,13 +33,12 @@ def load(name, path):
 
 
 nsp = load('build_ipa_from_nsp', REPO / 'scripts/build_ipa_from_nsp.py')
-regress = load('regress', REPO / 'scripts/regress.py')
+regress = load('regress', REPO / 'scripts/regress.py') if os.name != 'nt' else None   # the Mac's regression runner (fcntl): its cases are POSIX ones
 BOUND = 10.0   # seconds any one stop may take here (the grace periods below are shorter)
 
 
-# Every case reads its processes' states through libproc (proc_status) and names them as macOS does: off a Mac the tests skip with the reason, as the port's suites
-# do where a machine lacks what a test needs (proc_group.py itself runs on Linux too, with members only)
-@unittest.skipUnless(sys.platform == 'darwin', "the cases read process states through macOS's libproc (proc_status)")
+# The process trees of fixtures/proc_tree.py are POSIX ones (a fifo, inherited descriptors, signals): on Windows the Job cases below run instead
+@unittest.skipIf(os.name == 'nt', 'POSIX process groups; Windows: the Job cases')
 class Tree(unittest.TestCase):
     def setUp(self):
         d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
@@ -149,7 +148,7 @@ class Run(Tree):
 
     def test_exit_codes(self):
         r, _, _ = self.run_tree('--child', 'exit', '--wrapper', 'join:5', ok=(5,))
-        self.assertEqual(r, 0)
+        self.assertEqual(r, 5)   # a code in ok is returned (the port's build_vk_chain reads dmsh_build_vk.py's 1)
         r, _, _ = self.run_tree('--child', 'exit', '--wrapper', 'join:7', ok=(5,))
         self.assertIsInstance(r, nsp.BuildError); self.assertIn('exit code 7', str(r))
         r, _, _ = self.run_tree('--child', 'exit', '--wrapper', 'join:7', fatal=False)
@@ -292,7 +291,159 @@ class Supervisor(Tree):
         self.assertEqual(g.stragglers, [])   # a stop, not a straggler: the caller reports its own error
 
 
-def proc_status(pid):   # a process's state from its proc_bsdinfo: gone, zombie, stopped or running
+@unittest.skipUnless(sys.platform.startswith('linux'), 'Linux: members from /proc')
+class LinuxMembers(unittest.TestCase):
+    """members() on Linux reads /proc: a zombie is no member (a packer that is PID 1 in a container reaps none of the orphans it adopts), a live member is named"""
+    def test_a_zombie_is_no_member(self):
+        p = subprocess.Popen([sys.executable, '-c', 'pass'], start_new_session=True)
+        try:
+            os.waitid(os.P_PID, p.pid, os.WEXITED | os.WNOWAIT)   # exited, not reaped: a zombie in its own group
+            self.assertEqual(proc_status(p.pid), 'zombie')
+            self.assertEqual(proc_group.members(p.pid), [])
+            with contextlib.suppress(ProcessLookupError): os.killpg(p.pid, 0)   # what the old check went by: the kernel still counts the zombie in its group
+        finally: p.wait()
+
+    def test_a_live_member_is_named(self):
+        p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(30)'], start_new_session=True)
+        try:
+            got = proc_group.members(p.pid)
+            self.assertEqual([pid for pid, _ in got], [p.pid])
+            self.assertEqual(got[0][1], Path(f'/proc/{p.pid}/comm').read_text().strip())
+            self.assertNotEqual(got[0][1], '?')
+        finally: p.kill(); p.wait()
+
+    def test_an_orphan_that_exits_late_does_not_fail_the_step(self):
+        """The case of "shader_split.py exited, but ? (pid 101) still ran": the tool's child outlives it briefly and exits, adopted by a process that does not reap it
+        (PID 1 in a container; here this process made a subreaper, PR_SET_CHILD_SUBREAPER). Its zombie stays in the group, and the step passes; a child that keeps running
+        is stopped and named"""
+        libc = ctypes.CDLL(None, use_errno=True)
+        if libc.prctl(36, 1, 0, 0, 0): self.skipTest(f'PR_SET_CHILD_SUBREAPER: errno {ctypes.get_errno()}')
+        self.addCleanup(libc.prctl, 36, 0, 0, 0)
+        out = io.StringIO()
+        with mock.patch.object(nsp, 'PROG', nsp.Progress('off')), contextlib.redirect_stdout(out), mock.patch.object(proc_group, 'DRAIN', 2.0), \
+             tempfile.TemporaryDirectory() as d:
+            for sleep, ok in ((0.3, True), (30, False)):
+                ids = []
+                code = ('import subprocess, sys, os; c = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(%s)"], stdout=subprocess.DEVNULL); '
+                        'print("READY", os.getpid(), c.pid, flush=True)' % sleep)
+                try: r = nsp.run([sys.executable, '-c', code], Path(d) / 'tool.log', on_line=lambda l: l.startswith('READY ') and ids.append(int(l.split()[2])))
+                except nsp.BuildError as e: r = e
+                c = ids[0]
+                if ok:
+                    self.assertEqual(r, 0)
+                    self.assertEqual(proc_status(c), 'zombie', 'the orphan was adopted here and not reaped')
+                else:
+                    self.assertIsInstance(r, nsp.BuildError)
+                    self.assertIn(f'(pid {c}) still ran', str(r)); self.assertNotIn('? (pid', str(r))
+                    self.assertIn(proc_status(c), ('gone', 'zombie'))
+                with contextlib.suppress(ChildProcessError): os.waitpid(c, 0)
+
+
+class Stops(unittest.TestCase):   # cli's signals are the ones the platform has
+    def test_per_platform(self):
+        want = (signal.SIGTERM, signal.SIGBREAK) if os.name == 'nt' else (signal.SIGTERM, signal.SIGHUP)
+        self.assertEqual(nsp.STOPS, want)
+
+
+@unittest.skipUnless(os.name == 'nt', 'Windows: proc_group.JobGroup')
+class Job(unittest.TestCase):
+    """proc_group.Group on Windows: a Job Object with the tool and what it starts (a tree written here: fixtures/proc_tree.py is a POSIX one), stopped whole; a member that
+    outlives the tool is stopped and named"""
+    TREE = ('''import os, subprocess, sys, time
+mode, out = sys.argv[1], sys.argv[2]
+c = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(float(%r))' % (0.3 if mode == 'quick' else 60)], stdout=subprocess.DEVNULL if out == 'null' else None)
+print('READY', os.getpid(), c.pid, flush=True)
+if mode in ('exit', 'quick'): os._exit(0)
+if mode.startswith('join:'): c.kill(); c.wait(); print('done', flush=True); sys.exit(int(mode[5:]))
+time.sleep(60)
+''')
+
+    def setUp(self):
+        d = tempfile.TemporaryDirectory(); self.addCleanup(d.cleanup)
+        self.dir = Path(d.name); self.tree = self.dir / 'tree.py'; self.tree.write_text(self.TREE); self.log = self.dir / 'tool.log'
+        self.out = io.StringIO()
+        for cm in (mock.patch.object(proc_group, 'GRACE', 2.0), mock.patch.object(proc_group, 'DRAIN', 0.5), mock.patch.object(nsp, 'PROG', nsp.Progress('off')),
+                   contextlib.redirect_stdout(self.out)):
+            cm.__enter__(); self.addCleanup(cm.__exit__, None, None, None)
+
+    def alive(self, pid):   # a process that has not exited (SYNCHRONIZE, a wait of 0)
+        k32 = ctypes.WinDLL('kernel32'); k32.OpenProcess.restype = ctypes.c_void_p; k32.WaitForSingleObject.argtypes = (ctypes.c_void_p, ctypes.c_uint32)
+        k32.CloseHandle.argtypes = (ctypes.c_void_p,)
+        h = k32.OpenProcess(0x100000, False, pid)
+        if not h: return False
+        try: return k32.WaitForSingleObject(h, 0) == 0x102   # WAIT_TIMEOUT
+        finally: k32.CloseHandle(h)
+
+    def run_tree(self, mode='wait', out='pipe', stop=None, **kw):   # → (result or exception, seconds, (wrapper, child))
+        got = {}
+        def on_line(line):
+            if line.startswith('READY '):
+                got['ids'] = tuple(int(x) for x in line.split()[1:])
+                if stop: stop()
+        t0 = time.monotonic()
+        try: r = nsp.run([sys.executable, self.tree, mode, out], self.log, on_line=on_line, **kw)
+        except BaseException as e: r = e   # noqa: BLE001
+        return r, time.monotonic() - t0, got.get('ids', (-1, -1))
+
+    def assert_gone(self, *pids):
+        self.assertGreater(min(pids), 0, 'the process tree never got ready')
+        for pid in pids: self.assertFalse(self.alive(pid), f'pid {pid} still runs')
+
+    def test_members_from_the_start(self):   # started suspended, joined to the job, then resumed: the child it starts at once is a member, named
+        g = proc_group.Group([sys.executable, self.tree, 'wait', 'pipe'], stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+        with self.assertRaises(RuntimeError), g:
+            line = next(g.lines()); w, c = (int(x) for x in line.split()[1:])
+            self.assertEqual(sorted(p for p, _ in g.members()), sorted([w, c]))
+            self.assertTrue(all(n.lower().startswith('python') for _, n in g.members()), g.members())
+            with self.assertRaises(NotImplementedError): g.pause()
+            raise RuntimeError
+        self.assert_gone(w, c)
+        self.assertEqual(g.stragglers, [])
+
+    def test_interrupt_in_progress_callback_stops_the_group(self):
+        def interrupt(): raise KeyboardInterrupt
+        r, secs, ids = self.run_tree(stop=interrupt)
+        self.assertIsInstance(r, KeyboardInterrupt)
+        self.assertLess(secs, BOUND)
+        self.assert_gone(*ids)
+
+    def test_normal_completion_and_exit_codes(self):
+        r, _, ids = self.run_tree('join:0')
+        self.assertEqual(r, 0); self.assertEqual(self.log.read_text().split()[-1], 'done'); self.assert_gone(*ids)
+        r, _, _ = self.run_tree('join:7', ok=(5,))
+        self.assertIsInstance(r, nsp.BuildError); self.assertIn('exit code 7', str(r))
+
+    def test_a_child_that_ends_soon_after_the_tool(self):   # within the drain: its start (a Python's, slow under Wine) and 0.3 s
+        with mock.patch.object(proc_group, 'DRAIN', 5.0): r, _, ids = self.run_tree('quick', 'null')
+        self.assertEqual(r, 0)
+        self.assert_gone(*ids)
+
+    def test_a_child_left_running(self):   # holding the output (lines' drain) or not (finish's): stopped, named, the step failed
+        for out in ('pipe', 'null'):
+            r, secs, (w, c) = self.run_tree('exit', out)
+            self.assertIsInstance(r, nsp.BuildError, out); self.assertIn(f'(pid {c}) still ran', str(r))
+            self.assertNotIn('? (pid', str(r))
+            self.assertLess(secs, proc_group.DRAIN + BOUND)
+            self.assert_gone(w, c)
+
+    def test_sigterm_in_cli(self):   # STOPS: a SIGTERM raised in the process (Windows delivers none from another) ends the build as Stopped, the group stopped
+        ids = []
+        def main(_):
+            def on_line(line):
+                if line.startswith('READY '): ids.append(tuple(int(x) for x in line.split()[1:])); signal.raise_signal(signal.SIGTERM)
+            nsp.run([sys.executable, self.tree, 'wait', 'pipe'], self.log, on_line=on_line)
+        before = {s: signal.getsignal(s) for s in nsp.STOPS}
+        with mock.patch.object(nsp, 'parse_args'), mock.patch.object(nsp, 'main', side_effect=main): code = nsp.cli([])
+        self.assertEqual(code, 128 + signal.SIGTERM)
+        self.assert_gone(*ids[0])
+        self.assertEqual({s: signal.getsignal(s) for s in nsp.STOPS}, before)
+
+
+def proc_status(pid):   # a process's state: gone, zombie, stopped or running; macOS from its proc_bsdinfo, Linux from /proc/<pid>/stat
+    if proc_group._libproc is None:
+        try: state = Path(f'/proc/{pid}/stat').read_bytes().rpartition(b')')[2].split()[0]
+        except (OSError, IndexError): return 'gone'
+        return {b'Z': 'zombie', b'X': 'gone', b'T': 'stopped', b't': 'stopped'}.get(state, 'running')
     info = ctypes.create_string_buffer(136)
     if proc_group._libproc.proc_pidinfo(pid, 3, 0, info, 136) != 136: return 'gone'
     return {5: 'zombie', 4: 'stopped'}.get(int.from_bytes(info.raw[4:8], 'little'), 'running')
