@@ -118,12 +118,13 @@ static int child(const char *phase, const char *res) {
         char p[800]; snprintf(p, sizeof p, "%s/%s.json", g_libv, g_s[k].key);
         FILE *f = fopen(p, "w"); if (f) { fputs(json, f); fclose(f); }
     }
-    // the table beside the shader map, as dmsh_build_vk.py writes it (c1_guard.py: dmsh_chain.py table_head, then the keys): group B listed; the library's stamp says inputs "test"
+    // the table beside the shader map, as dmsh_build_vk.py writes it (c1_guard.py: shader_lib.py table_head, the stamp alone on its line, then the keys): group B listed; the
+    // library's stamp says inputs "test". The stale table names "test2", which starts with the library's inputs: only the whole word matches
     if (banks || stale) {
         char p[700]; snprintf(p, sizeof p, "%s/c1_full_vk.tsv", g_lib);
         FILE *f = fopen(p, "w");
         if (f) {
-            fprintf(f, "# chain vk-%s inputs %s 2026-11-02T00:00:00+00:00\n", DMSH_CHAIN_VK, banks ? "test" : "other");
+            fprintf(f, "# chain vk-%s inputs %s\n", DMSH_CHAIN_VK, banks ? "test" : "test2");
             for (int k = 0; k < g_n; k++) if (g_s[k].group == 1) fprintf(f, "%s\n", g_s[k].key);
             fclose(f);
         }

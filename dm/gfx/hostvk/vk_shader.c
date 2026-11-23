@@ -284,7 +284,7 @@ static nvn_hmap g_fail;   // 24-byte key → (void *)1
 // - Proven bounded: the shader's key is not in the profile's c1_full_vk.tsv, which a full dmsh_build_vk.py run writes beside the shader map with dm/gfx/tools/c1_guard.py (the Metal
 //   chain's c1_full.tsv rule: interval arithmetic over every c1 index, 0 <= index and 16 * (index + 1) <= the span) run on the analysis MSL rendering of this library's own SPIR-V,
 //   geometry and tessellation shaders (no rendering) listed as unproven; read as nvn_mtl.m reads c1_full.tsv, and taken only when its first line names this library's chain and
-//   stamp ("# chain vk-<DMSH_CHAIN_VK> inputs <the inputs row of vk-<V>/inputs.tsv> ...", dmsh_chain.py table_head).
+//   stamp ("# chain vk-<DMSH_CHAIN_VK> inputs <the inputs row of vk-<V>/inputs.tsv>", alone or with more after a blank: shader_lib.py table_head).
 // - Any other shader (listed, or every one when the table is missing or stale) gets C1_WINDOW bytes of its own, a range of a block too. A missing or stale table is said in one
 //   [RED] line, at the first shader with a c1 that takes a window of its own for that reason, not at the map's load as nvn_mtl.m says it: a library whose shaders have no c1 (the
 //   GPU tests', a game's built-in kernels) needs no table, and the line then marks only what the table would have changed.
@@ -304,12 +304,14 @@ static void c1_table_load(const char *map_path, const char *inputs) {   // under
     char p[1100]; size_t dl = 0;
     for (size_t i = 0; map_path[i]; i++) if (map_path[i] == '/' || map_path[i] == '\\') dl = i + 1;
     snprintf(p, sizeof p, "%.*sc1_full_vk.tsv", (int)dl, map_path);
-    char want[256]; snprintf(want, sizeof want, "# chain vk-%s inputs %s ", DMSH_CHAIN_VK, inputs[0] ? inputs : "-");   // a library without a stamp matches no table
+    // The header line is the stamp alone (shader_lib.py table_head, which c1_guard.py writes since the upstream merge) or the stamp and more after a blank, as nvn_mtl.m
+    // table_head_ok takes it; a library without a stamp ("-") matches no table
+    char want[256]; int wl = snprintf(want, sizeof want, "# chain vk-%s inputs %s", DMSH_CHAIN_VK, inputs[0] ? inputs : "-");
     size_t n = 0; char *txt = read_file(p, &n);
     pthread_mutex_lock(&g_c1_mu);
     if (!g_c1_full.klen) nvn_hm_init(&g_c1_full, 16);
     nvn_hm_clear(&g_c1_full, NULL); g_c1_full_valid = 0; g_c1_said = 0; g_c1_why[0] = 0;
-    if (!txt || strncmp(txt, want, strlen(want))) {
+    if (!txt || strncmp(txt, want, (size_t)wl) || (txt[wl] && txt[wl] != '\n' && txt[wl] != '\r' && txt[wl] != ' ')) {
         snprintf(g_c1_why, sizeof g_c1_why, "[RED] [hostvk] c1_full_vk.tsv is stale or missing (%s: its header must name this library's chain vk-%s and inputs %s; a full "
                  "dmsh_build_vk.py run makes it): every c1 gets its own 64 KiB", p, DMSH_CHAIN_VK, inputs[0] ? inputs : "(no stamp)");
         pthread_mutex_unlock(&g_c1_mu);
