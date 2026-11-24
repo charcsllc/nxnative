@@ -27,3 +27,5 @@ Mario-vs-Donkey-Kong.xci
 .coverage
 .coverage.*
 /coverage.json
+
+CLAUDE.md
