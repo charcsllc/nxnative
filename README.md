@@ -1,12 +1,15 @@
 # nxnative
 
-Play your own Nintendo Switch and Switch 2 games natively on Apple silicon Macs, iPhone and iPad. One script packs your game into a Mac app or an unsigned IPA that you sideload.
+Play your own Nintendo Switch and Switch 2 games natively on Apple silicon Macs, iPhone and iPad, and on Windows and Linux PCs.
 
-It is not an emulator: the game's own code runs directly on the Apple chip, with Switch graphics rebuilt on Metal. Nothing from any game is in this repository, and the project is not affiliated with Nintendo or any game publisher.
+- **Mac, iPhone and iPad:** one script packs your game into a Mac app, or into an unsigned IPA that you sideload.
+- **Windows and Linux:** a launcher window packs the game and plays it.
+
+It is not an emulator: on Apple chips the game's own code runs directly, with Switch graphics rebuilt on Metal. A PC's processor is not ARM, so on a PC the game's code is compiled once to native x86-64 code when you pack the game, and its graphics run on Vulkan. Nothing from any game is in this repository, and the project is not affiliated with Nintendo or any game publisher.
 
 [Games](#games) · [Community front ends](#community-front-ends) · [Requirements](#requirements) · [How to play](#how-to-play) · [Windows and Linux](#windows-and-linux) · [Discussions](#discussions) · [For developers](#for-developers)
 
-**New: Windows and Linux PCs** (x86-64, in progress): the same games packed for a PC and played from a launcher window, with graphics on Vulkan. One game is tested so far. See [Windows and Linux](#windows-and-linux).
+**Windows and Linux (x86-64) are in preview.** One game is tested so far, Mario vs. Donkey Kong, on a Windows 11 PC and on Linux. Download the launcher from [Releases](https://github.com/charcsllc/nxnative/releases) and see [Windows and Linux](#windows-and-linux).
 
 ## Games
 
@@ -48,6 +51,7 @@ Community projects build on nxnative with tools to turn your games into apps for
 - **Mac:** Apple silicon, macOS 26.6 or later. Building games requires Xcode 27.2.
 - **iPhone:** A17 Pro chip or later, with iOS 26 or later.
 - **iPad:** M1 chip or later, with iPadOS 26 or later.
+- **PC:** a 64-bit Intel or AMD processor with Windows 10 or 11, or Linux, and a GPU driver with Vulkan 1.3. See [What your PC needs](#what-your-pc-needs).
 
 The games' textures are BC-compressed, which older iPhones cannot read. Switch 2 builds are tested on the Mac; check each game's note for device-specific validation.
 
@@ -55,7 +59,7 @@ For a game without a profile, the script writes a survey and tries a provisional
 
 ## How to play
 
-For a Switch 2 game, follow the [Switch 2 build instructions](#switch-2-games) with a `.nup` file or a dump folder.
+For a Switch 2 game, follow the [Switch 2 build instructions](#switch-2-games) with a `.nup` file or a dump folder. On a Windows or Linux PC, see [Windows and Linux](#windows-and-linux).
 
 ### Build from the command line
 
@@ -137,7 +141,7 @@ You can also pass a complete update folder directly, for example `~/Games/Donkey
 
 The port runs the games on x86-64 PCs with Windows 10 or 11, or Linux. A PC's processor is not ARM, so the game's code cannot run unchanged as on Apple chips. When you pack a game, its code is compiled once, ahead of time, to native x86-64 code (`nxaot`, built on LLVM). A JIT fallback (dynarmic) runs any code that was not found ahead of time. The graphics go to Vulkan instead of Metal, and the window, controllers and sound to SDL3. As on Apple, nothing from any game is in the download: you pack your own dump with your own keys, on your PC.
 
-**Status.** One game is tested so far: **Mario vs. Donkey Kong**. It was played on Linux with a software renderer (every level visited), and packed and played on a real Windows 11 PC with an NVIDIA RTX 4060. Other games are not tested yet. On Linux, movies are black and silent until a video decoder is chosen; on Windows they play through Media Foundation. Progress and open items: [docs/design/migration-status.md](docs/design/migration-status.md).
+**Status: preview.** One game is tested so far: **Mario vs. Donkey Kong**. It was played on Linux with a software renderer (every level visited), and packed and played on a real Windows 11 PC with an NVIDIA RTX 4060. Other games are not tested yet, including the profiles that came with upstream's 2026-11-23 update. On Linux, movies are black and silent until a video decoder is chosen; on Windows they play through Media Foundation. Progress and open items: [docs/design/migration-status.md](docs/design/migration-status.md).
 
 ### What your PC needs
 
@@ -157,7 +161,7 @@ Nothing else is installed. The download is one self-contained folder, the **bund
 | Windows | `nxnative-windows-x86_64.zip` | `nxlauncher.exe` |
 | Linux | `nxnative-linux-x86_64.tar.gz` | `nxlauncher` |
 
-Download them from [Releases](https://github.com/charcsllc/nxnative/releases) (the latest `port-preview` release lists each file's SHA-256). The [port workflow](.github/workflows/port.yml) is set to build both on every push and on a manual run. To build them yourself, see [Build the bundles](#build-the-bundles) below. A newer bundle can be unpacked anywhere: its launcher takes over the games packed with an older one.
+Download them from [Releases](https://github.com/charcsllc/nxnative/releases) (the latest `port-preview` release lists each file's SHA-256). The [port workflow](.github/workflows/port.yml) is set to build both on every push and on a manual run. To build them yourself, see [Build the bundles](#build-the-bundles) below. A newer bundle can be unpacked anywhere; unpack it into a new folder, not over an older bundle. Its launcher takes over the games packed with an older one, and offers **Repack** for a pack it cannot run, keeping the game's saves. Games packed with `port-preview-1` must be packed again with `port-preview-2` or later.
 
 ### Pack and play (Windows)
 
@@ -186,9 +190,22 @@ The Linux build ships as a `.tar.gz` folder that runs from where it is unpacked,
 ### Controls
 
 - **Controllers:** any controller SDL3 knows works, including Xbox, PlayStation (with gyro), the Switch Pro Controller and handheld PCs' built-in controllers.
-- **Keyboard:** the same keys as on the Mac.
 - **Mouse:** stands in for the touchscreen.
 - **Rumble:** works where the controller has it.
+- **Keyboard:** works without a controller, and alongside one. The keys are read by their position, so they are the same keys on any keyboard layout:
+
+  | Controller | Keyboard |
+  |---|---|
+  | A / B / X / Y | J / K / U / I |
+  | L / R | Q / E |
+  | ZL / ZR | Z / C |
+  | + / − | Enter / Tab |
+  | D-pad | Arrow keys |
+  | Left stick | W A S D |
+  | Press the left / right stick | F / G |
+  | Shake the controller | Space (held) |
+
+  F11 or Alt+Enter switches fullscreen.
 
 ### Build the bundles
 
