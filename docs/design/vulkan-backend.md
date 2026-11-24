@@ -70,7 +70,7 @@ The CPU side (an ahead-of-time ARM64 to x86-64 recompiler, a platform layer for 
 
 Design statements (what we propose to build) carry no tag.
 
-**Boundaries.** Following [CLAUDE.md](../../CLAUDE.md): this design touches the NVN graphics backend boundary (`dm/gfx/nvn`), adds a new host Vulkan backend beside it, and touches the guest Vulkan and OpenGL layers (`dm/gfx/vk`, `dm/gfx/gl`) only for their non-Apple builds. The host (`dm/host`) is touched only through the interfaces listed in section 1.6. No game profile changes.
+**Boundaries.** Following `CLAUDE.md` (the lead's local rules, not in the repository): this design touches the NVN graphics backend boundary (`dm/gfx/nvn`), adds a new host Vulkan backend beside it, and touches the guest Vulkan and OpenGL layers (`dm/gfx/vk`, `dm/gfx/gl`) only for their non-Apple builds. The host (`dm/host`) is touched only through the interfaces listed in section 1.6. No game profile changes.
 
 ## 0. Summary
 

@@ -2,7 +2,7 @@
 
 This page is the handoff for the port of nxnative to Windows 10+ and Linux. It records what was decided, what exists, where it is, and what is left, so that a new session (another account, another agent) can continue without the conversation that produced it. Last updated 2026-10-28 (evening, on the owner's Linux PC).
 
-Read first: [AGENTS.md](../../AGENTS.md) and `CLAUDE.md` (the project rules; they apply to all of this work), then [aot-recompiler.md](aot-recompiler.md) and [vulkan-backend.md](vulkan-backend.md) (the two designs).
+Read first: [AGENTS.md](../../AGENTS.md) and, where it exists, the local `CLAUDE.md` (not in the repository since 2026-11-24; the project rules; they apply to all of this work), then [aot-recompiler.md](aot-recompiler.md) and [vulkan-backend.md](vulkan-backend.md) (the two designs).
 
 ## Goal
 
