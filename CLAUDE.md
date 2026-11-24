@@ -16,6 +16,7 @@ The user writes in Spanish: reply in Spanish. Code, comments, docs, log messages
 - The user cannot test on a Mac (a managed work Mac). A check that needs Windows or a Mac is prepared in the repository with a runner that writes its logs to the committed folder `logs/<platform>/` (`logs/README.md`); the user runs it and, on failure, pushes the logs to GitHub for the next session to read.
 - What cannot run here and must be reported as unchecked, never as passed: `scripts/regress.py check`, the host Makefiles (`make -C dm/host`, `make -C dm/host/tests`), the Metal graphics tests (`make -C dm/gfx/tests ... run`), the shader chain builds (`dmsh_build.py`, `dmsh_chain.py`), `build_ipa.sh` and the NSP script's IPA step. They need an Apple-silicon Mac or macOS CI.
 - Game files, keys and work folders stay outside the repository and outside the home folder (AGENTS.md). The repository root must never hold an NSP or XCI; if one is found there, say so and do not `git add` it.
+- Docker images (`nxnative-build`, `nxnative-chain`, `nxnative-wine`, `nx-e2e-player`, `mstorsjo/llvm-mingw`) can be gone at the start of a session, because the user frees disk space. Check `docker images` and `df -h /` before planning a Docker or Wine check. When a check cannot run because an image is missing and there is no room to rebuild it, say so.
 
 ## Code search
 
@@ -46,6 +47,51 @@ The user writes in Spanish: reply in Spanish. Code, comments, docs, log messages
 - Migration readiness is shown by `scripts/regress.py check` and the tests, not by assertion. Run them on the games a change reaches and report the result; when they cannot run on this machine, say which were not run.
 - A decision that adds a language or a large dependency (Boost, LLVM, SDL3, FFmpeg, CMake for first-party code) is presented to the user with criteria first; the user decides. The open ones are listed in `docs/design/migration-status.md`.
 - At the end of a change, say which boundary it touched and which it left alone, and update `docs/design/migration-status.md` when a phase of the port moves.
+
+## The Windows pack path
+
+Windows is the user's main target. On Windows, the port's packer runs on the bundle's own Python (CPython 3.14 embeddable). Upstream writes its tools for macOS, so a merge or a carried tool can bring in calls that Windows' Python does not have:
+
+- the `fork` start method (Windows has only `spawn`)
+- `signal.pthread_sigmask`
+- `os.killpg`, `os.getpgid` and `os.setsid`
+- `SIGHUP`, `SIGKILL`, `SIGSTOP` and `SIGCONT`
+- `fcntl`, `resource` and `termios`
+- `os.pread`
+- `selectors` on pipes
+- `cp -c`, `ditto` and `xcrun`
+
+On 2026-11-24 the merge's `patch_nso.py` stopped the user's first Windows pack at the rewrite (a fork pool with `pthread_sigmask`; fixed in `345e3f1f`). The merge's sweep had checked the packer and every module it imports, but the rewriter is a tool the packer starts, not an import.
+
+- **What to check.** After an upstream merge, and after any change to a tool on the port's pack path, check every tool a port pack starts and what each tool imports, not only `scripts/build_ipa_from_nsp.py`. The logs of a pack in `<id>_build/logs/` list those tools:
+  - `rewrite_*` (`dm/tools/patch_nso.py`)
+  - `shader_split`, `dmsh_build_vk` and `dmsh_chain_vk*`
+  - `make_ext_font`, `game_profile_*` and `settings_*`
+  - `extract*`, `nxaot_*` and `nxhost_bindings`
+- **How to write the Windows form.** Put it behind a capability check such as `'fork' in multiprocessing.get_all_start_methods()` or `hasattr(signal, 'pthread_sigmask')`. Leave the macOS and Linux paths as they are. Add a test that runs the real code with Windows' limits; `dm/tools/tests/test_rewrite_parallel.py` shows how.
+- **How to check, best option first.**
+  1. A pack under Wine in the `nxnative-wine` image. Report it as Wine, never as Windows.
+  2. When Wine cannot run here, simulate Windows' limits on Linux. Run each Python tool of the pack on a game's extracted files with the Linux bundle's Python, then compare its outputs byte for byte with the same run without the limits. Report the result as "Windows' limits simulated on Linux". The simulation is a `sitecustomize.py` on `PYTHONPATH`:
+
+     ```python
+     import multiprocessing, signal
+     multiprocessing.set_start_method('spawn', force=True)
+     _get = multiprocessing.get_context
+     def _only_spawn(method=None):
+         if method in ('fork', 'forkserver'): raise ValueError(f'cannot find context for {method!r}')
+         return _get(method)
+     multiprocessing.get_context = _only_spawn
+     multiprocessing.get_all_start_methods = lambda: ['spawn']
+     if hasattr(signal, 'pthread_sigmask'): del signal.pthread_sigmask
+     ```
+
+     It covers only the start methods and `pthread_sigmask`. Grep the tools for the other names in the list above as well.
+- **When a bundle is ready.** A bundle goes to the user only after check 1 or check 2 has passed on the commit it is built from. A bundle whose Windows pack path was not checked is not handed over as ready.
+- **How to deliver a build for the user's PC.**
+  - Always a whole bundle zip, never a loose file to copy into a bundle.
+  - Put the zip in the shared folder `/mnt/hgfs/compartir_linux/`. Look at any file already there before replacing it, because the user copies files into that folder too.
+  - The user unzips it into a fresh folder. The first line of its `VERSION` names the commit; tell the user which commit to expect.
+  - When only Python files changed since a bundle was built, a new zip of that bundle with those files replaced is the same bundle a rebuild makes. Update `VERSION`'s commit and date too; the Windows `VERSION` has CRLF line ends.
 
 ## Delegation
 
@@ -79,6 +125,7 @@ Every brief is a complete specification, because the subagent sees nothing else.
 - That code search goes through the codebase-memory-mcp graph, project `home-jb-Documentos-nxnative`, as in the Code search section.
 - The exact commands to run, with `DM_GAME` or `GAME=<id>` and the build ID when they apply, and which of them cannot run on this machine.
 - The AGENTS.md constraints that apply: root cause over workaround, per-build addresses gated by build ID, English only, no game files or keys in the repository, no key values printed.
+- For a change that reaches the port's pack path, the Windows check from "The Windows pack path", over every tool the pack starts.
 - An acceptance check that can be run, with its expected output.
 - The report format: changed files with `file:line`, every command run with its output, what was not verified and why, open questions. The report cites evidence and does not only assert.
 
