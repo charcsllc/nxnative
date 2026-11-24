@@ -36,6 +36,7 @@ signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
 try: WORKERS = int(os.environ.get('DM_REWRITE_J') or os.cpu_count() or 1)
 except ValueError: sys.exit('[RED] DM_REWRITE_J must be a positive integer')
 if WORKERS < 1: sys.exit('[RED] DM_REWRITE_J must be a positive integer')
+FORK = 'fork' in multiprocessing.get_all_start_methods()   # in_parallel's workers: macOS and Linux; not Windows
 
 src, outdir, NAME = sys.argv[1], sys.argv[2], sys.argv[3]
 AOT_DIR = sys.argv[5] if len(sys.argv) > 5 and sys.argv[4] == '--aot' else None   # --aot <dir>: also the recompiler's input (the header above)
@@ -993,8 +994,10 @@ def in_parallel(fn, jobs):
     only sets a flag, which Python clears in a new child, so a worker just forked could lose the signal, wait for that lock forever and hang the rewrite (jobs too small for every worker to
     start first). So SIGTERM stays blocked across the fork, which keeps it pending in the kernel, until a worker has the default action back and that action can end it.
     In this process it acts only while waiting for the results: the handler's sys.exit raised during the pool's teardown could stop a terminate halfway and leave workers behind, or be discarded
-    in a destructor."""
-    if WORKERS < 2 or len(jobs) < 2:
+    in a destructor.
+    Windows has no fork, and a spawned worker would run this script's top level again (the whole rewrite) to rebuild the state the jobs read, so there the jobs run here one after
+    another; Windows has no pthread_sigmask either, and the NSP script stops a Windows tool with its Job Object, which delivers no signal to handle."""
+    if WORKERS < 2 or len(jobs) < 2 or not FORK:
         return [fn(*job) for job in jobs]
     def worker_signals():
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
