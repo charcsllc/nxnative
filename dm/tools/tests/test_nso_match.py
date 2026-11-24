@@ -25,7 +25,12 @@ sys.path.insert(0, str(TOOLS))
 from nso_asm import ADRP, ADDI, B, NOP
 from nso_match import Image, MatchError, resolve, validate
 
-MOV = 0xaa1703e0  # mov x0, x23
+# nso_match.Image and nso_code.out_store decode with Capstone: without the module those tests skip (the CI installs it, tests.yml); the symbol table test needs none
+import capstone_version  # noqa: E402
+NO_CAPSTONE = capstone_version.unusable()   # none, or one the rewriter refuses (capstone_version.py): the tests that decode skip with the reason
+HAVE_CAPSTONE = not NO_CAPSTONE
+
+MOV =0xaa1703e0  # mov x0, x23
 ADD = 0x914012e0  # add x0, x23, #0x4000
 RET = 0xd65f03c0
 
@@ -81,6 +86,7 @@ def image_with(img, start, words, keep=None):
     return out
 
 
+@unittest.skipUnless(HAVE_CAPSTONE, NO_CAPSTONE)
 class Matching(unittest.TestCase):
     def setUp(self):
         self.original = image({0x100: caller(0x100, 0x500), 0x500: [0xd2800020, RET]})
@@ -321,6 +327,8 @@ class Matching(unittest.TestCase):
         self.assertIn('2 implementations match', messages[0])
 
     def test_registry_scopes_rules_and_preserves_known_builds(self):
+        # patch_nso.py from PATCH_FILES up to KEYS: the registry, the cuts applied, and the --aot behaviour image copied after them. The namespace holds the module-level
+        # names that code reads (the NSO header d, IMG, TEXT_END, NAME, outdir, and AOT_DIR: None, a run without --aot)
         source = TOOLS / 'patch_nso.py'; tree = ast.parse(source.read_text())
         start = next(i for i, n in enumerate(tree.body) if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == 'SHARED')   # the shared files, then PATCH_FILES
         end = next(i for i, n in enumerate(tree.body[start:], start) if isinstance(n, ast.Assign) and ast.unparse(n.targets[0]) == 'KEYS')
@@ -343,7 +351,7 @@ class Matching(unittest.TestCase):
                 with self.subTest(game=gid, module=name, build=bid):
                     img = bytearray(self.original)
                     out = root / 'out' / gid / name / bid; out.mkdir(parents=True)
-                    ns = dict(__file__=str(root / 'tools/patch_nso.py'), os=os, glob=glob, importlib=importlib,
+                    ns = dict(__file__=str(root / 'tools/patch_nso.py'), os=os, glob=glob, importlib=importlib, AOT_DIR=None,
                               MOD=SimpleNamespace(build_id=bytes.fromhex(bid)), IMG=img, TEXT_END=0x2000, NAME=name, outdir=str(out))
                     with patch.dict(os.environ, DM_GAME=gid, DM_GAMES_DIR='/derived/profile', DM_GAMES_FIRST='1'):
                         exec(code, ns)
@@ -366,7 +374,7 @@ class Matching(unittest.TestCase):
             (g / 'patches.py').write_text("CUTS = {'" + known + "': [(0x108, 'e00317aa', '1f2003d5', 'a'), (0x10c, '1f2003d5', '1f2003d5', 'b')]}\n")
             (g / 'game.tsv').write_text(f'build\tv65536\t1.0.1\tmain={known}\tsdk={"cd" * 16}\n')
             img = bytearray(self.original)
-            ns = dict(__file__=str(root / 'tools/patch_nso.py'), os=os, glob=glob, importlib=importlib,
+            ns = dict(__file__=str(root / 'tools/patch_nso.py'), os=os, glob=glob, importlib=importlib, AOT_DIR=None,
                       MOD=SimpleNamespace(build_id=bytes(16)), IMG=img, TEXT_END=0x2000, NAME='main', outdir=str(root / 'out'))
             with patch.dict(os.environ, DM_GAME=gid): exec(code, ns)
             self.assertEqual(bytes(img), bytes(self.original))
@@ -395,7 +403,7 @@ class Matching(unittest.TestCase):
                                                ('main', '00' * 16, gid, MOV)):
                 with self.subTest(module=name, build=bid, game=gamed):
                     img, out = bytearray(self.original), root / 'out' / f'{name}{bid}{gamed}'
-                    ns = dict(__file__=str(root / 'tools/patch_nso.py'), os=os, glob=glob, importlib=importlib,
+                    ns = dict(__file__=str(root / 'tools/patch_nso.py'), os=os, glob=glob, importlib=importlib, AOT_DIR=None,
                               MOD=SimpleNamespace(build_id=bytes.fromhex(bid)), IMG=img, TEXT_END=0x2000, NAME=name, outdir=str(out))
                     with patch.dict(os.environ, DM_GAME=gamed): exec(code, ns)
                     self.assertEqual(struct.unpack_from('<I', img, 0x108)[0], expected)
@@ -404,7 +412,7 @@ class Matching(unittest.TestCase):
                     else: self.assertFalse((out / 'sdk.match.tsv').exists())
             printed = io.StringIO()
             with contextlib.redirect_stdout(printed):
-                ns = dict(__file__=str(root / 'tools/patch_nso.py'), os=os, glob=glob, importlib=importlib,
+                ns = dict(__file__=str(root / 'tools/patch_nso.py'), os=os, glob=glob, importlib=importlib, AOT_DIR=None,
                           MOD=SimpleNamespace(build_id=bytes(16)), IMG=bytearray(image({0x100: [RET]})), TEXT_END=0x2000, NAME='sdk', outdir=str(root / 'miss'))
                 with patch.dict(os.environ, DM_GAME=gid): exec(code, ns)
             self.assertIn("function patch 'heap' skipped", printed.getvalue())
@@ -438,6 +446,7 @@ class RegionGates(unittest.TestCase):
     """The address region gates' sites (patch_nso.py "Address regions"): the SDK's symbols and the one store through the out pointer"""
     PRO, MOV_OUT, RETW = [0xa9bd7bfd, 0x910003fd], 0xaa0103f4, RET   # stp x29, x30, [sp, #-0x30]!; mov x29, sp; mov x20, x1; ret
 
+    @unittest.skipUnless(HAVE_CAPSTONE, NO_CAPSTONE)
     def test_the_one_store_through_the_out_pointer(self):
         from nso_code import out_store
         from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
@@ -462,6 +471,7 @@ class RegionGates(unittest.TestCase):
         self.assertEqual(defined(bytearray(0x100)), {})   # no MOD0
 
 
+@unittest.skipUnless(HAVE_CAPSTONE, NO_CAPSTONE)
 class Patches(unittest.TestCase):
     """A patch of several functions: one constant whose uses lie in different functions applies whole or not at all"""
     def setUp(self):

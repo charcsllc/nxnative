@@ -1,0 +1,1042 @@
+// The Vulkan backend's graphics pipelines without stutter (docs/design/vulkan-backend.md 3.1, 3.2, 3.5, 3.6; phase P5). vk_pso.h says what the pieces share.
+//
+// Keys (3.1). A pipeline is keyed by its shaders, its layout and hvk_gfx_key: the attachment formats and sample count, the fragment entry point, the depth mode, the topology class,
+// and only the state the device cannot set dynamically (the blend group, the raster group, the vertex input, the logic op, the patch size: the HOSTVK_EDS_* bits and dynamic vertex
+// input it enabled). The class leaves the key where the device draws any class from one pipeline (dynamicPrimitiveTopologyUnrestricted), except patches, which tessellation needs.
+//
+// Two phases (3.2), levels A and B. A pipeline is the link of four libraries, each cached by a key of its own: vertex input (the topology class and, without dynamic vertex input, the
+// bindings and attributes), pre-rasterization (the vertex, tessellation and geometry shaders, the layout, the depth mode and the raster state that is not dynamic), fragment shader
+// (the fragment shader with its entry point and the layout; depth and stencil state are all dynamic in Vulkan 1.3) and fragment output (the formats, the samples and the blend state
+// that is not dynamic). Libraries are made with RETAIN_LINK_TIME_OPTIMIZATION_INFO. A key first seen links them without link-time optimization (the fast link) and the draw uses
+// that pipeline at once; the same libraries are linked again with LINK_TIME_OPTIMIZATION on the optimizing worker, and the next draw with the key binds the optimized pipeline
+// (the fast one is released after the submissions that may use it). Both run the same SPIR-V with the same state: t_vk_gpl_identity compares their pixels with the monolithic
+// pipelines' bit for bit; a device where they differ gets HVK_QUIRK_NO_OPT in the quirk table below (never a game profile key). The libraries are used only where the device
+// reports fast linking and independent interpolation decorations: the vertex variants matched to their fragment partners' interpolation (3.2) are not built yet, so a device
+// without the second gets the monolithic pipelines of level C, said once.
+//
+// Levels C and D (3.6). No libraries: a key first seen is compiled whole on the submit thread and the draw waits for it, counted; the prewarm, the prediction, the prebuild and
+// the disk cache make those waits rare. D bakes the blend, raster and vertex input state into the key as the Metal key does. A draw is always made with its own shaders and its
+// own state: nothing is skipped or drawn with a stand-in while a pipeline compiles.
+//
+// The look-ahead (3.3, vk_predict.c). After a draw waited, the rest of its submission is walked once and the keys of the draws ahead that are not ready are queued here
+// (hvk_pso_predict) on HVK_Q_PRED, the first queue the background workers take, in draw order. A queued key is in g_pred, not in the table of pipelines: the worker that takes it
+// enters it there (pso_ent.pred) and makes it as a draw would, so a draw that comes while it is being made waits only for the rest of it; a draw that comes before any worker took
+// it takes it out of the queue and makes it itself, as on a miss, so no draw waits behind the queue (the Metal backend's pso_pend_take). At its first draw a predicted pipeline is
+// counted ready in time, still being made, or not started (hvk_pso_stats.pred_*; be_pso_line and the shutdown line "[hostvk] prediction: ..."), and one no list named gets its
+// P row in the device's list then, as one the draw made does (the miss callback), so the next start prewarms it.
+//
+// Waits. A draw whose pipeline is not ready waits for it at the bind: the time (plat_now_ns) per reason (a fast link, a library compile, a monolithic compile, a build a worker had
+// under way), the count, the longest and those over the 2 ms budget of the P5 acceptance go into be_pso_line; DM_VK_PSO_TRACE=1 logs each one with its key.
+//
+// Threads (3.5): vk_pso.h. The QoS classes come from the platform layer (plat_qos_set_self): background builds at UTILITY, which is a below-normal priority on Linux and Windows;
+// the idle class of 3.5 and starting the optimized relinks only while the frame step reports slack need the platform layer and the presenter (P4), and are declared.
+#include "plat/plat.h"
+#include "vk_pso.h"
+#include "../nvn/nvn_state.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <time.h>
+
+static const VkShaderStageFlagBits k_vkstage[6] = {VK_SHADER_STAGE_VERTEX_BIT, VK_SHADER_STAGE_FRAGMENT_BIT, VK_SHADER_STAGE_GEOMETRY_BIT, VK_SHADER_STAGE_TESSELLATION_CONTROL_BIT,
+                                                   VK_SHADER_STAGE_TESSELLATION_EVALUATION_BIT, VK_SHADER_STAGE_COMPUTE_BIT};
+const char *const hvk_wait_why[HVK_W_N] = {"fast link", "library compile", "monolithic compile", "build under way on a worker"};
+
+// ---------- Blend state and formats ----------
+static VkBlendFactor bf(uint32_t f) {
+    switch (f) {
+        case NVN_BLEND_FUNC_ZERO: return VK_BLEND_FACTOR_ZERO; case NVN_BLEND_FUNC_ONE: return VK_BLEND_FACTOR_ONE;
+        case NVN_BLEND_FUNC_SRC_COLOR: return VK_BLEND_FACTOR_SRC_COLOR; case NVN_BLEND_FUNC_ONE_MINUS_SRC_COLOR: return VK_BLEND_FACTOR_ONE_MINUS_SRC_COLOR;
+        case NVN_BLEND_FUNC_SRC_ALPHA: return VK_BLEND_FACTOR_SRC_ALPHA; case NVN_BLEND_FUNC_ONE_MINUS_SRC_ALPHA: return VK_BLEND_FACTOR_ONE_MINUS_SRC_ALPHA;
+        case NVN_BLEND_FUNC_DST_ALPHA: return VK_BLEND_FACTOR_DST_ALPHA; case NVN_BLEND_FUNC_ONE_MINUS_DST_ALPHA: return VK_BLEND_FACTOR_ONE_MINUS_DST_ALPHA;
+        case NVN_BLEND_FUNC_DST_COLOR: return VK_BLEND_FACTOR_DST_COLOR; case NVN_BLEND_FUNC_ONE_MINUS_DST_COLOR: return VK_BLEND_FACTOR_ONE_MINUS_DST_COLOR;
+        case NVN_BLEND_FUNC_SRC_ALPHA_SATURATE: return VK_BLEND_FACTOR_SRC_ALPHA_SATURATE;
+        case NVN_BLEND_FUNC_SRC1_COLOR: return VK_BLEND_FACTOR_SRC1_COLOR; case NVN_BLEND_FUNC_ONE_MINUS_SRC1_COLOR: return VK_BLEND_FACTOR_ONE_MINUS_SRC1_COLOR;
+        case NVN_BLEND_FUNC_SRC1_ALPHA: return VK_BLEND_FACTOR_SRC1_ALPHA; case NVN_BLEND_FUNC_ONE_MINUS_SRC1_ALPHA: return VK_BLEND_FACTOR_ONE_MINUS_SRC1_ALPHA;
+        case NVN_BLEND_FUNC_CONSTANT_COLOR: return VK_BLEND_FACTOR_CONSTANT_COLOR; case NVN_BLEND_FUNC_ONE_MINUS_CONSTANT_COLOR: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_COLOR;
+        case NVN_BLEND_FUNC_CONSTANT_ALPHA: return VK_BLEND_FACTOR_CONSTANT_ALPHA; case NVN_BLEND_FUNC_ONE_MINUS_CONSTANT_ALPHA: return VK_BLEND_FACTOR_ONE_MINUS_CONSTANT_ALPHA;
+        default: return VK_BLEND_FACTOR_ONE;
+    }
+}
+static VkBlendOp bo(uint32_t e) {
+    switch (e) { case NVN_BLEND_EQUATION_SUB: return VK_BLEND_OP_SUBTRACT; case NVN_BLEND_EQUATION_REVERSE_SUB: return VK_BLEND_OP_REVERSE_SUBTRACT;
+                 case NVN_BLEND_EQUATION_MIN: return VK_BLEND_OP_MIN; case NVN_BLEND_EQUATION_MAX: return VK_BLEND_OP_MAX; default: return VK_BLEND_OP_ADD; }
+}
+// Whether attachments of format f can blend: the device's answer, kept per core format (the draw asks for every attachment of every draw)
+static _Atomic uint8_t g_blendable[256];   // 0 not asked yet, 1 no, 2 yes
+static int fmt_blendable(VkFormat f) {
+    if ((uint32_t)f < 256) { uint8_t v = atomic_load(&g_blendable[f]); if (v) return v == 2; }
+    VkFormatProperties p; vkGetPhysicalDeviceFormatProperties(hvk.dev.phys, f, &p);
+    int yes = (p.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BLEND_BIT) != 0;
+    if ((uint32_t)f < 256) atomic_store(&g_blendable[f], (uint8_t)(yes ? 2 : 1));
+    return yes;
+}
+// Whether f is a floating-point format, whose attachments blend without clamping (the specification's "Blend Operations": fixed-point attachments clamp the source, the
+// destination and the factors to [0, 1]; their stored result is clamped too). The colour formats NVN renders to: the 16- and 32-bit floats and R11G11B10F
+static int fmt_float(VkFormat f) {
+    switch (f) {
+        case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R16G16B16_SFLOAT: case VK_FORMAT_R16G16B16A16_SFLOAT: case VK_FORMAT_R32_SFLOAT:
+        case VK_FORMAT_R32G32_SFLOAT: case VK_FORMAT_R32G32B32_SFLOAT: case VK_FORMAT_R32G32B32A32_SFLOAT: case VK_FORMAT_B10G11R11_UFLOAT_PACK32: case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32:
+            return 1;
+        default: return 0;
+    }
+}
+// Whether f has no alpha channel: blending reads a missing destination alpha as 1, so every destination of such a target is opaque (Ad = 1). The colour formats NVN renders to
+// without alpha: one, two and three channels, R11G11B10F and RGB565
+static int fmt_no_alpha(VkFormat f) {
+    switch (f) {
+        case VK_FORMAT_R8_UNORM: case VK_FORMAT_R8_SNORM: case VK_FORMAT_R8G8_UNORM: case VK_FORMAT_R8G8_SNORM: case VK_FORMAT_R16_UNORM: case VK_FORMAT_R16_SNORM:
+        case VK_FORMAT_R16_SFLOAT: case VK_FORMAT_R16G16_UNORM: case VK_FORMAT_R16G16_SNORM: case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R16G16B16_SFLOAT:
+        case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R32G32_SFLOAT: case VK_FORMAT_R32G32B32_SFLOAT: case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+        case VK_FORMAT_E5B9G9R9_UFLOAT_PACK32: case VK_FORMAT_R5G6B5_UNORM_PACK16: case VK_FORMAT_B5G6R5_UNORM_PACK16:
+            return 1;
+        default: return 0;
+    }
+}
+// ---------- Advanced blend modes (step P8, design 6; docs/reference/rendering.md, "Advanced blend modes on the Vulkan backend") ----------
+// While an advanced mode is set (blend_st.adv, hle_nvn.c) the Switch's GPU blends by NV_blend_equation_advanced and ignores the state's own functions. VK_EXT_blend_operation_advanced
+// is the same definition (the specification's "Advanced Blend Operations"): with uncorrelated overlap, premultiplied colours (Cs, As), (Cd, Ad) and Cs' = Cs / As, Cd' = Cd / Ad,
+//   RGB = f(Cs', Cd') As Ad + Y Cs' As (1 - Ad) + Z Cd' Ad (1 - As),   A = X As Ad + Y As (1 - Ad) + Z Ad (1 - As)
+// for the f / X / Y / Z modes, and closed forms for the "additional RGB" ones (PLUS ... BLUE). A source that is not premultiplied (SetAdvancedPremultipliedSrc(false)) enters as
+// Cs = c As, with c the shader's colour. Where the result is a fixed-function blend Cs Fs (op) Cd Fd for every input, the mode is that blend (k_red: exact). The table was derived
+// by algebra and checked numerically over a grid of colours and alphas (the CPU reference of t_vk_adv_blend, which draws each row against it):
+//   ZERO .. XOR (Porter-Duff), PLUS: sums of Cs and Cd weighted by 1, 0, As, Ad and their complements (the Metal backend's table, nvn_mtl.m adv_blend);
+//   SCREEN: f As Ad = Cs Ad + Cd As - Cs Cd, so RGB = Cs + Cd (1 - Cs): ONE, ONE_MINUS_SRC_COLOR; EXCLUSION: RGB = Cs (1 - Cd) + Cd (1 - Cs);
+//   MINUS: Cd - Cs and Ad - As, REVERSE_SUBTRACT; RED, GREEN, BLUE: the source's channel over the destination's, a write mask of that channel;
+//   PLUS_CLAMPED, PLUS_CLAMPED_ALPHA, MINUS_CLAMPED: PLUS and MINUS clamped to [0, 1], exact on a fixed-point target, whose stored result is clamped (PLUS_CLAMPED_ALPHA's
+//   clamp to As + Ad holds as Cs + Cd <= As + Ad for premultiplied colours); on a float target exact while no sum passes 1 (no difference falls below 0);
+//   alpha of every f / X / Y / Z blend mode: As + Ad (1 - As), ONE, ONE_MINUS_SRC_ALPHA.
+// Exact under a condition (R_COND; R_OPAQUE where the condition is an opaque destination, which a target without alpha always is), used as the closest fixed-function blend
+// where the state's own functions would be arbitrary (the error is bounded and has a known sign):
+//   MULTIPLY: Cs Cd + Cs (1 - Ad) + Cd (1 - As), three terms: DST_COLOR, ONE_MINUS_SRC_ALPHA drops Cs (1 - Ad), exact over an opaque destination (Ad = 1), darker by Cs (1 - Ad) elsewhere;
+//   INVERT_RGB: Cs (Ad - Cd) + Cd (1 - As): ONE_MINUS_DST_COLOR, ONE_MINUS_SRC_ALPHA, exact over an opaque destination, brighter by Cs (1 - Ad) elsewhere;
+//   LIGHTEN: max(Cs + Cd (1 - As), Cd + Cs (1 - Ad)): the MAX operation (factors ignored) gives max(Cs, Cd), exact where both are opaque, darker elsewhere (at most 1/4 over the
+//     grid; a transparent source keeps the destination, as the mode does).
+// Not reduced (the state's own functions stay, with a red line naming the mode): OVERLAY, HARDLIGHT, SOFTLIGHT, COLORDODGE, COLORBURN, VIVIDLIGHT, LINEARLIGHT, PINLIGHT,
+// HARDMIX, LINEARBURN, DIFFERENCE (piecewise or quotients of Cs' and Cd'), DARKEN (MIN would be exact only for opaque pairs and turns a transparent source texel black), the HSL
+// modes (they mix the channels), PLUS_DARKER (min(1, As + Ad) - (As - Cs) - (Ad - Cd): an alpha term no factor carries; it is PLUS only while As + Ad <= 1), CONTRAST
+// (Ad / 2 + 2 (Cd - Ad / 2)(Cs - As / 2)), INVERT (As Ad + Cd (1 - 2 As)) and INVERT_OVG (As (1 - Cd) + (1 - As) Cd: OpenVG's invert), whose source term is As alone; and the
+// disjoint and conjoint overlaps (min / max weights). A source that is not premultiplied needs As in the source term, which only a source factor of ONE can take (SRC_ALPHA): rows
+// whose source factor is another, or that read the source colour in the destination factor or use MIN / MAX, are not reduced for it. Dual-source factors would help only with a
+// second fragment output the translator does not write (the chain's, not the backend's).
+// Kept on the state's own functions on purpose, neither reduced nor drawn through the extension (adv_kept; open): LINEARDODGE. Its equation is f = min(1, Cs' + Cd'), so
+// Cs + Cd (ONE, ONE) while unsaturated, which the extension draws exactly too; the blend microcode NVN uploads for it (premultiplied, uncorrelated) computes the same,
+// min(Cs Ad + Cd As, As Ad) + Cs (1 - Ad) + Cd (1 - As), with no clamp of its inputs in its operands (Ryujinx's reading of the microcode, Ryujinx.Graphics.Gpu Blender/
+// AdvancedBlendFunctions.cs GenUncorrelatedLinearDodgePremul, UcodeAssembler.cs). Mario vs. Donkey Kong's fire bird writes a negative colour (its shader's own
+// rgb = lit - s, a = 1 - s, negative at the flame's edges, as its Maxwell code has it) into a B10G11R11 float target: ONE, ONE adds it in full and the store clamps the sum at 0 (black
+// edges, red bands), where the state's SRC_ALPHA, ONE scales it by As and draws the soft flame the game was seen with on the Mac (Metal keeps the state's functions). Whether
+// the Switch clamps such a source before the microcode on an unsigned float target is not known, so the mode keeps the picture it had before the equation was used
+// (docs/reference/rendering.md, "Advanced blend modes on the Vulkan backend")
+static int adv_kept(unsigned mode) { return mode == NVN_BLEND_ADVANCED_MODE_LINEARDODGE; }
+// R_OPAQUE: exact under the condition of an opaque destination, so exact for every input on a target without alpha (fmt_no_alpha), such as the R11G11B10F scenes Mario vs.
+// Donkey Kong draws MULTIPLY into (level 3-DK), where the red line used to call the reduction approximate
+enum { R_EXACT = 1, R_UNORM, R_COND, R_OPAQUE };   // exact; exact on a fixed-point target (float: while unclamped); exact under the row's condition; exact over an opaque destination
+typedef struct { uint8_t s, d, eq, sa, da, eqa, mask, cls; } adv_row;
+#define ROW(s, d, eq, sa, da, eqa, mask, cls) {NVN_BLEND_FUNC_##s, NVN_BLEND_FUNC_##d, NVN_BLEND_EQUATION_##eq, NVN_BLEND_FUNC_##sa, NVN_BLEND_FUNC_##da, NVN_BLEND_EQUATION_##eqa, mask, cls}
+static const adv_row k_red[NVN_BLEND_ADVANCED_MODE_HSL_LUMINOSITY + 1] = {
+    [NVN_BLEND_ADVANCED_MODE_ZERO] = ROW(ZERO, ZERO, ADD, ZERO, ZERO, ADD, 0xf, R_EXACT),
+    [NVN_BLEND_ADVANCED_MODE_SRC] = ROW(ONE, ZERO, ADD, ONE, ZERO, ADD, 0xf, R_EXACT),
+    [NVN_BLEND_ADVANCED_MODE_DST] = ROW(ZERO, ONE, ADD, ZERO, ONE, ADD, 0xf, R_EXACT),
+    [NVN_BLEND_ADVANCED_MODE_SRC_OVER] = ROW(ONE, ONE_MINUS_SRC_ALPHA, ADD, ONE, ONE_MINUS_SRC_ALPHA, ADD, 0xf, R_EXACT),
+    [NVN_BLEND_ADVANCED_MODE_DST_OVER] = ROW(ONE_MINUS_DST_ALPHA, ONE, ADD, ONE_MINUS_DST_ALPHA, ONE, ADD, 0xf, R_EXACT),
+    [NVN_BLEND_ADVANCED_MODE_SRC_IN] = ROW(DST_ALPHA, ZERO, ADD, DST_ALPHA, ZERO, ADD, 0xf, R_EXACT),
+    [NVN_BLEND_ADVANCED_MODE_DST_IN] = ROW(ZERO, SRC_ALPHA, ADD, ZERO, SRC_ALPHA, ADD, 0xf, R_EXACT),
+    [NVN_BLEND_ADVANCED_MODE_SRC_OUT] = ROW(ONE_MINUS_DST_ALPHA, ZERO, ADD, ONE_MINUS_DST_ALPHA, ZERO, ADD, 0xf, R_EXACT),
+    [NVN_BLEND_ADVANCED_MODE_DST_OUT] = ROW(ZERO, ONE_MINUS_SRC_ALPHA, ADD, ZERO, ONE_MINUS_SRC_ALPHA, ADD, 0xf, R_EXACT),
+    [NVN_BLEND_ADVANCED_MODE_SRC_ATOP] = ROW(DST_ALPHA, ONE_MINUS_SRC_ALPHA, ADD, ZERO, ONE, ADD, 0xf, R_EXACT),
+    [NVN_BLEND_ADVANCED_MODE_DST_ATOP] = ROW(ONE_MINUS_DST_ALPHA, SRC_ALPHA, ADD, ONE, ZERO, ADD, 0xf, R_EXACT),
+    [NVN_BLEND_ADVANCED_MODE_XOR] = ROW(ONE_MINUS_DST_ALPHA, ONE_MINUS_SRC_ALPHA, ADD, ONE_MINUS_DST_ALPHA, ONE_MINUS_SRC_ALPHA, ADD, 0xf, R_EXACT),
+    [NVN_BLEND_ADVANCED_MODE_PLUS] = ROW(ONE, ONE, ADD, ONE, ONE, ADD, 0xf, R_EXACT),
+    [NVN_BLEND_ADVANCED_MODE_PLUS_CLAMPED] = ROW(ONE, ONE, ADD, ONE, ONE, ADD, 0xf, R_UNORM),
+    [NVN_BLEND_ADVANCED_MODE_PLUS_CLAMPED_ALPHA] = ROW(ONE, ONE, ADD, ONE, ONE, ADD, 0xf, R_UNORM),
+    [NVN_BLEND_ADVANCED_MODE_SCREEN] = ROW(ONE, ONE_MINUS_SRC_COLOR, ADD, ONE, ONE_MINUS_SRC_ALPHA, ADD, 0xf, R_EXACT),
+    [NVN_BLEND_ADVANCED_MODE_EXCLUSION] = ROW(ONE_MINUS_DST_COLOR, ONE_MINUS_SRC_COLOR, ADD, ONE, ONE_MINUS_SRC_ALPHA, ADD, 0xf, R_EXACT),
+    [NVN_BLEND_ADVANCED_MODE_MINUS] = ROW(ONE, ONE, REVERSE_SUB, ONE, ONE, REVERSE_SUB, 0xf, R_EXACT),
+    [NVN_BLEND_ADVANCED_MODE_MINUS_CLAMPED] = ROW(ONE, ONE, REVERSE_SUB, ONE, ONE, REVERSE_SUB, 0xf, R_UNORM),
+    [NVN_BLEND_ADVANCED_MODE_RED] = ROW(ONE, ZERO, ADD, ZERO, ONE, ADD, 0x1, R_EXACT),
+    [NVN_BLEND_ADVANCED_MODE_GREEN] = ROW(ONE, ZERO, ADD, ZERO, ONE, ADD, 0x2, R_EXACT),
+    [NVN_BLEND_ADVANCED_MODE_BLUE] = ROW(ONE, ZERO, ADD, ZERO, ONE, ADD, 0x4, R_EXACT),
+    [NVN_BLEND_ADVANCED_MODE_MULTIPLY] = ROW(DST_COLOR, ONE_MINUS_SRC_ALPHA, ADD, ONE, ONE_MINUS_SRC_ALPHA, ADD, 0xf, R_OPAQUE),
+    [NVN_BLEND_ADVANCED_MODE_INVERT_RGB] = ROW(ONE_MINUS_DST_COLOR, ONE_MINUS_SRC_ALPHA, ADD, ZERO, ONE, ADD, 0xf, R_OPAQUE),
+    [NVN_BLEND_ADVANCED_MODE_LIGHTEN] = ROW(ONE, ONE, MAX, ONE, ONE_MINUS_SRC_ALPHA, ADD, 0xf, R_COND),
+};
+#undef ROW
+static const char *adv_cond(unsigned mode) {   // what a conditional reduction gets wrong, for its red line
+    switch (mode) {
+        case NVN_BLEND_ADVANCED_MODE_MULTIPLY: return "exact over an opaque destination; where Ad < 1 the result is darker by Cs (1 - Ad)";
+        case NVN_BLEND_ADVANCED_MODE_INVERT_RGB: return "exact over an opaque destination; where Ad < 1 the result is brighter by Cs (1 - Ad)";
+        case NVN_BLEND_ADVANCED_MODE_LIGHTEN: return "MAX, exact where source and destination are opaque; darker where either is translucent";
+        default: return "exact on a UNORM target; on this float target sums over 1 (differences below 0) are not clamped as the mode clamps them";
+    }
+}
+// The reduction of b for a target of format f: the row, or NULL (not reducible: overlap, mode, or a source that is not premultiplied where the row cannot take As). *exact: exact
+// for every input on this target
+static const adv_row *adv_row_of(const blend_st *b, VkFormat f, int *exact) {
+    const adv_row *r = b->adv < sizeof k_red / sizeof *k_red && k_red[b->adv].cls ? &k_red[b->adv] : NULL;
+    if (!r || b->adv_ovl) return NULL;
+    if (b->adv_npm && ((r->s != NVN_BLEND_FUNC_ONE && r->s != NVN_BLEND_FUNC_ZERO) || r->d == NVN_BLEND_FUNC_SRC_COLOR || r->d == NVN_BLEND_FUNC_ONE_MINUS_SRC_COLOR ||
+                       r->eq == NVN_BLEND_EQUATION_MAX || r->eq == NVN_BLEND_EQUATION_MIN)) return NULL;
+    *exact = r->cls == R_EXACT || (r->cls == R_UNORM && !fmt_float(f)) || (r->cls == R_OPAQUE && fmt_no_alpha(f));
+    return r;
+}
+// For the tests (t_vk_adv_blend): whether mode's reduction is exact for every input on a target of format f, with a premultiplied source and uncorrelated overlap (-1: not reduced)
+int hvk_adv_exact_on(unsigned mode, VkFormat f);
+int hvk_adv_exact_on(unsigned mode, VkFormat f) {
+    blend_st b; memset(&b, 0, sizeof b); b.adv = mode & 63u;
+    int exact = 0;
+    return adv_row_of(&b, f, &exact) ? exact : -1;
+}
+// Why VK_EXT_blend_operation_advanced did not draw a mode, for the red lines
+static const char *adv_ext_why(void) {
+    if (!(hvk.dev.opt_present >> HOSTVK_OPT_BLEND_ADVANCED & 1)) return "the device has not VK_EXT_blend_operation_advanced";
+    if (!hvk.dev.x.blend_adv) return "the device's VK_EXT_blend_operation_advanced lacks advancedBlendCoherentOperations (the barriers between overlapping draws it needs are not placed)";
+    if ((hvk.dev.eds_present >> HOSTVK_EDS_BLEND_EQUATION & 1) && !hvk.dev.x.blend_adv_dyn)
+        return "VK_EXT_blend_operation_advanced is enabled, but this device sets the blend equation dynamically and has not extendedDynamicState3ColorBlendAdvanced with "
+               "advancedBlendMaxColorAttachments of 8 (vkCmdSetColorBlendAdvancedEXT is not used)";
+    return "VK_EXT_blend_operation_advanced is enabled, but the device's limits exclude this case (advancedBlendAllOperations, NonPremultipliedSrcColor, CorrelatedOverlap, "
+           "IndependentBlend or MaxColorAttachments)";
+}
+// quiet: no red line (the draw's dynamic state on a device whose pipelines bake the blend: hvk_key_fill, which decides there, says it)
+static blend_st adv_blend(blend_st b, VkFormat f, uint32_t *mask, int quiet) {
+    if (!b.adv) return b;
+    int exact = 0; const adv_row *r = adv_row_of(&b, f, &exact);
+    static _Atomic uint64_t seen_none, seen_apx; uint64_t bit = 1ull << (b.adv & 63);
+    if (!r) {
+        if (quiet || (atomic_fetch_or(&seen_none, bit) & bit)) return b;
+        if (adv_kept(b.adv))
+            hostvk_log("[RED] [hostvk] advanced blend mode %#x (overlap %d, %spremultiplied source) is drawn with the state's blend functions on purpose: its equation adds a negative "
+                       "source colour in full, and whether the Switch clamps such a source is not known (open)", (unsigned)b.adv, (int)b.adv_ovl, b.adv_npm ? "not " : "");
+        else
+            hostvk_log("[RED] [hostvk] advanced blend mode %#x (overlap %d, %spremultiplied source) has no fixed-function equivalent and %s: the state's blend functions are used",
+                       (unsigned)b.adv, (int)b.adv_ovl, b.adv_npm ? "not " : "", adv_ext_why());
+        return b;
+    }
+    if (!exact && !quiet && !(atomic_fetch_or(&seen_apx, bit) & bit))
+        hostvk_log("[RED] [hostvk] advanced blend mode %#x (overlap %d, %spremultiplied source) drawn with its closest fixed-function blend, %s (%s)", (unsigned)b.adv, (int)b.adv_ovl,
+                   b.adv_npm ? "not " : "", adv_cond(b.adv), adv_ext_why());
+    b.src_rgb = b.adv_npm && r->s == NVN_BLEND_FUNC_ONE ? NVN_BLEND_FUNC_SRC_ALPHA : r->s; b.dst_rgb = r->d; b.src_a = r->sa; b.dst_a = r->da;
+    b.eq_rgb = r->eq; b.eq_a = r->eqa; *mask = r->mask;
+    return b;
+}
+static void blend_of(const blend_st *b0, int on, VkFormat f, uint32_t wmask4, uint32_t *en, VkColorBlendEquationEXT *eq, VkColorComponentFlags *wm, int quiet) {
+    *en = on && f && fmt_blendable(f);
+    uint32_t mask = 0xf;
+    blend_st bb = *en ? adv_blend(*b0, f, &mask, quiet) : *b0; const blend_st *b = &bb;
+    *eq = (VkColorBlendEquationEXT){bf(b->src_rgb), bf(b->dst_rgb), bo(b->eq_rgb), bf(b->src_a), bf(b->dst_a), bo(b->eq_a)};
+    if (bo(b->eq_rgb) == VK_BLEND_OP_MIN || bo(b->eq_rgb) == VK_BLEND_OP_MAX) { eq->srcColorBlendFactor = eq->dstColorBlendFactor = VK_BLEND_FACTOR_ONE; }
+    if (bo(b->eq_a) == VK_BLEND_OP_MIN || bo(b->eq_a) == VK_BLEND_OP_MAX) { eq->srcAlphaBlendFactor = eq->dstAlphaBlendFactor = VK_BLEND_FACTOR_ONE; }
+    *wm = (VkColorComponentFlags)(wmask4 & mask & 0xf);
+}
+// VK_EXT_blend_operation_advanced (exact, as NVN sets the mode, the premultiplied source and the overlap) for a mode whose reduction is not exact on this target. Only with
+// advancedBlendCoherentOperations (vk_device.c): a device without it would need a VK_ACCESS_COLOR_ATTACHMENT_READ_NONCOHERENT_BIT_EXT dependency between overlapping advanced
+// blends, a pass split per draw under dynamic rendering, which is not done: it keeps the reductions. Two ways, by whether the blend equation is dynamic:
+// - baked (HVK_BAKE_BLEND with the equation not dynamic; levels B and D, or a device without extendedDynamicState3ColorBlendEquation): the pipeline's attachment takes the
+//   advanced op (colour and alpha the same, VUID-VkPipelineColorBlendAttachmentState-colorBlendOp-01406) and VkPipelineColorBlendAdvancedStateCreateInfoEXT, which is one per
+//   pipeline (srcPremultiplied, blendOverlap): a second attachment with other parameters is reduced (adv_ext);
+// - dynamic (level A with extendedDynamicState3ColorBlendAdvanced, x.blend_adv_dyn): every pipeline with colour attachments declares VK_DYNAMIC_STATE_COLOR_BLEND_ADVANCED_EXT
+//   beside the equation (hvk_dyn_states), and the draw sets an advanced attachment with vkCmdSetColorBlendAdvancedEXT after vkCmdSetColorBlendEquationEXT (hvk_blend_dyn,
+//   vk_commands.c dyn_apply): per attachment, so attachments may differ in their parameters.
+// The limits both keep: advancedBlendAllOperations (-advancedBlendAllOperations-01409: without it only MULTIPLY to EXCLUSION and the HSL modes), advancedBlendIndependentBlend
+// (-advancedBlendIndependentBlend-01407: without it one op for all attachments, so such a device uses the extension for single-target passes only), advancedBlendMaxColorAttachments
+// (-colorBlendOp-01410, VUID-vkCmdDraw-advancedBlendMaxColorAttachments-07480), NonPremultipliedSrcColor and CorrelatedOverlap
+// (VUID-VkPipelineColorBlendAdvancedStateCreateInfoEXT-srcPremultiplied-01424 / -blendOverlap-01426, VUID-VkColorBlendAdvancedEXT-srcPremultiplied-07505 / -blendOverlap-07507).
+// dstPremultiplied is VK_TRUE: NVN's destination is premultiplied (NV_blend_equation_advanced has no switch for it)
+static const VkBlendOp k_adv_vk[NVN_BLEND_ADVANCED_MODE_HSL_LUMINOSITY + 1] = {
+    [NVN_BLEND_ADVANCED_MODE_ZERO] = VK_BLEND_OP_ZERO_EXT, [NVN_BLEND_ADVANCED_MODE_SRC] = VK_BLEND_OP_SRC_EXT, [NVN_BLEND_ADVANCED_MODE_DST] = VK_BLEND_OP_DST_EXT,
+    [NVN_BLEND_ADVANCED_MODE_SRC_OVER] = VK_BLEND_OP_SRC_OVER_EXT, [NVN_BLEND_ADVANCED_MODE_DST_OVER] = VK_BLEND_OP_DST_OVER_EXT,
+    [NVN_BLEND_ADVANCED_MODE_SRC_IN] = VK_BLEND_OP_SRC_IN_EXT, [NVN_BLEND_ADVANCED_MODE_DST_IN] = VK_BLEND_OP_DST_IN_EXT,
+    [NVN_BLEND_ADVANCED_MODE_SRC_OUT] = VK_BLEND_OP_SRC_OUT_EXT, [NVN_BLEND_ADVANCED_MODE_DST_OUT] = VK_BLEND_OP_DST_OUT_EXT,
+    [NVN_BLEND_ADVANCED_MODE_SRC_ATOP] = VK_BLEND_OP_SRC_ATOP_EXT, [NVN_BLEND_ADVANCED_MODE_DST_ATOP] = VK_BLEND_OP_DST_ATOP_EXT, [NVN_BLEND_ADVANCED_MODE_XOR] = VK_BLEND_OP_XOR_EXT,
+    [NVN_BLEND_ADVANCED_MODE_PLUS] = VK_BLEND_OP_PLUS_EXT, [NVN_BLEND_ADVANCED_MODE_PLUS_CLAMPED] = VK_BLEND_OP_PLUS_CLAMPED_EXT,
+    [NVN_BLEND_ADVANCED_MODE_PLUS_CLAMPED_ALPHA] = VK_BLEND_OP_PLUS_CLAMPED_ALPHA_EXT, [NVN_BLEND_ADVANCED_MODE_PLUS_DARKER] = VK_BLEND_OP_PLUS_DARKER_EXT,
+    [NVN_BLEND_ADVANCED_MODE_MULTIPLY] = VK_BLEND_OP_MULTIPLY_EXT, [NVN_BLEND_ADVANCED_MODE_SCREEN] = VK_BLEND_OP_SCREEN_EXT, [NVN_BLEND_ADVANCED_MODE_OVERLAY] = VK_BLEND_OP_OVERLAY_EXT,
+    [NVN_BLEND_ADVANCED_MODE_DARKEN] = VK_BLEND_OP_DARKEN_EXT, [NVN_BLEND_ADVANCED_MODE_LIGHTEN] = VK_BLEND_OP_LIGHTEN_EXT, [NVN_BLEND_ADVANCED_MODE_COLORDODGE] = VK_BLEND_OP_COLORDODGE_EXT,
+    [NVN_BLEND_ADVANCED_MODE_COLORBURN] = VK_BLEND_OP_COLORBURN_EXT, [NVN_BLEND_ADVANCED_MODE_HARDLIGHT] = VK_BLEND_OP_HARDLIGHT_EXT, [NVN_BLEND_ADVANCED_MODE_SOFTLIGHT] = VK_BLEND_OP_SOFTLIGHT_EXT,
+    [NVN_BLEND_ADVANCED_MODE_DIFFERENCE] = VK_BLEND_OP_DIFFERENCE_EXT, [NVN_BLEND_ADVANCED_MODE_MINUS] = VK_BLEND_OP_MINUS_EXT, [NVN_BLEND_ADVANCED_MODE_MINUS_CLAMPED] = VK_BLEND_OP_MINUS_CLAMPED_EXT,
+    [NVN_BLEND_ADVANCED_MODE_EXCLUSION] = VK_BLEND_OP_EXCLUSION_EXT, [NVN_BLEND_ADVANCED_MODE_CONTRAST] = VK_BLEND_OP_CONTRAST_EXT, [NVN_BLEND_ADVANCED_MODE_INVERT] = VK_BLEND_OP_INVERT_EXT,
+    [NVN_BLEND_ADVANCED_MODE_INVERT_RGB] = VK_BLEND_OP_INVERT_RGB_EXT, [NVN_BLEND_ADVANCED_MODE_INVERT_OVG] = VK_BLEND_OP_INVERT_OVG_EXT,
+    [NVN_BLEND_ADVANCED_MODE_LINEARDODGE] = VK_BLEND_OP_LINEARDODGE_EXT, [NVN_BLEND_ADVANCED_MODE_LINEARBURN] = VK_BLEND_OP_LINEARBURN_EXT,
+    [NVN_BLEND_ADVANCED_MODE_VIVIDLIGHT] = VK_BLEND_OP_VIVIDLIGHT_EXT, [NVN_BLEND_ADVANCED_MODE_LINEARLIGHT] = VK_BLEND_OP_LINEARLIGHT_EXT, [NVN_BLEND_ADVANCED_MODE_PINLIGHT] = VK_BLEND_OP_PINLIGHT_EXT,
+    [NVN_BLEND_ADVANCED_MODE_HARDMIX] = VK_BLEND_OP_HARDMIX_EXT, [NVN_BLEND_ADVANCED_MODE_RED] = VK_BLEND_OP_RED_EXT, [NVN_BLEND_ADVANCED_MODE_GREEN] = VK_BLEND_OP_GREEN_EXT,
+    [NVN_BLEND_ADVANCED_MODE_BLUE] = VK_BLEND_OP_BLUE_EXT, [NVN_BLEND_ADVANCED_MODE_HSL_HUE] = VK_BLEND_OP_HSL_HUE_EXT, [NVN_BLEND_ADVANCED_MODE_HSL_SATURATION] = VK_BLEND_OP_HSL_SATURATION_EXT,
+    [NVN_BLEND_ADVANCED_MODE_HSL_COLOR] = VK_BLEND_OP_HSL_COLOR_EXT, [NVN_BLEND_ADVANCED_MODE_HSL_LUMINOSITY] = VK_BLEND_OP_HSL_LUMINOSITY_EXT,
+};
+static int adv_basic(unsigned mode) {   // the operations a device without advancedBlendAllOperations has (VUID-VkPipelineColorBlendAttachmentState-advancedBlendAllOperations-01409)
+    return (mode >= NVN_BLEND_ADVANCED_MODE_MULTIPLY && mode <= NVN_BLEND_ADVANCED_MODE_DIFFERENCE) || mode == NVN_BLEND_ADVANCED_MODE_EXCLUSION ||
+           (mode >= NVN_BLEND_ADVANCED_MODE_HSL_HUE && mode <= NVN_BLEND_ADVANCED_MODE_HSL_LUMINOSITY);
+}
+// The advanced op the extension draws attachment state b of a pass of nc colour attachments with (format f), or 0 (reduced): the limits above
+static VkBlendOp adv_op(const blend_st *b, VkFormat f, int nc) {
+    const hostvk_dev *d = &hvk.dev;
+    if (!d->x.blend_adv || !b->adv || b->adv >= sizeof k_adv_vk / sizeof *k_adv_vk || !k_adv_vk[b->adv] || adv_kept(b->adv)) return 0;
+    int exact = 0;
+    if (adv_row_of(b, f, &exact) && exact) return 0;   // the fixed-function blend is the mode: no extension needed
+    if ((uint32_t)nc > d->x.blend_adv_max_att || (nc > 1 && !d->x.blend_adv_indep) || (!d->x.blend_adv_all && !adv_basic(b->adv)) ||
+        (b->adv_npm && !d->x.blend_adv_npm_src) || (b->adv_ovl && !d->x.blend_adv_correlated)) return 0;
+    return k_adv_vk[b->adv];
+}
+// The baked way: the op for attachment b of key k, whose advanced state it fixes (the first advanced attachment's) or must match
+static VkBlendOp adv_ext(const blend_st *b, VkFormat f, int nc, hvk_gfx_key *k) {
+    if (hvk.dev.eds_present >> HOSTVK_EDS_BLEND_EQUATION & 1) return 0;   // the equation is dynamic: hvk_blend_dyn's way, or none
+    VkBlendOp op = adv_op(b, f, nc);
+    if (!op || (k->adv_on && (k->adv_src_pm != !b->adv_npm || k->adv_overlap != b->adv_ovl))) return 0;
+    k->adv_on = 1; k->adv_src_pm = (uint8_t)!b->adv_npm; k->adv_overlap = (uint8_t)b->adv_ovl;   // NVN's overlap values are VkBlendOverlapEXT's (0 uncorrelated, 1 disjoint, 2 conjoint)
+    return op;
+}
+// The dynamic blend state of a draw's nc colour attachments (vk_pso.h). clampResults is VK_FALSE: NV_blend_equation_advanced clamps as the basic equations do (issue 11: inputs to
+// [0, 1] on a UNORM target, whose stored result is clamped too) and not on a float target, where only the modes' own clamps (PLUS_CLAMPED and the like, issue 18) apply
+void hvk_blend_dyn(const blend_st b[8], uint32_t blend_en, const VkFormat f[8], uint32_t chmask, int nc, uint32_t en[8], VkColorBlendEquationEXT eq[8], VkColorComponentFlags wm[8],
+                   VkColorBlendAdvancedEXT adv[8]) {
+    int dyn = hvk.dev.x.blend_adv_dyn && (hvk.dev.eds_present >> HOSTVK_EDS_BLEND_EQUATION & 1);
+    int quiet = (hvk.dev.eds_present & HOSTVK_EDS_BLEND) != HOSTVK_EDS_BLEND;   // the pipelines bake the blend: hvk_key_fill says what is approximate
+    for (int i = 0; i < nc && i < 8; i++) {
+        int on = (int)(blend_en >> i & 1);
+        VkBlendOp op = dyn && on && f[i] && fmt_blendable(f[i]) ? adv_op(&b[i], f[i], nc) : (VkBlendOp)0;
+        blend_of(&b[i], on, f[i], chmask >> (4 * i), &en[i], &eq[i], &wm[i], quiet || op);   // the equation set first: valid, and replaced by the advanced state after it
+        adv[i] = op ? (VkColorBlendAdvancedEXT){op, b[i].adv_npm ? VK_FALSE : VK_TRUE, VK_TRUE, (VkBlendOverlapEXT)b[i].adv_ovl, VK_FALSE} : (VkColorBlendAdvancedEXT){0};
+    }
+}
+
+// ---------- Vertex input ----------
+void hvk_vertex_input(const hvk_shader *vs, const va_st attr[16], const vs_st stream[16], uint32_t bound, hvk_vin *v) {
+    memset(v, 0, sizeof *v);
+    if (!vs) return;
+    uint32_t zero_binding = 16;
+    for (uint32_t loc = 0; loc < 32; loc++) {
+        if (!vs->vin_types[loc]) continue;
+        uint32_t ct = vs->vin_types[loc] - 1;
+        const va_st *at = loc < 16 ? &attr[loc] : NULL;
+        nvn_vk_fmt row; VkFormat f = 0;
+        if (at && at->fmt) { nvn_fmt_to_vk((int)at->fmt, &row); f = row.vk ? row.vk : row.alt; }
+        if (!f || !(bound >> at->stream & 1)) {   // no format or no buffer: the attribute reads zero, as on an unbound Maxwell attribute
+            f = ct == NVN_CT_UINT ? VK_FORMAT_R32G32B32A32_UINT : ct == NVN_CT_INT ? VK_FORMAT_R32G32B32A32_SINT : VK_FORMAT_R32G32B32A32_SFLOAT;
+            v->a[v->na++] = (VkVertexInputAttributeDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT, NULL, loc, zero_binding, f, 0};
+            v->zero = 1; continue;
+        }
+        uint8_t fc = row.cls; int fint = fc == NVN_VK_UINT ? NVN_CT_UINT : fc == NVN_VK_SINT ? NVN_CT_INT : NVN_CT_FLOAT;
+        if (fint != (int)ct) HVK_RED_ONCE("vertex input %u read as %s from a %s format (NVN %s): the class mismatch needs the shader's shadow inputs (<key>_bv, phase P4); bound as it is",
+                                          loc, ct == NVN_CT_FLOAT ? "float" : ct == NVN_CT_UINT ? "uint" : "int", fint == NVN_CT_FLOAT ? "float" : "integer", nvn_fmt_name((int)at->fmt));
+        v->a[v->na++] = (VkVertexInputAttributeDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_ATTRIBUTE_DESCRIPTION_2_EXT, NULL, loc, at->stream, f, at->offset};
+        v->used_streams |= 1u << at->stream;
+    }
+    for (uint32_t s = 0; s < 16; s++) if (v->used_streams >> s & 1) {
+        const vs_st *st = &stream[s];
+        VkVertexInputBindingDescription2EXT b = {VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT, NULL, s, st->stride, st->divisor ? VK_VERTEX_INPUT_RATE_INSTANCE : VK_VERTEX_INPUT_RATE_VERTEX, 1};
+        if (st->divisor > 1) { if (hvk.dev.x.vertex_divisor) b.divisor = st->divisor; else HVK_RED_ONCE("vertex stream divisor %u without VK_EXT_vertex_attribute_divisor: read per instance", st->divisor); }
+        v->b[v->nb++] = b;
+    }
+    if (v->zero) v->b[v->nb++] = (VkVertexInputBindingDescription2EXT){VK_STRUCTURE_TYPE_VERTEX_INPUT_BINDING_DESCRIPTION_2_EXT, NULL, zero_binding, 0, VK_VERTEX_INPUT_RATE_VERTEX, 1};
+}
+
+// ---------- Keys (3.1) ----------
+uint8_t hvk_line_mode(VkSampleCountFlagBits samples, int a2c) {
+    if (!hvk.dev.x.line_raster) return 0;
+    if (samples > VK_SAMPLE_COUNT_1_BIT || a2c) return (uint8_t)(hvk.dev.x.line_rect ? VK_LINE_RASTERIZATION_MODE_RECTANGULAR_EXT : VK_LINE_RASTERIZATION_MODE_DEFAULT_EXT);
+    return (uint8_t)VK_LINE_RASTERIZATION_MODE_BRESENHAM_EXT;
+}
+void hvk_key_fill(hvk_gfx_key *k, hvk_shader *const sh[6], int klass, const hvk_key_src *s) {
+    memset(k, 0, sizeof *k);
+    int nc = s->nc > 8 ? 8 : s->nc;
+    k->ccount = (uint8_t)nc; memcpy(k->color, s->cfmt, sizeof k->color); k->depth = s->dfmt; k->stencil = s->sfmt; k->samples = s->samples;
+    // the class: dynamic within it, and left out where one pipeline draws every class; patches stay (a pipeline with tessellation draws patches only)
+    int tess = sh[3] || sh[4];
+    k->topology_class = (uint8_t)(tess ? VK_PRIMITIVE_TOPOLOGY_PATCH_LIST : klass == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST || !hvk.dev.x.topology_unrestricted ? klass : HVK_TOPOLOGY_ANY);
+    k->depth_clip_ndc = !atomic_load(&hvk.depth_zero) && hvk.dev.x.depth_clip_control;   // NVN's default depth mode: near = -w (GL), in fixed function (design 2.2)
+    int all_uint = nc > 0, any_uint = 0;
+    for (int i = 0; i < nc; i++) { if (!s->cfmt[i]) continue; int u = s->ccls[i] == NVN_VK_UINT || s->ccls[i] == NVN_VK_SINT; all_uint &= u; any_uint |= u; }
+    if (sh[1] && any_uint) k->entry[0] = all_uint && sh[1]->entry_u[0] ? 1 : sh[1]->entry_m[0] ? 2 : sh[1]->entry_u[0] ? 1 : 0;
+    uint32_t e = hvk.dev.eds_present;
+    if ((e & HOSTVK_EDS_BLEND) != HOSTVK_EDS_BLEND) {
+        k->baked |= HVK_BAKE_BLEND;
+        for (int i = 0; i < nc; i++) { uint32_t en; VkColorBlendEquationEXT q; VkColorComponentFlags wm;
+            VkBlendOp op = (s->blend_en >> i & 1) && s->cfmt[i] && fmt_blendable(s->cfmt[i]) ? adv_ext(&s->blend[i], s->cfmt[i], nc, k) : (VkBlendOp)0;
+            if (op) {   // the advanced operation itself (its factors are not used); the channel mask as the game set it
+                k->blend[i] = (VkPipelineColorBlendAttachmentState){VK_TRUE, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, op, VK_BLEND_FACTOR_ONE, VK_BLEND_FACTOR_ZERO, op,
+                                                                    (VkColorComponentFlags)(s->chmask >> (4 * i) & 0xf)};
+                continue;
+            }
+            blend_of(&s->blend[i], (int)(s->blend_en >> i & 1), s->cfmt[i], s->chmask >> (4 * i), &en, &q, &wm, 0);
+            if (!en) memset(&q, 0, sizeof q);   // a target that does not blend: its factors are not part of the pipeline (NVN's reset leaves ONE / ZERO there, a row zero)
+            k->blend[i] = (VkPipelineColorBlendAttachmentState){en, q.srcColorBlendFactor, q.dstColorBlendFactor, q.colorBlendOp, q.srcAlphaBlendFactor, q.dstAlphaBlendFactor, q.alphaBlendOp, wm}; }
+        k->logic_en = s->logic_op != NVN_LOGIC_OP_COPY;
+    } else for (int i = 0; i < nc; i++) k->blend[i].colorWriteMask = 0xf;
+    if (!(e >> HOSTVK_EDS_LOGIC_OP & 1)) { k->baked |= HVK_BAKE_LOGIC_OP; k->logic_op = (uint8_t)s->logic_op; }
+    if ((e & HOSTVK_EDS_RASTER) != HOSTVK_EDS_RASTER) {
+        k->baked |= HVK_BAKE_RASTER;
+        k->poly_mode = s->poly_mode == NVN_POLYGON_MODE_POINT ? VK_POLYGON_MODE_POINT : s->poly_mode == NVN_POLYGON_MODE_LINE ? VK_POLYGON_MODE_LINE : VK_POLYGON_MODE_FILL;
+        k->depth_clamp = s->depth_clamp != 0; k->a2c = s->a2c != 0;
+    }
+    if ((k->topology_class == VK_PRIMITIVE_TOPOLOGY_POINT_LIST || k->topology_class == HVK_TOPOLOGY_ANY) && klass == VK_PRIMITIVE_TOPOLOGY_POINT_LIST && !hvk.dev.x.maintenance5)
+        HVK_RED_ONCE("points on a device without VK_KHR_maintenance5: a vertex stage that writes no PointSize draws them at an undefined size (the Vulkan chain writes none; nvnCommandBufferSetPointSize is not recorded)");
+    if (hvk.dev.x.line_raster && !hvk.dev.x.line_mode_dynamic) { k->baked |= HVK_BAKE_LINE; k->line_mode = hvk_line_mode(s->samples, s->a2c); }
+    // The patch size (step P8): nvnCommandBufferSetPatchSize is not recorded (hle_nvn.c lists it among the no-ops; nvn_pipe.h's TODO list), so a draw of patches takes the control
+    // shader's own output vertex count, which equals the input patch size in the shaders seen (a hull shader that passes its control points through). Said once with a red line
+    if (k->topology_class == VK_PRIMITIVE_TOPOLOGY_PATCH_LIST) {
+        k->patch_points = sh[3] && sh[3]->tcs_vertices ? sh[3]->tcs_vertices : 3;
+        HVK_RED_ONCE("patches drawn with the control shader's output vertex count as the patch size (first case %u%s): nvnCommandBufferSetPatchSize is not recorded by the frontend",
+                     (unsigned)k->patch_points, sh[3] && sh[3]->tcs_vertices ? "" : ", no control shader: 3");
+    }
+    if (!hvk.dev.caps.vertex_input_dynamic && s->vin) {
+        const hvk_vin *v = s->vin;
+        k->baked |= HVK_BAKE_VERTEX;
+        for (uint32_t i = 0; i < v->nb; i++) { k->vb[i] = (VkVertexInputBindingDescription){v->b[i].binding, v->b[i].stride, v->b[i].inputRate};
+            if (v->b[i].divisor > 1) k->vd[k->nvd++] = (VkVertexInputBindingDivisorDescriptionKHR){v->b[i].binding, v->b[i].divisor}; }
+        for (uint32_t i = 0; i < v->na; i++) k->va[i] = (VkVertexInputAttributeDescription){v->a[i].location, v->a[i].binding, v->a[i].format, v->a[i].offset};
+        k->nvb = (uint8_t)v->nb; k->nva = (uint8_t)v->na;
+    }
+}
+
+// ---------- Dynamic states: a whole pipeline's, and each library's share of them ----------
+// The colour blend states only with colour attachments (with none, vkCmdSetColorBlend*EXT cannot be called for any, and a pipeline that declares them dynamic fails every
+// draw's validation); the vertex binding strides only with vertex bindings (vkCmdBindVertexBuffers2 sets strides only for bindings it binds, so a draw with none could never
+// set them: VUID-vkCmdDraw-pStrides-04913 on every device without dynamic vertex input, found when levels C and D were first forced, phase P5)
+uint32_t hvk_dyn_states(VkDynamicState *d, int vertex_dynamic, int colors, int bindings) {
+    uint32_t n = 0;
+    const VkDynamicState core[] = {VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT, VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT, VK_DYNAMIC_STATE_LINE_WIDTH, VK_DYNAMIC_STATE_DEPTH_BIAS,
+        VK_DYNAMIC_STATE_BLEND_CONSTANTS, VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK, VK_DYNAMIC_STATE_STENCIL_WRITE_MASK, VK_DYNAMIC_STATE_STENCIL_REFERENCE,
+        VK_DYNAMIC_STATE_CULL_MODE, VK_DYNAMIC_STATE_FRONT_FACE, VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY, VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE, VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE,
+        VK_DYNAMIC_STATE_DEPTH_COMPARE_OP, VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE, VK_DYNAMIC_STATE_STENCIL_OP,
+        VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE, VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE, VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE, VK_DYNAMIC_STATE_DEPTH_BOUNDS};
+    for (size_t i = 0; i < sizeof core / sizeof *core; i++) d[n++] = core[i];
+    uint32_t e = hvk.dev.eds_present;
+    if (vertex_dynamic) d[n++] = VK_DYNAMIC_STATE_VERTEX_INPUT_EXT; else if (bindings) d[n++] = VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE;
+    if (e >> HOSTVK_EDS_LOGIC_OP & 1) d[n++] = VK_DYNAMIC_STATE_LOGIC_OP_EXT;
+    if (e >> HOSTVK_EDS_PATCH_POINTS & 1) d[n++] = VK_DYNAMIC_STATE_PATCH_CONTROL_POINTS_EXT;
+    if (e >> HOSTVK_EDS_LOGIC_OP_ENABLE & 1) d[n++] = VK_DYNAMIC_STATE_LOGIC_OP_ENABLE_EXT;
+    if (colors && (e >> HOSTVK_EDS_BLEND_ENABLE & 1)) d[n++] = VK_DYNAMIC_STATE_COLOR_BLEND_ENABLE_EXT;
+    if (colors && (e >> HOSTVK_EDS_BLEND_EQUATION & 1)) d[n++] = VK_DYNAMIC_STATE_COLOR_BLEND_EQUATION_EXT;
+    if (colors && (e >> HOSTVK_EDS_BLEND_EQUATION & 1) && hvk.dev.x.blend_adv_dyn) d[n++] = VK_DYNAMIC_STATE_COLOR_BLEND_ADVANCED_EXT;   // NVN's advanced modes (hvk_blend_dyn)
+    if (colors && (e >> HOSTVK_EDS_WRITE_MASK & 1)) d[n++] = VK_DYNAMIC_STATE_COLOR_WRITE_MASK_EXT;
+    if (e >> HOSTVK_EDS_DEPTH_CLAMP & 1) d[n++] = VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT;
+    if (e >> HOSTVK_EDS_POLYGON_MODE & 1) d[n++] = VK_DYNAMIC_STATE_POLYGON_MODE_EXT;
+    if (e >> HOSTVK_EDS_SAMPLES & 1) d[n++] = VK_DYNAMIC_STATE_RASTERIZATION_SAMPLES_EXT;
+    if (e >> HOSTVK_EDS_SAMPLE_MASK & 1) d[n++] = VK_DYNAMIC_STATE_SAMPLE_MASK_EXT;
+    if (e >> HOSTVK_EDS_ALPHA_TO_COVERAGE & 1) d[n++] = VK_DYNAMIC_STATE_ALPHA_TO_COVERAGE_ENABLE_EXT;
+    if (hvk.dev.x.line_mode_dynamic) d[n++] = VK_DYNAMIC_STATE_LINE_RASTERIZATION_MODE_EXT;   // step P8
+    if (hvk.dev.x.vp_swizzle_nv) d[n++] = VK_DYNAMIC_STATE_VIEWPORT_SWIZZLE_NV;
+    return n;
+}
+enum { L_VI, L_PR, L_FS, L_FO, L_N };   // the four libraries of design 3.2
+static const VkGraphicsPipelineLibraryFlagsEXT k_part[L_N] = {VK_GRAPHICS_PIPELINE_LIBRARY_VERTEX_INPUT_INTERFACE_BIT_EXT, VK_GRAPHICS_PIPELINE_LIBRARY_PRE_RASTERIZATION_SHADERS_BIT_EXT,
+                                                             VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_SHADER_BIT_EXT, VK_GRAPHICS_PIPELINE_LIBRARY_FRAGMENT_OUTPUT_INTERFACE_BIT_EXT};
+static const char *const k_part_name[L_N] = {"vertex input", "pre-rasterization", "fragment shader", "fragment output"};
+static int dyn_part(VkDynamicState s) {   // which library a dynamic state belongs to (the specification's table of dynamic state per pipeline subset)
+    switch (s) {
+        case VK_DYNAMIC_STATE_VERTEX_INPUT_EXT: case VK_DYNAMIC_STATE_VERTEX_INPUT_BINDING_STRIDE: case VK_DYNAMIC_STATE_PRIMITIVE_TOPOLOGY: case VK_DYNAMIC_STATE_PRIMITIVE_RESTART_ENABLE:
+            return L_VI;
+        case VK_DYNAMIC_STATE_VIEWPORT_WITH_COUNT: case VK_DYNAMIC_STATE_SCISSOR_WITH_COUNT: case VK_DYNAMIC_STATE_LINE_WIDTH: case VK_DYNAMIC_STATE_DEPTH_BIAS:
+        case VK_DYNAMIC_STATE_CULL_MODE: case VK_DYNAMIC_STATE_FRONT_FACE: case VK_DYNAMIC_STATE_RASTERIZER_DISCARD_ENABLE: case VK_DYNAMIC_STATE_DEPTH_BIAS_ENABLE:
+        case VK_DYNAMIC_STATE_PATCH_CONTROL_POINTS_EXT: case VK_DYNAMIC_STATE_DEPTH_CLAMP_ENABLE_EXT: case VK_DYNAMIC_STATE_POLYGON_MODE_EXT:
+        case VK_DYNAMIC_STATE_LINE_RASTERIZATION_MODE_EXT: case VK_DYNAMIC_STATE_VIEWPORT_SWIZZLE_NV:
+            return L_PR;
+        case VK_DYNAMIC_STATE_STENCIL_COMPARE_MASK: case VK_DYNAMIC_STATE_STENCIL_WRITE_MASK: case VK_DYNAMIC_STATE_STENCIL_REFERENCE: case VK_DYNAMIC_STATE_DEPTH_TEST_ENABLE:
+        case VK_DYNAMIC_STATE_DEPTH_WRITE_ENABLE: case VK_DYNAMIC_STATE_DEPTH_COMPARE_OP: case VK_DYNAMIC_STATE_DEPTH_BOUNDS_TEST_ENABLE: case VK_DYNAMIC_STATE_STENCIL_TEST_ENABLE:
+        case VK_DYNAMIC_STATE_STENCIL_OP: case VK_DYNAMIC_STATE_DEPTH_BOUNDS:
+            return L_FS;
+        default: return L_FO;   // blend constants, logic op and its enable, the colour blend states, samples, sample mask, alpha to coverage
+    }
+}
+static uint32_t dyn_states_part(VkDynamicState *d, int part, int vertex_dynamic, int colors, int bindings) {
+    VkDynamicState all[48]; uint32_t n = hvk_dyn_states(all, vertex_dynamic, colors, bindings), m = 0;
+    for (uint32_t i = 0; i < n; i++) if (dyn_part(all[i]) == part) d[m++] = all[i];
+    return m;
+}
+
+// ---------- The level (3.6), the quirk table (3.2, risk 7) ----------
+static char g_level; static int g_gpl, g_opt_on = 1, g_trace;
+static uint32_t g_quirks; static const char *g_quirk_why;
+static hostvk_caps g_full_caps; static uint32_t g_full_eds, g_full_topo, g_full_line_dyn, g_full_swz; static int g_full_saved;
+// A row per vendor and driver where the pipelines of the two phases or of the levels are found to give different pixels (t_vk_gpl_identity on that device). Matched on the vendor
+// ID and the VkDriverId (0: any) and the driver version range [lo, hi] as the device reports it (0, 0: any). None is known: on Mesa's lavapipe 25.2.8 (VK_DRIVER_ID_MESA_LLVMPIPE)
+// the fast-linked, optimized and monolithic pipelines of levels A to D gave the same bits for every draw of t_vk_gpl_identity. A new row says how it was found
+static const struct { uint32_t vendor, driver_id, ver_lo, ver_hi, flags; const char *why; } k_quirks[] = {
+    {0, 0, 0, 0, 0, NULL},
+};
+uint32_t hvk_quirks(const char **why) { if (why) *why = g_quirk_why; return g_quirks; }
+static void quirks_find(void) {
+    g_quirks = 0; g_quirk_why = NULL;
+    for (size_t i = 0; i < sizeof k_quirks / sizeof *k_quirks; i++) {
+        if (!k_quirks[i].flags) continue;
+        if (k_quirks[i].vendor && k_quirks[i].vendor != hvk.dev.props.vendorID) continue;
+        if (k_quirks[i].driver_id && k_quirks[i].driver_id != hvk.dev.driver_id) continue;
+        if ((k_quirks[i].ver_lo || k_quirks[i].ver_hi) && (hvk.dev.props.driverVersion < k_quirks[i].ver_lo || hvk.dev.props.driverVersion > k_quirks[i].ver_hi)) continue;
+        g_quirks |= k_quirks[i].flags; g_quirk_why = k_quirks[i].why;
+    }
+    if (g_quirks & HVK_QUIRK_NO_OPT) hostvk_log("[hostvk] pipeline quirk of this driver: optimized relinks are not used (%s)", g_quirk_why ? g_quirk_why : "-");
+}
+static void level_rules(void) {
+    g_level = hvk.dev.caps.level; g_gpl = hvk.dev.caps.gpl;
+    if (g_gpl && (!hvk.dev.caps.gpl_fast_link || !hvk.dev.caps.gpl_indep_interp)) {
+        hostvk_log("[RED] [hostvk] pipeline libraries present but not used: %s%s%s (interpolation-matched vertex variants, design 3.2, are not built): monolithic pipelines with level C's waits",
+                   hvk.dev.caps.gpl_fast_link ? "" : "no graphicsPipelineLibraryFastLinking", !hvk.dev.caps.gpl_fast_link && !hvk.dev.caps.gpl_indep_interp ? ", " : "",
+                   hvk.dev.caps.gpl_indep_interp ? "" : "no graphicsPipelineLibraryIndependentInterpolationDecoration");
+        g_gpl = 0; g_level = 'C';
+    }
+}
+char hvk_pso_level(void) { return g_level; }
+int hvk_pso_gpl(void) { return g_gpl; }
+void hvk_pso_test_optimize(int on) { g_opt_on = on != 0; }
+
+// ---------- Libraries and pipelines ----------
+typedef struct { uint8_t cls, baked; uint8_t nvb, nva, nvd, pad[3]; VkVertexInputBindingDescription vb[16]; VkVertexInputAttributeDescription va[32]; VkVertexInputBindingDivisorDescriptionKHR vd[16]; } vi_key;
+typedef struct { const void *sh[4]; const void *layout; uint32_t patch_points; uint8_t depth_clip_ndc, poly_mode, depth_clamp, baked, line_mode, pad[3]; } pr_key;
+typedef struct { const void *fs; const void *layout; uint8_t entry, pad[7]; } fs_key;
+typedef struct { VkFormat color[8], depth, stencil; uint32_t samples, baked; uint8_t ccount, logic_en, logic_op, a2c, adv_on, adv_src_pm, adv_overlap, pad;
+                 VkPipelineColorBlendAttachmentState blend[8]; } fo_key;
+typedef struct { _Atomic int state; VkPipeline p; } lib_ent;   // state: 0 being made, 1 made, 2 failed
+typedef struct { const void *sh[5]; const void *layout; hvk_gfx_key k; } gpl_key;   // a whole pipeline: vertex, tess control, tess evaluation, geometry, fragment
+enum { K_FAST, K_OPT, K_MONO };
+typedef struct pso_ent {
+    _Atomic int state;           // 0 being made, 1 ready, 2 failed
+    VkPipeline cur;              // what draws bind (written by the maker before state 1, then by the submit thread when it swaps)
+    _Atomic(VkPipeline) opt;     // the optimized relink, waiting to be swapped in
+    uint8_t kind, used;          // K_*; the submit thread has drawn with it (the prediction's first use)
+    uint8_t pred;                // made by a worker for the look-ahead (hvk_pso_predict)
+    int row;                     // the list row that named it (-1: none)
+    lib_ent *lib[L_N];
+    hvk_shader *sh[6]; hvk_layout *l; hvk_gfx_key k;
+} pso_ent;
+static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_cv = PTHREAD_COND_INITIALIZER;   // the tables below; g_cv: something being made is made
+static nvn_hmap g_lib[L_N], g_ents;
+static _Atomic uint64_t s_lib[L_N], s_lib_ns[L_N], s_fast, s_fast_ns, s_opt, s_opt_ns, s_mono, s_mono_ns, s_swapped, s_opt_dropped, s_draw_made, s_failed;
+static _Atomic uint64_t s_wait_n[HVK_W_N], s_wait_ns[HVK_W_N], s_wait_max, s_wait_max_win, s_over, s_draws_kind[3], s_pending;
+static _Atomic uint64_t s_pred_queued, s_pred_built, s_pred_found, s_pred_failed, s_pred_ready, s_pred_inflight, s_pred_made;
+static int g_waited;                 // the last draw waited for its pipeline (submit thread; hvk_pso_take_waited)
+// Test hooks: the look-ahead's builds held at their start; the digests of the keys queued and waited for
+static int g_pred_hold; static int g_tk_on, g_tk_n[2]; static uint64_t g_tk[2][1024];
+static void stat_max(_Atomic uint64_t *m, uint64_t v) { uint64_t o = atomic_load(m); while (v > o && !atomic_compare_exchange_weak(m, &o, v)) {} }
+static void key_of(gpl_key *key, hvk_shader *const sh[6], hvk_layout *l, const hvk_gfx_key *k) {
+    memset(key, 0, sizeof *key);
+    static const int order[5] = {0, 3, 4, 2, 1};
+    for (int i = 0; i < 5; i++) key->sh[i] = sh[order[i]];
+    key->layout = l; key->k = *k;
+}
+static const char *entry_of(const hvk_shader *s, int which) { return which == 1 && s->entry_u[0] ? s->entry_u : which == 2 && s->entry_m[0] ? s->entry_m : s->entry; }
+// A creation through the calling thread's disk cache, with its feedback; t: time
+static VkResult create(const VkGraphicsPipelineCreateInfo *ci0, VkPipeline *p, uint64_t *t) {
+    VkGraphicsPipelineCreateInfo ci = *ci0;
+    VkPipelineCreationFeedback fb = {0};
+    VkPipelineCreationFeedbackCreateInfo fci = {VK_STRUCTURE_TYPE_PIPELINE_CREATION_FEEDBACK_CREATE_INFO, (void *)ci.pNext, &fb, 0, NULL};
+    ci.pNext = &fci;
+    uint64_t t0 = plat_now_ns();
+    VkPipelineCache pc = hvk_cache_begin();
+    VkResult r = vkCreateGraphicsPipelines(hvk.d, pc, 1, &ci, NULL, p);
+    hvk_cache_end(&fb, r == VK_SUCCESS);
+    *t = plat_now_ns() - t0;
+    if (r) *p = VK_NULL_HANDLE;
+    return r;
+}
+// The tessellation state (step P8): the patch size, and the domain origin of NVN, whose tessellator is GL's (the lower-left origin of the domain coordinates: the winding of
+// the triangles it makes and gl_TessCoord as a GL program sees them), where Vulkan's default is the upper left (core since 1.1)
+static void tess_state(const hvk_gfx_key *k, VkPipelineTessellationStateCreateInfo *ts, VkPipelineTessellationDomainOriginStateCreateInfo *tdo) {
+    *tdo = (VkPipelineTessellationDomainOriginStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_DOMAIN_ORIGIN_STATE_CREATE_INFO, NULL, VK_TESSELLATION_DOMAIN_ORIGIN_LOWER_LEFT};
+    *ts = (VkPipelineTessellationStateCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_TESSELLATION_STATE_CREATE_INFO, tdo, 0, k->patch_points ? k->patch_points : 1};
+}
+// The advanced blend state of a pipeline whose key has an advanced operation (adv_ext): chained to its colour blend state (the specification's
+// VkPipelineColorBlendAdvancedStateCreateInfoEXT); a fragment output library holds it with the rest of the blend state
+static void adv_state(const hvk_gfx_key *k, VkPipelineColorBlendAdvancedStateCreateInfoEXT *a) {
+    *a = (VkPipelineColorBlendAdvancedStateCreateInfoEXT){VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_ADVANCED_STATE_CREATE_INFO_EXT, NULL, k->adv_src_pm ? VK_TRUE : VK_FALSE, VK_TRUE,
+                                                          (VkBlendOverlapEXT)k->adv_overlap};
+}
+static VkPipeline lib_make(int part, const pso_ent *e) {
+    const hvk_gfx_key *k = &e->k; hvk_shader *const *sh = e->sh;
+    int vdyn = hvk.dev.caps.vertex_input_dynamic;
+    VkGraphicsPipelineLibraryCreateInfoEXT gl = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_LIBRARY_CREATE_INFO_EXT, NULL, k_part[part]};
+    VkPipelineRenderingCreateInfo ri = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, &gl, 0, 0, NULL, VK_FORMAT_UNDEFINED, VK_FORMAT_UNDEFINED};
+    VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &ri, VK_PIPELINE_CREATE_LIBRARY_BIT_KHR | VK_PIPELINE_CREATE_RETAIN_LINK_TIME_OPTIMIZATION_INFO_BIT_EXT};
+    VkDynamicState dsv[48]; VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, dyn_states_part(dsv, part, vdyn, k->ccount > 0, k->nvb > 0), dsv};
+    ci.pDynamicState = &dy;
+    VkPipelineVertexInputDivisorStateCreateInfoKHR vds = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_KHR, NULL, k->nvd, k->vd};
+    VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, !vdyn && k->nvd ? &vds : NULL, 0, vdyn ? 0 : k->nvb, k->vb, vdyn ? 0 : k->nva, k->va};
+    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0,
+        k->topology_class == HVK_TOPOLOGY_ANY ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : (VkPrimitiveTopology)k->topology_class, VK_FALSE};
+    VkPipelineShaderStageCreateInfo stg[4]; uint32_t ns = 0;
+    VkPipelineTessellationDomainOriginStateCreateInfo tdo; VkPipelineTessellationStateCreateInfo ts; tess_state(k, &ts, &tdo);
+    VkPipelineViewportDepthClipControlCreateInfoEXT dcc = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT, NULL, k->depth_clip_ndc};
+    VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, hvk.dev.x.depth_clip_control ? &dcc : NULL, 0, 0, NULL, 0, NULL};
+    VkPipelineRasterizationLineStateCreateInfoEXT ls = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO_EXT, NULL, (VkLineRasterizationModeEXT)k->line_mode, VK_FALSE, 0, 0};
+    VkPipelineRasterizationProvokingVertexStateCreateInfoEXT pv;   // NVN's last vertex, a constant of every pipeline (vk_pso.h hvk_raster_next): not in the key
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, hvk_raster_next(&pv, (k->baked & HVK_BAKE_LINE) ? &ls : NULL), 0, k->depth_clamp, VK_FALSE,
+                                                 (VkPolygonMode)k->poly_mode, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, VK_FALSE, 0, 0, 0, 1};
+    VkPipelineDepthStencilStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, k->samples ? k->samples : VK_SAMPLE_COUNT_1_BIT, VK_FALSE, 0, NULL, k->a2c, VK_FALSE};
+    VkPipelineColorBlendAttachmentState ba[8]; for (int i = 0; i < 8; i++) ba[i] = k->blend[i];
+    VkPipelineColorBlendAdvancedStateCreateInfoEXT adv; adv_state(k, &adv);
+    VkPipelineColorBlendStateCreateInfo cbs = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, k->adv_on ? &adv : NULL, 0, k->logic_en, (VkLogicOp)k->logic_op, k->ccount, ba, {0, 0, 0, 0}};
+    switch (part) {
+        case L_VI: ci.pVertexInputState = &vi; ci.pInputAssemblyState = &ia; break;
+        case L_PR: {
+            static const int order[4] = {0, 3, 4, 2};
+            for (int i = 0; i < 4; i++) { const hvk_shader *s = sh[order[i]]; if (!s) continue;
+                stg[ns++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, k_vkstage[order[i]], s->module, s->entry, NULL}; }
+            ci.stageCount = ns; ci.pStages = stg; ci.pViewportState = &vp; ci.pRasterizationState = &rs; ci.layout = hvk_layout_vk(e->l);
+            if (sh[3] || sh[4]) ci.pTessellationState = &ts;
+            break;
+        }
+        case L_FS:
+            if (sh[1]) { stg[ns++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, VK_SHADER_STAGE_FRAGMENT_BIT, sh[1]->module, entry_of(sh[1], k->entry[0]), NULL}; }
+            ci.stageCount = ns; ci.pStages = ns ? stg : NULL; ci.pDepthStencilState = &ds; ci.layout = hvk_layout_vk(e->l);
+            break;
+        case L_FO:
+            ri.colorAttachmentCount = k->ccount; ri.pColorAttachmentFormats = k->color; ri.depthAttachmentFormat = k->depth; ri.stencilAttachmentFormat = k->stencil;
+            ci.pColorBlendState = &cbs; ci.pMultisampleState = &ms;
+            break;
+    }
+    VkPipeline p; uint64_t t;
+    VkResult r = create(&ci, &p, &t);
+    if (r) { hostvk_log("[RED] [hostvk] %s library (vertex %s fragment %s) failed: VkResult %d", k_part_name[part], sh[0] ? sh[0]->key : "-", sh[1] ? sh[1]->key : "-", r); return VK_NULL_HANDLE; }
+    atomic_fetch_add(&s_lib[part], 1); atomic_fetch_add(&s_lib_ns[part], t);
+    return p;
+}
+// The library of part for e: made here when no thread has it (*made), waited for when one is making it (*waited)
+static lib_ent *lib_get(int part, const pso_ent *e, int *made, int *waited) {
+    union { vi_key vi; pr_key pr; fs_key fs; fo_key fo; } u; memset(&u, 0, sizeof u);
+    const hvk_gfx_key *k = &e->k; size_t klen = 0;
+    switch (part) {
+        case L_VI: u.vi.cls = k->topology_class; u.vi.baked = (uint8_t)(k->baked & HVK_BAKE_VERTEX);
+            if (k->baked & HVK_BAKE_VERTEX) { u.vi.nvb = k->nvb; u.vi.nva = k->nva; u.vi.nvd = k->nvd; memcpy(u.vi.vb, k->vb, sizeof k->vb); memcpy(u.vi.va, k->va, sizeof k->va); memcpy(u.vi.vd, k->vd, sizeof k->vd); }
+            klen = sizeof u.vi; break;
+        case L_PR: u.pr.sh[0] = e->sh[0]; u.pr.sh[1] = e->sh[3]; u.pr.sh[2] = e->sh[4]; u.pr.sh[3] = e->sh[2]; u.pr.layout = e->l; u.pr.patch_points = k->patch_points;
+            u.pr.depth_clip_ndc = k->depth_clip_ndc; u.pr.poly_mode = k->poly_mode; u.pr.depth_clamp = k->depth_clamp; u.pr.baked = (uint8_t)(k->baked & (HVK_BAKE_RASTER | HVK_BAKE_PATCH | HVK_BAKE_LINE));
+            u.pr.line_mode = k->line_mode;
+            klen = sizeof u.pr; break;
+        case L_FS: u.fs.fs = e->sh[1]; u.fs.layout = e->l; u.fs.entry = k->entry[0]; klen = sizeof u.fs; break;
+        case L_FO: memcpy(u.fo.color, k->color, sizeof k->color); u.fo.depth = k->depth; u.fo.stencil = k->stencil; u.fo.samples = k->samples; u.fo.ccount = k->ccount;
+            u.fo.baked = k->baked & (HVK_BAKE_BLEND | HVK_BAKE_LOGIC_OP | HVK_BAKE_RASTER); u.fo.logic_en = k->logic_en; u.fo.logic_op = k->logic_op; u.fo.a2c = k->a2c;
+            u.fo.adv_on = k->adv_on; u.fo.adv_src_pm = k->adv_src_pm; u.fo.adv_overlap = k->adv_overlap;
+            memcpy(u.fo.blend, k->blend, sizeof k->blend); klen = sizeof u.fo; break;
+    }
+    pthread_mutex_lock(&g_mu);
+    if (!g_lib[part].klen) nvn_hm_init(&g_lib[part], (uint32_t)klen);
+    lib_ent *l = nvn_hm_get(&g_lib[part], &u);
+    if (!l) {
+        if (!(l = calloc(1, sizeof *l))) { pthread_mutex_unlock(&g_mu); return NULL; }
+        nvn_hm_put(&g_lib[part], &u, l);
+        pthread_mutex_unlock(&g_mu);
+        VkPipeline p = lib_make(part, e);
+        pthread_mutex_lock(&g_mu);
+        l->p = p; atomic_store(&l->state, p ? 1 : 2); pthread_cond_broadcast(&g_cv);
+        pthread_mutex_unlock(&g_mu);
+        *made = 1;
+        return l;
+    }
+    while (atomic_load(&l->state) == 0) { *waited = 1; pthread_cond_wait(&g_cv, &g_mu); }
+    pthread_mutex_unlock(&g_mu);
+    return l;
+}
+static VkPipeline link(const pso_ent *e, int optimize, uint64_t *t) {
+    VkPipeline libs[L_N]; for (int i = 0; i < L_N; i++) libs[i] = e->lib[i]->p;
+    VkPipelineLibraryCreateInfoKHR li = {VK_STRUCTURE_TYPE_PIPELINE_LIBRARY_CREATE_INFO_KHR, NULL, L_N, libs};
+    VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &li, optimize ? VK_PIPELINE_CREATE_LINK_TIME_OPTIMIZATION_BIT_EXT : 0};
+    ci.layout = hvk_layout_vk(e->l); ci.basePipelineIndex = -1;
+    VkPipeline p; VkResult r = create(&ci, &p, t);
+    if (r) { hostvk_log("[RED] [hostvk] %s link (vertex %s fragment %s) failed: VkResult %d", optimize ? "optimized" : "fast", e->sh[0] ? e->sh[0]->key : "-", e->sh[1] ? e->sh[1]->key : "-", r); return VK_NULL_HANDLE; }
+    return p;
+}
+static VkPipeline mono_make(const pso_ent *e, uint64_t *t) {   // levels C and D: the pipeline whole (what phase P3 made for every draw)
+    const hvk_gfx_key *k = &e->k; hvk_shader *const *sh = e->sh;
+    static const int order[5] = {0, 3, 4, 2, 1};
+    VkPipelineShaderStageCreateInfo stg[5]; uint32_t ns = 0;
+    for (int i = 0; i < 5; i++) { const hvk_shader *s = sh[order[i]]; if (!s) continue;
+        stg[ns++] = (VkPipelineShaderStageCreateInfo){VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO, NULL, 0, k_vkstage[order[i]], s->module, order[i] == 1 ? entry_of(s, k->entry[0]) : s->entry, NULL}; }
+    int vdyn = hvk.dev.caps.vertex_input_dynamic;
+    VkPipelineVertexInputDivisorStateCreateInfoKHR vds = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_DIVISOR_STATE_CREATE_INFO_KHR, NULL, k->nvd, k->vd};
+    VkPipelineVertexInputStateCreateInfo vi = {VK_STRUCTURE_TYPE_PIPELINE_VERTEX_INPUT_STATE_CREATE_INFO, !vdyn && k->nvd ? &vds : NULL, 0, vdyn ? 0 : k->nvb, k->vb, vdyn ? 0 : k->nva, k->va};
+    VkPipelineInputAssemblyStateCreateInfo ia = {VK_STRUCTURE_TYPE_PIPELINE_INPUT_ASSEMBLY_STATE_CREATE_INFO, NULL, 0,
+        k->topology_class == HVK_TOPOLOGY_ANY ? VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST : (VkPrimitiveTopology)k->topology_class, VK_FALSE};
+    VkPipelineTessellationDomainOriginStateCreateInfo tdo; VkPipelineTessellationStateCreateInfo ts; tess_state(k, &ts, &tdo);
+    VkPipelineViewportDepthClipControlCreateInfoEXT dcc = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_DEPTH_CLIP_CONTROL_CREATE_INFO_EXT, NULL, k->depth_clip_ndc};
+    VkPipelineViewportStateCreateInfo vp = {VK_STRUCTURE_TYPE_PIPELINE_VIEWPORT_STATE_CREATE_INFO, hvk.dev.x.depth_clip_control ? &dcc : NULL, 0, 0, NULL, 0, NULL};
+    VkPipelineRasterizationLineStateCreateInfoEXT ls = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_LINE_STATE_CREATE_INFO_EXT, NULL, (VkLineRasterizationModeEXT)k->line_mode, VK_FALSE, 0, 0};
+    VkPipelineRasterizationProvokingVertexStateCreateInfoEXT pv;   // NVN's last vertex, a constant of every pipeline (vk_pso.h hvk_raster_next): not in the key
+    VkPipelineRasterizationStateCreateInfo rs = {VK_STRUCTURE_TYPE_PIPELINE_RASTERIZATION_STATE_CREATE_INFO, hvk_raster_next(&pv, (k->baked & HVK_BAKE_LINE) ? &ls : NULL), 0, k->depth_clamp, VK_FALSE,
+                                                 (VkPolygonMode)k->poly_mode, VK_CULL_MODE_NONE, VK_FRONT_FACE_COUNTER_CLOCKWISE, VK_FALSE, 0, 0, 0, 1};
+    VkPipelineMultisampleStateCreateInfo ms = {VK_STRUCTURE_TYPE_PIPELINE_MULTISAMPLE_STATE_CREATE_INFO, NULL, 0, k->samples ? k->samples : VK_SAMPLE_COUNT_1_BIT, VK_FALSE, 0, NULL, k->a2c, VK_FALSE};
+    VkPipelineDepthStencilStateCreateInfo ds = {VK_STRUCTURE_TYPE_PIPELINE_DEPTH_STENCIL_STATE_CREATE_INFO};
+    VkPipelineColorBlendAttachmentState ba[8]; for (int i = 0; i < 8; i++) ba[i] = k->blend[i];
+    VkPipelineColorBlendAdvancedStateCreateInfoEXT adv; adv_state(k, &adv);
+    VkPipelineColorBlendStateCreateInfo cbs = {VK_STRUCTURE_TYPE_PIPELINE_COLOR_BLEND_STATE_CREATE_INFO, k->adv_on ? &adv : NULL, 0, k->logic_en, (VkLogicOp)k->logic_op, k->ccount, ba, {0, 0, 0, 0}};
+    VkDynamicState dsv[48]; uint32_t nd = hvk_dyn_states(dsv, vdyn, k->ccount > 0, k->nvb > 0);
+    VkPipelineDynamicStateCreateInfo dy = {VK_STRUCTURE_TYPE_PIPELINE_DYNAMIC_STATE_CREATE_INFO, NULL, 0, nd, dsv};
+    VkPipelineRenderingCreateInfo ri = {VK_STRUCTURE_TYPE_PIPELINE_RENDERING_CREATE_INFO, NULL, 0, k->ccount, k->color, k->depth, k->stencil};
+    VkGraphicsPipelineCreateInfo ci = {VK_STRUCTURE_TYPE_GRAPHICS_PIPELINE_CREATE_INFO, &ri, 0, ns, stg, &vi, &ia, (sh[3] || sh[4]) ? &ts : NULL, &vp, &rs, &ms, &ds, &cbs, &dy,
+                                       hvk_layout_vk(e->l), VK_NULL_HANDLE, 0, VK_NULL_HANDLE, -1};
+    VkPipeline p; VkResult r = create(&ci, &p, t);
+    if (r) { hostvk_log("[RED] [hostvk] graphics pipeline (vertex %s fragment %s) failed: VkResult %d", sh[0] ? sh[0]->key : "-", sh[1] ? sh[1]->key : "-", r); return VK_NULL_HANDLE; }
+    return p;
+}
+
+// ---------- Background optimization (3.2): the optimizing worker relinks with link-time optimization ----------
+static void opt_job(void *arg) {
+    pso_ent *e = arg;
+    if (!g_opt_on || (g_quirks & HVK_QUIRK_NO_OPT) || atomic_load(&e->state) != 1 || e->kind != K_FAST) { atomic_fetch_add(&s_opt_dropped, 1); return; }
+    uint64_t t; VkPipeline p = link(e, 1, &t);
+    if (!p) { atomic_fetch_add(&s_opt_dropped, 1); return; }
+    atomic_fetch_add(&s_opt, 1); atomic_fetch_add(&s_opt_ns, t);
+    atomic_store(&e->opt, p);
+}
+// Make e on the calling thread: its libraries (made or waited for) and a fast link, or the monolithic pipeline. *why: what the wait was (for a draw)
+static void ent_make(pso_ent *e, int *why) {
+    VkPipeline p = VK_NULL_HANDLE; uint64_t t = 0; int made = 0, waited = 0;
+    atomic_fetch_add(&s_pending, 1);
+    if (g_gpl) {
+        int ok = 1;
+        for (int i = 0; i < L_N; i++) { e->lib[i] = lib_get(i, e, &made, &waited); ok &= e->lib[i] && atomic_load(&e->lib[i]->state) == 1; }
+        if (ok && (p = link(e, 0, &t))) { atomic_fetch_add(&s_fast, 1); atomic_fetch_add(&s_fast_ns, t); }
+        e->kind = K_FAST;
+        *why = made ? HVK_W_LIB : waited ? HVK_W_INFLIGHT : HVK_W_LINK;
+    } else {
+        if ((p = mono_make(e, &t))) { atomic_fetch_add(&s_mono, 1); atomic_fetch_add(&s_mono_ns, t); }
+        e->kind = K_MONO; *why = HVK_W_MONO;
+    }
+    if (!p) atomic_fetch_add(&s_failed, 1);
+    pthread_mutex_lock(&g_mu);
+    e->cur = p; atomic_store(&e->state, p ? 1 : 2); pthread_cond_broadcast(&g_cv);
+    pthread_mutex_unlock(&g_mu);
+    atomic_fetch_sub(&s_pending, 1);
+    if (p && e->kind == K_FAST && g_opt_on && !(g_quirks & HVK_QUIRK_NO_OPT)) hvk_work_submit(HVK_Q_OPT, opt_job, e);
+}
+static pso_ent *ent_new(hvk_shader *const sh[6], hvk_layout *l, const hvk_gfx_key *k, int row) {
+    pso_ent *e = calloc(1, sizeof *e);
+    if (!e) return NULL;
+    memcpy(e->sh, sh, sizeof e->sh); e->l = l; e->k = *k; e->row = row;
+    return e;
+}
+static void trace_wait(int why, uint64_t ns, const pso_ent *e) {
+    char f[160] = ""; size_t o = 0;
+    for (int i = 0; i < e->k.ccount && o < sizeof f; i++) o += (size_t)snprintf(f + o, sizeof f - o, "%s%u", i ? "," : "", (unsigned)e->k.color[i]);
+    hostvk_log("[hostvk] pipeline wait %.3f ms (%s): vertex %s fragment %s, colour formats %s, depth %u stencil %u, %u samples, topology class %u, entry %u, level %c",
+               ns / 1e6, hvk_wait_why[why], e->sh[0] ? e->sh[0]->key : "-", e->sh[1] ? e->sh[1]->key : "-", o ? f : "-", (unsigned)e->k.depth, (unsigned)e->k.stencil,
+               (unsigned)e->k.samples, (unsigned)e->k.topology_class, (unsigned)e->k.entry[0], g_level);
+}
+// ---------- The look-ahead's builds (3.3, vk_predict.c) ----------
+// A key the look-ahead queued: in g_pred until a worker takes it (or a draw does, taken), in g_pred_all until the job has run (the workers drop queued jobs at shutdown)
+typedef struct pred_job { gpl_key key; hvk_shader *sh[6]; hvk_layout *l; int taken; struct pred_job *prev, *next; } pred_job;
+static nvn_hmap g_pred; static pred_job *g_pred_all;   // under g_mu
+static void pred_unlink(pred_job *j) { if (j->prev) j->prev->next = j->next; else g_pred_all = j->next; if (j->next) j->next->prev = j->prev; j->prev = j->next = NULL; }
+static void pred_run(void *arg) {   // a worker (HVK_Q_PRED): the key entered in the table and made, unless a draw took it or something made it meanwhile
+    pred_job *j = arg; pso_ent *e = NULL;
+    pthread_mutex_lock(&g_mu);
+    for (uint64_t t0 = plat_now_ns(); g_pred_hold && !j->taken && plat_now_ns() - t0 < 30000000000ull;) {   // test hook: held before it takes its key
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_nsec += 20000000; if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+        pthread_cond_timedwait(&g_cv, &g_mu, &ts);
+    }
+    pred_unlink(j);
+    int skip = j->taken;
+    if (!skip) { nvn_hm_del(&g_pred, &j->key); if (nvn_hm_get(&g_ents, &j->key)) { skip = 1; atomic_fetch_add(&s_pred_found, 1); } }
+    if (!skip && (e = ent_new(j->sh, j->l, &j->key.k, -1))) { e->pred = 1; nvn_hm_put(&g_ents, &j->key, e); }
+    pthread_mutex_unlock(&g_mu);
+    free(j);
+    if (!e) { if (!skip) atomic_fetch_add(&s_pred_failed, 1); return; }
+    int why; ent_make(e, &why);
+    atomic_fetch_add(atomic_load(&e->state) == 1 ? &s_pred_built : &s_pred_failed, 1);
+}
+static void work_submit_n(int q, void (*fn)(void *), void *const *args, int n);
+int hvk_pso_predict(const hvk_pred_key *keys, int n) {
+    enum { CHUNK = 64 };
+    pred_job *jobs[CHUNK]; int queued = 0;
+    for (int at = 0; at < n; at += CHUNK) {
+        int m = 0, c = n - at < CHUNK ? n - at : CHUNK;
+        for (int i = 0; i < c; i++) {   // the jobs made outside the lock
+            const hvk_pred_key *p = &keys[at + i];
+            if (!(jobs[m] = malloc(sizeof *jobs[m]))) continue;
+            key_of(&jobs[m]->key, p->sh, p->l, &p->k); memcpy(jobs[m]->sh, p->sh, sizeof jobs[m]->sh); jobs[m]->l = p->l; jobs[m]->taken = 0;
+            m++;
+        }
+        int k = 0;
+        pthread_mutex_lock(&g_mu);
+        if (!g_ents.klen) nvn_hm_init(&g_ents, sizeof(gpl_key));
+        if (!g_pred.klen) nvn_hm_init(&g_pred, sizeof(gpl_key));
+        for (int i = 0; i < m; i++) {
+            pred_job *j = jobs[i];
+            if (nvn_hm_get(&g_ents, &j->key) || nvn_hm_get(&g_pred, &j->key)) { free(j); continue; }   // ready, being made or queued already (an earlier key of the walk too)
+            nvn_hm_put(&g_pred, &j->key, j);
+            j->prev = NULL; j->next = g_pred_all; if (g_pred_all) g_pred_all->prev = j; g_pred_all = j;
+            if (g_tk_on && g_tk_n[0] < 1024) g_tk[0][g_tk_n[0]++] = nvn_hm_hash(&j->key, sizeof j->key);
+            jobs[k++] = j;
+        }
+        pthread_mutex_unlock(&g_mu);
+        if (k) { atomic_fetch_add(&s_pred_queued, (uint64_t)k); work_submit_n(HVK_Q_PRED, pred_run, (void *const *)jobs, k); }
+        queued += k;
+    }
+    return queued;
+}
+int hvk_pso_take_waited(void) { int w = g_waited; g_waited = 0; return w; }
+void hvk_pso_test_pred_hold(int on) { pthread_mutex_lock(&g_mu); g_pred_hold = on != 0; pthread_cond_broadcast(&g_cv); pthread_mutex_unlock(&g_mu); }
+void hvk_pso_test_keys(int on) { pthread_mutex_lock(&g_mu); g_tk_on = on != 0; g_tk_n[0] = g_tk_n[1] = 0; pthread_mutex_unlock(&g_mu); }
+int hvk_pso_test_keys_get(int which, uint64_t *out, int max) {
+    pthread_mutex_lock(&g_mu);
+    int n = g_tk_n[which & 1]; for (int i = 0; i < n && i < max; i++) out[i] = g_tk[which & 1][i];
+    pthread_mutex_unlock(&g_mu);
+    return n;
+}
+
+VkPipeline hvk_gfx_pipeline(hvk_shader *const sh[6], hvk_layout *l, const hvk_gfx_key *k, void (*miss)(void)) {
+    gpl_key key; key_of(&key, sh, l, k);
+    pthread_mutex_lock(&g_mu);
+    if (!g_ents.klen) nvn_hm_init(&g_ents, sizeof key);
+    pso_ent *e = nvn_hm_get(&g_ents, &key);
+    int ready = e && atomic_load(&e->state) != 0;
+    if (!ready) {   // not ready: the draw waits for it, made here or by the worker that has it
+        uint64_t t0 = plat_now_ns(); int why = HVK_W_INFLIGHT, fresh = 0;
+        g_waited = 1;
+        if (g_tk_on && g_tk_n[1] < 1024) g_tk[1][g_tk_n[1]++] = nvn_hm_hash(&key, sizeof key);
+        if (!e) {
+            pred_job *j = g_pred.n ? nvn_hm_del(&g_pred, &key) : NULL;   // queued by the look-ahead and not taken by a worker: made here, as on a miss (the job finds it taken)
+            if (j) { j->taken = 1; atomic_fetch_add(&s_pred_made, 1); }
+            if (!(e = ent_new(sh, l, k, -1))) { pthread_mutex_unlock(&g_mu); return VK_NULL_HANDLE; }
+            nvn_hm_put(&g_ents, &key, e); fresh = 1;
+            pthread_mutex_unlock(&g_mu);
+            ent_make(e, &why);
+            atomic_fetch_add(&s_draw_made, 1); atomic_fetch_add(&hvk.st_pipelines, 1);
+        } else {
+            while (atomic_load(&e->state) == 0) pthread_cond_wait(&g_cv, &g_mu);
+            pthread_mutex_unlock(&g_mu);
+        }
+        uint64_t w = plat_now_ns() - t0;
+        atomic_fetch_add(&s_wait_n[why], 1); atomic_fetch_add(&s_wait_ns[why], w); stat_max(&s_wait_max, w); stat_max(&s_wait_max_win, w); atomic_fetch_add(&hvk.st_pipeline_ns, w);
+        if (w > 2000000) atomic_fetch_add(&s_over, 1);
+        if (g_trace) trace_wait(why, w, e);
+        if (fresh) { hvk_prewarm_predict_pair(sh[0] ? sh[0]->key : NULL, sh[1] ? sh[1]->key : NULL); if (miss) miss(); }
+    } else pthread_mutex_unlock(&g_mu);
+    if (atomic_load(&e->state) != 1) { HVK_RED_ONCE("a draw whose pipeline could not be made is skipped (first case: vertex %s fragment %s)", sh[0] ? sh[0]->key : "-", sh[1] ? sh[1]->key : "-"); return VK_NULL_HANDLE; }
+    VkPipeline o = atomic_load(&e->opt);
+    if (o && e->kind == K_FAST) {   // the optimized pipeline is ready: swapped in, the fast one released after the submissions that may still use it
+        hvk_defer(HVK_DEL_PIPELINE, (void *)e->cur, 0, 0);
+        e->cur = o; e->kind = K_OPT; atomic_store(&e->opt, VK_NULL_HANDLE);
+        atomic_fetch_add(&s_swapped, 1);
+    }
+    if (!e->used) {   // its first draw: a pipeline the look-ahead had made is counted, and one no list named goes to the device's list as one this draw made would (miss)
+        e->used = 1;
+        if (e->pred) { atomic_fetch_add(ready ? &s_pred_ready : &s_pred_inflight, 1); if (e->row < 0 && miss) miss(); }
+        if (e->row >= 0) hvk_prewarm_predict(e->row);
+    }
+    atomic_fetch_add(&s_draws_kind[e->kind], 1);
+    return e->cur;
+}
+int hvk_pso_build(hvk_shader *const sh[6], hvk_layout *l, const hvk_gfx_key *k, int row) {
+    gpl_key key; key_of(&key, sh, l, k);
+    pthread_mutex_lock(&g_mu);
+    if (!g_ents.klen) nvn_hm_init(&g_ents, sizeof key);
+    pso_ent *e = nvn_hm_get(&g_ents, &key);
+    if (e) { if (e->row < 0) e->row = row; int st = atomic_load(&e->state); pthread_mutex_unlock(&g_mu); return st != 2; }
+    if (!(e = ent_new(sh, l, k, row))) { pthread_mutex_unlock(&g_mu); return 0; }
+    nvn_hm_put(&g_ents, &key, e);
+    pthread_mutex_unlock(&g_mu);
+    int why; ent_make(e, &why);
+    return atomic_load(&e->state) == 1;
+}
+int hvk_pso_ready(hvk_shader *const sh[6], hvk_layout *l, const hvk_gfx_key *k) {
+    gpl_key key; key_of(&key, sh, l, k);
+    pthread_mutex_lock(&g_mu);
+    pso_ent *e = g_ents.klen ? nvn_hm_get(&g_ents, &key) : NULL;
+    int ok = e && atomic_load(&e->state) == 1;
+    pthread_mutex_unlock(&g_mu);
+    return ok;
+}
+int hvk_pso_build_shader(hvk_shader *s) {
+    if (!g_gpl || !s || (s->stage != 0 && s->stage != 1)) return 0;
+    hvk_shader *sh[6] = {0}; sh[s->stage] = s;
+    hvk_layout *l = hvk_layout_for(sh);
+    if (!l) return 0;
+    pso_ent e; memset(&e, 0, sizeof e); memcpy(e.sh, sh, sizeof e.sh); e.l = l;
+    hvk_key_src src; memset(&src, 0, sizeof src); src.samples = VK_SAMPLE_COUNT_1_BIT; src.poly_mode = NVN_POLYGON_MODE_FILL; src.logic_op = NVN_LOGIC_OP_COPY;
+    hvk_key_fill(&e.k, sh, VK_PRIMITIVE_TOPOLOGY_TRIANGLE_LIST, &src);   // the libraries' share of the key does not depend on the pair (the layout is the stage combination's)
+    int made = 0, waited = 0;
+    lib_ent *le = lib_get(s->stage == 0 ? L_PR : L_FS, &e, &made, &waited);
+    return le && atomic_load(&le->state) == 1;
+}
+uint64_t hvk_pso_take_window_max(void) { return atomic_exchange(&s_wait_max_win, 0); }
+void hvk_pso_stats_get(hvk_pso_stats *s) {
+    memset(s, 0, sizeof *s);
+    for (int i = 0; i < L_N; i++) { s->lib[i] = s_lib[i]; s->lib_ns[i] = s_lib_ns[i]; }
+    s->fast = s_fast; s->fast_ns = s_fast_ns; s->opt = s_opt; s->opt_ns = s_opt_ns; s->mono = s_mono; s->mono_ns = s_mono_ns; s->swapped = s_swapped; s->opt_dropped = s_opt_dropped;
+    s->draw_made = s_draw_made; s->draw_ns = hvk.st_pipeline_ns;
+    for (int i = 0; i < HVK_W_N; i++) { s->wait_n[i] = s_wait_n[i]; s->wait_ns[i] = s_wait_ns[i]; }
+    s->wait_max_ns = s_wait_max; s->over_budget = s_over;
+    s->draws_fast = s_draws_kind[K_FAST]; s->draws_opt = s_draws_kind[K_OPT]; s->draws_mono = s_draws_kind[K_MONO]; s->failed = s_failed; s->pending = s_pending;
+    s->pred_queued = s_pred_queued; s->pred_built = s_pred_built; s->pred_found = s_pred_found; s->pred_failed = s_pred_failed;
+    s->pred_ready = s_pred_ready; s->pred_inflight = s_pred_inflight; s->pred_made = s_pred_made;
+}
+
+// ---------- Worker threads (3.5) ----------
+typedef struct job { void (*fn)(void *); void *arg; struct job *next; } job;
+static struct { job *head, *tail; int n, running; } g_q[HVK_Q_N];
+static pthread_mutex_t g_wmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_wcv = PTHREAD_COND_INITIALIZER, g_wdone = PTHREAD_COND_INITIALIZER;
+enum { MAXW = 64 };
+static pthread_t g_bg[2], g_optw, g_prep[MAXW]; static int g_nbg, g_nprep, g_started, g_wquit, g_prep_stop, g_opt_started;
+static int bg_ready(void) { return g_q[HVK_Q_PRED].n || g_q[HVK_Q_SPEC].n || g_q[HVK_Q_BG].n; }
+static job *take(int q) { job *j = g_q[q].head; if (j) { g_q[q].head = j->next; if (!g_q[q].head) g_q[q].tail = NULL; g_q[q].n--; g_q[q].running++; } return j; }
+static void run(int q, job *j) {
+    j->fn(j->arg); free(j);
+    pthread_mutex_lock(&g_wmu); g_q[q].running--; pthread_cond_broadcast(&g_wdone); pthread_mutex_unlock(&g_wmu);
+}
+static void *bg_main(void *arg) {   // the look-ahead's builds, the speculative builds and the prewarm, in that order; a prepare worker too (arg non-NULL), until the prepare step ends
+    int prep = arg != NULL;
+    plat_thread_set_name(prep ? "dm-vk-prepare" : "dm-vk-pso");
+    plat_qos_set_self(prep ? PLAT_QOS_USER_INITIATED : PLAT_QOS_UTILITY);
+    pthread_mutex_lock(&g_wmu);
+    for (;;) {
+        if (g_wquit || (prep && g_prep_stop)) break;
+        int q = g_q[HVK_Q_PRED].n ? HVK_Q_PRED : g_q[HVK_Q_SPEC].n ? HVK_Q_SPEC : g_q[HVK_Q_BG].n ? HVK_Q_BG : -1;
+        if (q < 0) { pthread_cond_wait(&g_wcv, &g_wmu); continue; }
+        job *j = take(q);
+        pthread_mutex_unlock(&g_wmu);
+        run(q, j);
+        pthread_mutex_lock(&g_wmu);
+    }
+    pthread_mutex_unlock(&g_wmu);
+    if (prep) hvk_cache_retire_thread();
+    return NULL;
+}
+static void *opt_main(void *arg) {   // the optimized relinks, only while the other queues are empty, and the disk cache's periodic write
+    (void)arg;
+    plat_thread_set_name("dm-vk-opt");
+    plat_qos_set_self(PLAT_QOS_UTILITY);
+    pthread_mutex_lock(&g_wmu);
+    for (;;) {
+        if (g_wquit) break;
+        int idle = !bg_ready() && !g_q[HVK_Q_PRED].running && !g_q[HVK_Q_SPEC].running && !g_q[HVK_Q_BG].running && !atomic_load(&s_pending);
+        if (g_q[HVK_Q_OPT].n && idle) {
+            job *j = take(HVK_Q_OPT);
+            pthread_mutex_unlock(&g_wmu);
+            run(HVK_Q_OPT, j);
+            pthread_mutex_lock(&g_wmu);
+            continue;
+        }
+        struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 1;
+        pthread_cond_timedwait(&g_wcv, &g_wmu, &ts);
+        if (g_wquit) break;
+        pthread_mutex_unlock(&g_wmu);
+        hvk_cache_tick(plat_now_ns());
+        pthread_mutex_lock(&g_wmu);
+    }
+    pthread_mutex_unlock(&g_wmu);
+    return NULL;
+}
+static void workers_start(void) {   // under g_wmu
+    if (g_started) return;
+    g_started = 1; g_wquit = 0;
+    int cpu = plat_cpu_count(); g_nbg = cpu <= 4 ? 1 : 2;   // the low-core rule of 3.5: one background worker on a CPU of up to 4 hardware threads
+    for (int i = 0; i < g_nbg; i++) if (pthread_create(&g_bg[i], NULL, bg_main, NULL)) { g_nbg = i; break; }
+    g_opt_started = !pthread_create(&g_optw, NULL, opt_main, NULL);
+    if (!g_opt_started) hostvk_log("[RED] [hostvk] the optimizing worker could not be started: no optimized relinks, no periodic cache write");
+    hostvk_log("[hostvk] pipeline workers: %d background, 1 optimizing (%d hardware threads)", g_nbg, cpu);
+}
+static void work_submit_n(int q, void (*fn)(void *), void *const *args, int n) {   // n jobs in order, with one lock and one wake (a job that cannot be allocated runs here)
+    job *head = NULL, *tail = NULL; int k = 0;
+    for (int i = 0; i < n; i++) {
+        job *j = calloc(1, sizeof *j);
+        if (!j) { fn(args[i]); continue; }
+        j->fn = fn; j->arg = args[i];
+        if (tail) tail->next = j; else head = j;
+        tail = j; k++;
+    }
+    if (!k) return;
+    pthread_mutex_lock(&g_wmu);
+    workers_start();
+    if (g_q[q].tail) g_q[q].tail->next = head; else g_q[q].head = head;
+    g_q[q].tail = tail; g_q[q].n += k;
+    pthread_mutex_unlock(&g_wmu);
+    pthread_cond_broadcast(&g_wcv);   // after the unlock: the workers it wakes do not block on the mutex the submitter still holds
+}
+void hvk_work_submit(int q, void (*fn)(void *), void *arg) { work_submit_n(q, fn, &arg, 1); }
+int hvk_work_pending(int q) { pthread_mutex_lock(&g_wmu); int n = g_q[q].n + g_q[q].running; pthread_mutex_unlock(&g_wmu); return n; }
+void hvk_work_drain(int q) {
+    pthread_mutex_lock(&g_wmu);
+    for (;;) {
+        int busy = 0;
+        for (int i = 0; i < HVK_Q_N; i++) if (q == HVK_Q_N || q == i) busy |= g_q[i].n || g_q[i].running;
+        if (!busy || !g_started) break;
+        pthread_cond_wait(&g_wdone, &g_wmu);
+    }
+    pthread_mutex_unlock(&g_wmu);
+}
+int hvk_work_prepare_begin(int total) {   // total: the workers wanted with the background ones (3.5: one per hardware thread less one); the prepare workers made (they take every queue but HVK_Q_OPT)
+    pthread_mutex_lock(&g_wmu);
+    workers_start();
+    g_prep_stop = 0;
+    int n = total - g_nbg; if (n < 0) n = 0;
+    if (n > MAXW) n = MAXW;
+    for (g_nprep = 0; g_nprep < n; g_nprep++) if (pthread_create(&g_prep[g_nprep], NULL, bg_main, (void *)1)) break;
+    n = g_nprep;
+    pthread_mutex_unlock(&g_wmu);
+    return n;
+}
+void hvk_work_prepare_end(void) {
+    pthread_mutex_lock(&g_wmu); g_prep_stop = 1; pthread_cond_broadcast(&g_wcv); int n = g_nprep; g_nprep = 0; pthread_mutex_unlock(&g_wmu);
+    for (int i = 0; i < n; i++) pthread_join(g_prep[i], NULL);
+}
+static void workers_stop(void) {
+    pthread_mutex_lock(&g_wmu);
+    if (!g_started) { pthread_mutex_unlock(&g_wmu); return; }
+    for (int q = 0; q < HVK_Q_N; q++) { job *j = g_q[q].head; while (j) { job *n = j->next; free(j); j = n; } g_q[q].head = g_q[q].tail = NULL; g_q[q].n = 0; }   // queued work dropped
+    g_wquit = 1; g_prep_stop = 1; pthread_cond_broadcast(&g_wcv);
+    pthread_mutex_unlock(&g_wmu);
+    for (int i = 0; i < g_nbg; i++) pthread_join(g_bg[i], NULL);
+    if (g_opt_started) pthread_join(g_optw, NULL);
+    g_opt_started = 0;
+    hvk_work_prepare_end();
+    pthread_mutex_lock(&g_wmu); g_started = 0; g_nbg = 0; pthread_mutex_unlock(&g_wmu);
+}
+
+// ---------- Bring-up, the test hooks, shutdown ----------
+void hvk_pso_init(void) {
+    const char *e = getenv("DM_VK_PSO_TRACE"); g_trace = e && !strcmp(e, "1");
+    g_full_caps = hvk.dev.caps; g_full_eds = hvk.dev.eds_present; g_full_topo = hvk.dev.x.topology_unrestricted; g_full_saved = 1;
+    g_full_line_dyn = hvk.dev.x.line_mode_dynamic; g_full_swz = hvk.dev.x.vp_swizzle_nv;
+    level_rules(); quirks_find();
+    hostvk_log("[hostvk] pipelines: level %c, %s%s", g_level, g_gpl ? "libraries with a fast link and an optimized relink in the background" : "monolithic, a draw waits for a pipeline it is the first to use",
+               hvk.dev.x.topology_unrestricted ? "; one pipeline draws every topology class" : "");
+}
+static void drop_all(void) {   // every pipeline and library (the GPU is idle, no worker is building)
+    pthread_mutex_lock(&g_mu);
+    for (uint32_t i = 0; i < g_ents.cap; i++) if (g_ents.vals && g_ents.vals[i]) {
+        pso_ent *x = g_ents.vals[i];
+        if (x->cur) vkDestroyPipeline(hvk.d, x->cur, NULL);
+        VkPipeline o = atomic_load(&x->opt); if (o) vkDestroyPipeline(hvk.d, o, NULL);
+        free(x);
+    }
+    nvn_hm_clear(&g_ents, NULL);
+    for (int p = 0; p < L_N; p++) {
+        for (uint32_t i = 0; i < g_lib[p].cap; i++) if (g_lib[p].vals && g_lib[p].vals[i]) { lib_ent *l = g_lib[p].vals[i]; if (l->p) vkDestroyPipeline(hvk.d, l->p, NULL); free(l); }
+        nvn_hm_clear(&g_lib[p], NULL);
+    }
+    pthread_mutex_unlock(&g_mu);
+}
+void hvk_finish(void);
+void hvk_pso_test_level(char level) {
+    hvk_finish(); hvk_work_drain(HVK_Q_N); hvk_deferred_run(UINT64_MAX);
+    drop_all();
+    if (!g_full_saved) return;
+    hvk.dev.caps = g_full_caps; hvk.dev.eds_present = g_full_eds; hvk.dev.x.topology_unrestricted = g_full_topo;
+    hvk.dev.x.line_mode_dynamic = g_full_line_dyn; hvk.dev.x.vp_swizzle_nv = g_full_swz;
+    hostvk_caps *c = &hvk.dev.caps;
+    if (level == 'B' || level == 'D') { hvk.dev.eds_present = 0; c->eds3_blend = c->eds3_raster = 0; hvk.dev.x.topology_unrestricted = 0; hvk.dev.x.line_mode_dynamic = 0; hvk.dev.x.vp_swizzle_nv = 0; }
+    if (level == 'C' || level == 'D') c->gpl = c->gpl_fast_link = c->gpl_indep_interp = 0;
+    if (level == 'D') c->vertex_input_dynamic = 0;
+    if (level > c->device_level) c->level = level;
+    level_rules();
+    hostvk_log("[hostvk] pipelines made for level %c from now on (test)", g_level);
+}
+void hvk_pso_shutdown(void) {
+    workers_stop();
+    // the look-ahead's jobs the workers dropped, and its line
+    pthread_mutex_lock(&g_mu);
+    while (g_pred_all) { pred_job *j = g_pred_all; pred_unlink(j); free(j); }
+    nvn_hm_clear(&g_pred, NULL); memset(&g_pred, 0, sizeof g_pred);
+    pthread_mutex_unlock(&g_mu);
+    hvk_predict_stats w; hvk_predict_stats_get(&w);
+    uint64_t built = s_pred_built, ready = s_pred_ready, infl = s_pred_inflight;
+    hostvk_log("[hostvk] prediction: %s%llu walks of the rest of a submission after a draw waited (%llu records, %.2f ms on the submit thread of which %.2f ms loading programs and layouts, "
+               "the longest %.3f ms; %llu stopped at the budget, "
+               "%llu at a call deeper than the return stack), %llu draws walked, %llu keys made; %llu pipelines queued: %llu made ahead by the workers (%llu found made already, %llu failed); "
+               "at their draw %llu ready in time, %llu still being made (the draw waited for the rest), %llu not started (made by the draw), %llu made ahead and not drawn",
+               w.on ? "" : "off (DM_NVN_PREDICT=0), ", (unsigned long long)w.walks, (unsigned long long)w.records, w.ns / 1e6, w.load_ns / 1e6, w.max_ns / 1e6, (unsigned long long)w.budget_stops,
+               (unsigned long long)w.depth_stops, (unsigned long long)w.draws, (unsigned long long)w.keys, (unsigned long long)s_pred_queued, (unsigned long long)built,
+               (unsigned long long)s_pred_found, (unsigned long long)s_pred_failed, (unsigned long long)ready, (unsigned long long)infl, (unsigned long long)s_pred_made,
+               (unsigned long long)(built > ready + infl ? built - ready - infl : 0));
+    drop_all();
+    for (int p = 0; p < L_N; p++) memset(&g_lib[p], 0, sizeof g_lib[p]);
+    memset(&g_ents, 0, sizeof g_ents);
+}

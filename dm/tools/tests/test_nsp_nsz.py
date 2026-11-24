@@ -201,5 +201,29 @@ class Nsz(unittest.TestCase):
         self.assertEqual(fam['base'].read_bytes(), b'converted')
         self.assertEqual(fam['updates'][0][1].read_bytes(), b'converted')
 
+class Untagged(unittest.TestCase):   # a cartridge dump that names no title (no tag, no ticket: the first game packed on Linux); what the shader split's log says this PC lacks
+    def setUp(self):
+        self.tmp = Path(tempfile.mkdtemp()); self.addCleanup(shutil.rmtree, self.tmp)
+        self.said = []
+        p = mock.patch.object(nsp, 'say', self.said.append); p.start(); self.addCleanup(p.stop)
+
+    def test_untagged_cartridge_dump(self):   # its title is its content meta's, as every package's (nx_extract --contents), whatever its file name says
+        xci = self.tmp / 'Mario-vs-Donkey-Kong.xci'
+        head = bytearray(0x200); head[0x100:0x104] = b'HEAD'   # an XCI's card header (is_package)
+        xci.write_bytes(bytes(head) + meta(APP).encode())
+        app, fam = nsp.scan_nsps(self.tmp, fake_contents)
+        self.assertEqual((app, fam['base'], fam['updates'], fam['dlc']), (APP, xci, [], []))
+        self.assertEqual(self.said, [])
+
+    def test_split_lacks(self):
+        log = ("[RED] Banc/World05-01b.bcett.byml.zs: FileNotFoundError: [Errno 2] No such file or directory: 'zstd' (its shaders are left out)\n"
+               "[RED] Banc/World08-01d.bcett.byml.zs: FileNotFoundError: [Errno 2] No such file or directory: 'zstd' (its shaders are left out)\n"
+               "[RED] Pack/A.pack: ModuleNotFoundError: No module named 'lz4' (its shaders are left out)\n"
+               "[RED] 3 file(s) could not be read, their shaders are left out\n")
+        self.assertEqual(nsp.split_lacks(log), ['lz4', 'zstd'])
+        # a file the game's own data makes unreadable, and a missing file given by its path, are not this PC's lack
+        self.assertEqual(nsp.split_lacks("[RED] Model/x.bfres: ValueError: not a BFRES (its shaders are left out)\n"
+                                         "[RED] a.zs: FileNotFoundError: [Errno 2] No such file or directory: '/nsp/extract/a.zs' (its shaders are left out)\n"), [])
+
 if __name__ == '__main__':
     unittest.main()

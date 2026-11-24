@@ -5,7 +5,9 @@ void dm_thread_service_connect(void) {}   // threads started so far have nothing
 #include <assert.h>
 #include <stdbool.h>
 #include <stddef.h>
+#if !defined(_WIN32)
 #include <sys/wait.h>
+#endif
 #include <unistd.h>
 void mtl_present_screen(uint32_t w, uint32_t h) { (void)w; (void)h; }   // loader.c: a screen taller than 16:9; no renderer here
 // 40 fps (loader.c, compiled here): only a stub that takes ticks of 1/120 s (the FRAME_STEP_120 capability in its fixups table) gets it; the loader writes the step's unit (+0x38)
@@ -61,12 +63,14 @@ static void alias_cuts(void) {
     unsetenv("DM_ALIAS_SIZE"); setenv("DM_KEEP_ALIAS_CUTS", "1", 1);
     undo_alias_cuts(&m);
     assert(memcmp(img + 0x10, cut, 4) == 0);
-    // Byte mismatch at cut site fails closed (aborts)
+    // Byte mismatch at cut site fails closed (aborts), in a child: POSIX only (Windows has no fork; the check runs on Linux and Apple)
     unsetenv("DM_KEEP_ALIAS_CUTS"); memset(img + 0x10, 0xaa, 4);
+#if !defined(_WIN32)
     fflush(stdout); fflush(stderr);
     pid_t pid = fork(); assert(pid >= 0);
     if (!pid) { freopen("/dev/null", "w", stderr); undo_alias_cuts(&m); _exit(0); }
     int st; assert(waitpid(pid, &st, 0) == pid && WIFSIGNALED(st));
+#endif
     puts("ALIAS_CUT read_layout and undo_alias_cuts (restore at 64 GB, keep on small alias / DM_KEEP_ALIAS_CUTS, mismatch abort): OK");
 }
 
@@ -79,6 +83,17 @@ static uint64_t missing;
 uint64_t resolve_import(module_t *m, const char *name) { (void)m; (void)name; return (uint64_t)&missing; }
 int hle_implements(const char *name) { return !strcmp(name, "vkGetInstanceProcAddr") || !strcmp(name, "nvnBootstrapLoader"); }
 int svc_nro_deactivate(module_t *m) { m->loaded = 0; return 1; }   // no memory mappings in this fixture
+#if !DM_NATIVE_EXEC
+// The x86-64 execution engine's side of loader.c (aot_arena.c, aot_run.c), which this fixture does not reach: its modules are made by hand and run no guest code
+void *dm_guest_alloc(size_t n) { (void)n; abort(); }
+uint8_t *dm_aot_image_map(const uint8_t *bytes, size_t len, size_t bss, uint64_t ro_end, size_t *mapped) { (void)bytes; (void)len; (void)bss; (void)ro_end; (void)mapped; abort(); }
+struct dm_guest_state *dm_aot_self_state(void) { return NULL; }
+uint64_t dm_guest_call(struct dm_guest_state *st, uint64_t addr, int nargs, ...) { (void)st; (void)addr; (void)nargs; abort(); }
+uint64_t dm_aot_bind(const module_t *m, const char *name, uint64_t v) { (void)m; (void)name; return v; }   // modules outside the arena keep host addresses (aot_arena.c)
+int dm_aot_load_module_pack(module_t *m, const char *dir, const uint8_t sha256[32], uint64_t image_size, uint64_t text_end, uint64_t bss, char *err, size_t errn) {
+    (void)m; (void)dir; (void)sha256; (void)image_size; (void)text_end; (void)bss; (void)err; (void)errn; abort();
+}
+#endif
 void dm_exl_sync_all(void) {}
 
 typedef struct {
@@ -113,7 +128,7 @@ static void fixture(int i) {
     m->nro = 1; m->data_off = offsetof(image, slots); m->pristine_len = offsetof(image, bss) - m->data_off; m->key_page_off = sizeof *im;
     im->value = 123;
     uint8_t *h = raw[i - 1]; memcpy(h + 0x10, "NRO0", 4); *(uint32_t *)(h + 0x18) = sizeof raw[0]; h[0x40] = (uint8_t)i;
-    *(uint32_t *)(h + 0x38) = 32; m->nro_size = sizeof raw[0]; CC_SHA256(h, sizeof raw[0], m->sha256);
+    *(uint32_t *)(h + 0x38) = 32; m->nro_size = sizeof raw[0]; plat_sha256(h, sizeof raw[0], m->sha256);
     m->init = (uintptr_t)init - (uintptr_t)m->base; m->fini = (uintptr_t)fini - (uintptr_t)m->base;
 }
 static void load(int i) { assert(h_ro_LoadModule(&handles[i - 1], raw[i - 1], NULL, 32, 1) == 0); }
@@ -213,11 +228,15 @@ int main(void) {
     assert(images[0].slots[2] == (uint64_t)&images[2].value && images[1].slots[2] == 0);
     h_ro_UnloadModule(&handles[1]);
     assert(images[0].slots[2] == 0 && images[1].slots[2] == 0 && alone->loaded);
-    // Loaded again while it is loaded (a second environment of the plugin before the first is destroyed): refused, its state not reset under it
+    // Loaded again while it is loaded (a second environment of the plugin before the first is destroyed): refused, its state not reset under it. The refusal stops the
+    // process, so it runs in a child: POSIX only (Windows has no fork; the check runs on Linux and Apple)
+#if !defined(_WIN32)
     fflush(stdout); fflush(stderr);
     pid_t child = fork();
     if (!child) { nro_load_alone(alone); _exit(0); }
     int st; waitpid(child, &st, 0); assert(WIFSIGNALED(st) && images[1].value == 123);
+#endif
+    assert(images[1].value == 123);
     images[1].value = 999; images[1].bss = 456; images[1].slots[0] = images[1].slots[1] = images[1].slots[2] = 7;
     nro_unload_alone(alone);   // as h_jit_Destroy ends it, after the plugin's fini
     assert(!alone->loaded && !alone->alone);

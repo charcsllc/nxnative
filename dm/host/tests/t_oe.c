@@ -62,7 +62,9 @@ static int child_burst(int kind) {
     int st; if (waitpid(p, &st, 0) != p) return 0;
     return WIFEXITED(st) && WEXITSTATUS(st) == 0;
 }
-// oe::ExecuteProgram and oe::RequestToRelaunchApplication on the Mac: the plan of what starts (oe_plan), not the execve
+// oe::ExecuteProgram and oe::RequestToRelaunchApplication on the Mac: the plan of what starts (oe_plan), not the execve. The plan is the Mac's (hle_oe.c, _NSGetExecutablePath / _NSGetArgv); Linux and
+// Windows take the path the iPhone takes, which ends the program (open: docs/design/migration-status.md, multi-program games on the port), so these checks run on Apple only
+#if defined(__APPLE__) && !TARGET_OS_IPHONE
 static int env_count(char **env, const char *kv, int prefix) { int c = 0; for (; env && *env; env++) c += prefix ? !strncmp(*env, kv, strlen(kv)) : !strcmp(*env, kv); return c; }
 static const char *env_get(char **env, const char *key) { size_t l = strlen(key); for (; env && *env; env++) if (!strncmp(*env, key, l) && (*env)[l] == '=') return *env + l + 1; return NULL; }
 static int file_is(const char *path, const char *want, size_t n) { char b[64] = {0}; FILE *f = fopen(path, "rb"); if (!f) return 0; size_t got = fread(b, 1, sizeof b, f); fclose(f); return got == n && !memcmp(b, want, n); }
@@ -100,6 +102,7 @@ static void plan_checks(void) {
     prog_plan_free(&P);
     unlink(path); unlink(tsv); if (chdir(old)) {} rmdir(dir);
 }
+#endif
 static int lang_is(const char *want) {
     uint64_t got = h_oe_GetLang(); char exp[8] = {0};
     strncpy(exp, want, sizeof exp - 1);
@@ -261,7 +264,9 @@ int main(void) {
     setenv("DM_GFX_SCALE", "7", 1); CHECK(h_oe_GfxScale() == 0, "DM_GFX_SCALE=7: no such tier, 0"); unsetenv("DM_GFX_SCALE");
     reset(); h_oe_EnableCrashReport(); h_oe_DisableCrashReport();
     CHECK(empty() && h_oe_GetFocus() == 1, "crash-report service switches require no SDK proxy or notifications");
+#if defined(__APPLE__) && !TARGET_OS_IPHONE
     plan_checks();
+#endif
     lang_checks();
     printf("== oe %d checks, %d failed ==\n", checks, fails); return fails != 0;
 }

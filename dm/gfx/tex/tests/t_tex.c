@@ -1,4 +1,4 @@
-// Block-linear deswizzle unit tests (seconds). A round trip; B hand-calculated addresses; E hand-built 3D.
+// Block-linear deswizzle unit tests (seconds). A round trip; B hand-calculated addresses; R the row form of the address (WriteTexels); E hand-built 3D; S sparse layouts.
 // Usage: t_tex
 #include "../nvn_deswizzle.h"
 #include <math.h>
@@ -182,6 +182,24 @@ int main(void) {
                   "per-texture write GOB order %d", order);
         }
         free(st); free(lin);
+    }
+
+    // The row form (nvn_bl_row_of, nvn_bl_row_at: WriteTexels' addresses) gives nvn_bl_offset's address for every byte of every row, at block heights 1 to 32 GOBs, block
+    // depths 1 to 4, padded rows, slices 0 to 5 and both GOB orders (the Tegra X1's and the Switch 2's)
+    printf("R row form of the address (nvn_bl_row_of / nvn_bl_row_at against nvn_bl_offset)\n");
+    {
+        unsigned bad = 0, n = 0;
+        static const uint32_t rbs[] = {16, 64, 100, 128, 448, 1088};
+        for (int s2 = 0; s2 <= 1; s2++) for (unsigned th = 0; th <= 5; th++) for (unsigned td = 0; td <= 2; td++) for (unsigned i = 0; i < sizeof rbs / sizeof *rbs; i++)
+            for (uint32_t z = 0; z < (td ? 6u : 1u); z++) {
+                const uint32_t rb = rbs[i], rows = (8u << th) * 3 + 5;
+                for (uint32_t y = 0; y < rows; y++) {
+                    const nvn_bl_row r = nvn_bl_row_of(y, z, rb, rows, th, td, s2);
+                    for (uint32_t x = 0; x < rb; x++, n++) bad += nvn_bl_row_at(&r, x) != nvn_bl_offset(x, y, z, rb, rows, th, td, s2);
+                }
+            }
+        CHECK(!bad, "R row form: %u of %u addresses differ from nvn_bl_offset", bad, n);
+        printf("  R %u addresses, %u differ\n", n, bad);
     }
 
     // ---------- E hand-built 3D: place markers into block-linear storage at hand-calculated addresses, decode, and verify where the markers land (round trip A only proves self-consistency, not whether the layout is right) ----------

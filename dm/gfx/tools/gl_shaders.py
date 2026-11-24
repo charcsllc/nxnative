@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-# OpenGL games' GLSL shaders → one Metal library + a table for the host's GL layer (dm/gfx/gl/hle_gl.m). Digimon Story Cyber Sleuth: Complete Edition renders with
-# NVIDIA's desktop GL through EGL and compiles GLSL ES 3.20 source at run time (glShaderSource / glCompileShader); the host finds each shader again by the hash of its source.
+# OpenGL games' GLSL shaders → one Metal library + a table for the host's GL layer (dm/gfx/gl/hle_gl.m), or with --vk a SPIR-V library + its table for the Vulkan
+# backend's GL layer (dm/gfx/hostvk/guest_gl.c, Windows and Linux). Digimon Story Cyber Sleuth: Complete Edition renders with NVIDIA's desktop GL through EGL and compiles
+# GLSL ES 3.20 source at run time (glShaderSource / glCompileShader); the host finds each shader again by the hash of its source.
 # Sources, all searched in every input path:
 #   · MVGL archives (*.mvgl, dm/gfx/tools/mvgl.py): every .shad file, named <material>_vp / <material>_fp (1,682 files, 615 distinct sources in Digimon);
 #   · an NSO (a file that starts with NSO0, the game's main): every NUL-terminated string that starts with '#version' (its built-in post effects, movie and shadow shaders);
@@ -15,25 +16,35 @@
 #     outputs and bindings), SPIR-V → MSL with spirv-cross (one Tier 2 argument buffer per stage; vertex shaders --fixup-clipspace: GL's z from −w to w → 0 to w);
 #   · varyings are matched by name, as GL links them: --aml numbers each stage's outputs in its own declaration order, so [[user(locnN)]] becomes [[user(<variable name>)]];
 #   · the host renders in GL's orientation (row 0 at the bottom, the NVN layer's lower-left origin), so nothing is flipped here.
-# Output: <out>/gl/gl_shaders.metallib and <out>/gl/gl_shaders.tsv; --ios <dir> also writes <dir>/gl/ with an iPhone library (same table)
+# --vk (docs/design/vulkan-backend.md 8.2): the same SPIR-V, without the MSL step and without spirv-cross (the in-repo build is a Mac binary): the table comes from the module
+#   itself (reflect below gives table_fields_vk what spirv-cross --reflect gives the MSL path), then three passes on the binary with dmsh_spv.py's reader: the fragment
+#   stage's resources move to descriptor set 1 (--amb numbers each stage's bindings from 0, so the vertex stage keeps set 0), a vertex shader's position gets z = (z + w) / 2
+#   before each return (what --fixup-clipspace writes into the MSL), and FMin / FMax / FClamp become NMin / NMax / NClamp (dmsh_spv.py precise: the MSL path's precise::).
+#   Varyings keep --aml's locations: the host matches them by name when a program links (guest_gl.c), as GL does. spirv-val checks each module where it is installed.
+# Output: <out>/gl/gl_shaders.metallib and <out>/gl/gl_shaders.tsv; --ios <dir> also writes <dir>/gl/ with an iPhone library (same table); --vk writes <out>/gl-vk/ instead:
+#   gl_<key>_v.spv / gl_<key>_f.spv and gl_shaders.tsv. With <out> the shader cache folder (DM_MSL_DIR), gl-vk/ stands beside the Metal library gl/ and the NVN chain's Vulkan
+#   library vk-<DMSH_CHAIN_VK>/ (dmsh_build_vk.py); it is not versioned by the chain, as gl/ is not: this tool is not part of it
 # Table rows: key <TAB> stage (vert / frag) <TAB> fields, space-separated (a key can have a row per stage):
-#   a:<name>=<slot>:<type>                       a vertex input, [[attribute(slot)]]
+#   a:<name>=<slot>:<type>                       a vertex input, [[attribute(slot)]] (--vk: its location)
 #   u:<name>=<offset>:<type>:<count>:<stride>    a member of the default uniform block (count 0 = not an array)
 #   r:<slot>:<count>                             the argument buffer's Metal buffer slot (-1 when absent), and number of argument IDs
 #   b:<id>:<size>                                the default uniform block: its argument ID and size in bytes
 #   n:<name>=<id>:<size>                         a named uniform block (DOOM 3's matrices_ubo): its argument ID and size in bytes
 #   t:<name>=<texture id>:<sampler id>:<type>[:<unit>]  a combined sampler (-1 sampler ID if MSL omits it; optional initial unit from explicit layout(binding))
 #   o:<name>=<location>                          a fragment output, [[color(location)]]
+#   --vk's table (gl-vk/gl_shaders.tsv, which guest_gl.c reads) keeps the direct form of the Metal table before its ABI 2: b:<binding>:<size> for the default block,
+#   t:<name>=<binding>:<type> for a combined sampler, no r: or n: rows (a named uniform block is refused there)
 # <TAB> where it came from
-# Usage: gl_shaders.py <input path>... <out dir> [--ios <dir>]   (input paths: the RomFS, the main NSO, capture folders)
+# Usage: gl_shaders.py <input path>... <out dir> [--ios <dir>] [--fixed-function] [--vk]   (input paths: the RomFS, the main NSO, capture folders)
 #        gl_shaders.py --capture-shader <vert|frag> <source file> <out dir>   (one Mac shader for the capture host)
-import concurrent.futures as cf, hashlib, json, os, re, struct, subprocess, sys, tempfile
+import concurrent.futures as cf, hashlib, json, os, re, shutil, struct, subprocess, sys, tempfile
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../tools'))
 from romfs import os, open
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import mvgl
 from dmsh_chain import SPIRV_CROSS, MAC_MIN_FLAG   # the in-repo spirv-cross build the NVN chain uses too (spirv_cross_bin)
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), '../../ios/tools')); from ios_metal import IOS_FLAGS   # the iPhone's deployment target and math mode
+import dmsh_spv   # the SPIR-V reader and passes of the NVN chain's Vulkan target (--vk)
 
 VEC_TYPES = {'float', 'vec2', 'vec3', 'vec4', 'int', 'ivec2', 'ivec3', 'ivec4', 'uint', 'uvec2', 'uvec3', 'uvec4', 'bool', 'mat2', 'mat3', 'mat4'}
 TABLE_ABI = '# GL shader ABI 2'   # direct-slot tables cannot be consumed by the argument-buffer host
@@ -321,14 +332,15 @@ def argument_names(spv):
     buffers = {f'_{pointers[variables[v][0]]}': name for v, name in renamed.items() if variables[v][1] == 2}   # Uniform
     return textures, buffers
 
-def translate(src, stage, key, tmp):
-    """GLSL → MSL; returns (msl path, table fields) or an error string"""
+def spirv_of(src, stage, key, tmp):
+    """GLSL → SPIR-V, the front end of both targets (translate: MSL, translate_vk: the Vulkan GL layer): legacy GLSL promoted, glslang -E, the fix-ups, glslang -V -R -q;
+    returns (spv path, the preprocessed text, the fixed-up text, the renamed names, the active default-block uniforms) or an error string"""
     t = src.decode('latin1'); renamed = {}
     v = re.search(r'^[ \t]*#version[ \t]+(\d+)[^\n]*\n?', t, re.M)
     desktop_legacy = bool(v and v.group(1) in ('110', '120', '130'))
     if not v or v.group(1) == '100' or desktop_legacy:
         src = promote_legacy(t.replace(v.group(0), '', 1) if v else t, stage, renamed, desktop=desktop_legacy).encode('latin1')
-    g = os.path.join(tmp, f'{key}.{stage}'); spv = g + '.spv'; msl = os.path.join(tmp, f'{key}_{stage[0]}.metal')
+    g = os.path.join(tmp, f'{key}.{stage}'); spv = g + '.spv'
     open(g + '.in', 'wb').write(src)
     r = subprocess.run(['glslangValidator', '-E', '-S', stage, g + '.in'], capture_output=True, text=True)
     if r.returncode: return 'glslang -E: ' + ' | '.join(l for l in (r.stdout + r.stderr).splitlines() if 'ERROR' in l and 'compilation' not in l)[:400]
@@ -340,6 +352,13 @@ def translate(src, stage, key, tmp):
     if r.returncode: return 'glslang: ' + ' | '.join(l for l in (r.stdout + r.stderr).splitlines() if 'ERROR' in l and 'compilation' not in l)[:400]
     active = active_default_uniforms(r.stdout)
     if active is None: return 'glslang: could not read active uniform reflection'
+    return spv, pre, fixed, renamed, active
+
+def translate(src, stage, key, tmp):
+    """GLSL → MSL; returns (msl path, table fields) or an error string"""
+    r = spirv_of(src, stage, key, tmp)
+    if isinstance(r, str): return r
+    (spv, pre, fixed, renamed, active), msl = r, os.path.join(tmp, f'{key}_{stage[0]}.metal')
     refl = json.loads(subprocess.run([SPIRV_CROSS, spv, '--reflect'], capture_output=True, text=True, check=True).stdout)
     for k in ('separate_images', 'separate_samplers', 'images', 'ssbos', 'push_constants'):
         if refl.get(k): return f'{k} are not implemented'
@@ -385,13 +404,190 @@ def translate(src, stage, key, tmp):
         f.append(f't:{t["name"]}={ids[name]}:{ids.get(name + "Smplr", -1)}:{t["type"]}{suffix}')
     return msl, game_names(f, renamed)
 
-def one(item, tmp):
-    """[(key, stage, fields, msl, where)], or [(key, None, errors, None, where)] when no stage translates"""
+def table_fields_vk(refl, pre, stage, active):
+    """--vk: the table's fields of a shader from its reflection (reflect below, in spirv-cross --reflect's form), in the direct form guest_gl.c reads (b: and t: by
+    binding); the default block's members as the Metal table has them (uni_members: active ones only, a struct's members by their dotted name); a list, or an error string"""
+    f = []
+    if stage == 'vert':
+        for v in refl.get('inputs', []): f.append(f'a:{v["name"]}={v["location"]}:{v["type"]}')
+    else:
+        for v in refl.get('outputs', []): f.append(f'o:{v["name"]}={v["location"]}')
+    # a bool uniform is a uint in the SPIR-V block (it has no bool members), but the game asks GL for its declared type: LÖVE's Shader:send takes only a boolean for a GLSL bool
+    bools = {n for n in re.findall(r'\buniform\s+(?:(?:lowp|mediump|highp)\s+)?bool\s+(\w+)\s*;', pre)}
+    for u in refl.get('ubos', []):
+        t = refl['types'][u['type']]
+        if t['name'] != 'gl_DefaultUniformBlock': return f'uniform block {t["name"]} is not the default block'
+        f.append(f'b:{u["binding"]}:{u["block_size"]}')
+        e = uni_members(refl, t['members'], '', 0, f, bools, active)
+        if e: return e
+    for t in refl.get('textures', []):
+        if t.get('array'): return f'sampler array {t["name"]}'
+        f.append(f't:{t["name"]}={t["binding"]}:{t["type"]}')
+    for k in ('separate_images', 'separate_samplers', 'images', 'ssbos', 'push_constants'):
+        if refl.get(k): return f'{k} are not implemented'
+    return f
+
+# ---------- --vk: the reflection read from the module, and the passes ----------
+T_MATRIX, D_BLOCK, D_ARRAY_STRIDE, D_MATRIX_STRIDE, D_ROW_MAJOR, D_OFFSET, SC_PUSH_CONSTANT = 24, 2, 6, 7, 4, 35, 9
+OP_RETURN, OP_COMPOSITE_INSERT, OP_FADD, OP_FMUL = 253, 82, 129, 133
+DIM_NAMES = {0: '1D', 1: '2D', 2: '3D', 3: 'Cube', 4: '2DRect', 5: 'Buffer', 6: 'SubpassInput'}
+ARRAYS = (dmsh_spv.T_ARRAY, dmsh_spv.T_RUNTIME_ARRAY)
+
+def reflect(m):
+    """What spirv-cross --reflect gives table_fields, read from module m (dmsh_spv.Module): the entry point's inputs and outputs (built-ins left out; by location), the uniform
+    blocks with their struct types (members' offsets, arrays and strides; the block's declared size as spirv-cross computes it: the member at the highest offset, plus its
+    size), the combined image samplers, and the resource kinds the table refuses. Types by GLSL name; a struct as '_<id>', its name in 'types', as spirv-cross writes them"""
+    d, names, dec, mdec = m.defs(), m.names(), m.decorations(), m.member_decorations()
+    mnames = {(i[1], i[2]): dmsh_spv.read_string(i[3:])[0] for i in m.of(dmsh_spv.MEMBER_NAME)}
+    iface = set(m.entry_points()[0][3])
+    consts = {i[2]: i[3] for i in m.of(dmsh_spv.CONSTANT) if len(i) > 3}
+    out = {'types': {}}
+
+    def op(t): return d[t][0] & 0xffff if t in d else None
+    def scalar(t):
+        i, o = d[t], op(t)
+        if o == dmsh_spv.T_FLOAT: return {32: 'float', 64: 'double'}.get(i[2], 'float16_t')
+        if o == dmsh_spv.T_INT: return ('int' if i[3] else 'uint') if i[2] == 32 else f'{"" if i[3] else "u"}int{i[2]}_t'
+        return 'bool' if o == dmsh_spv.T_BOOL else f'_{t}'
+    def name_of(t):
+        i, o = d[t], op(t)
+        if o in ARRAYS: return name_of(i[2])
+        if o == dmsh_spv.T_VECTOR:
+            s = scalar(i[2])
+            return {'float': '', 'double': 'd', 'int': 'i', 'uint': 'u', 'bool': 'b'}.get(s, s) + f'vec{i[3]}'
+        if o == T_MATRIX:
+            col = d[i[2]]; rows, cols = col[3], i[3]; p = 'd' if scalar(col[2]) == 'double' else ''
+            return f'{p}mat{cols}' if cols == rows else f'{p}mat{cols}x{rows}'
+        if o == dmsh_spv.T_SAMPLED_IMAGE:
+            img = d[i[2]]   # OpTypeImage: result, sampled type, dim, depth, arrayed, multisampled, sampled, format
+            return ({'int': 'i', 'uint': 'u'}.get(scalar(img[2]), '') + 'sampler' + DIM_NAMES.get(img[3], str(img[3])) + ('MS' if img[6] else '') + ('Array' if img[5] else '')
+                    + ('Shadow' if img[4] == 1 else ''))
+        if o == dmsh_spv.T_STRUCT: struct_type(t); return f'_{t}'
+        return scalar(t)
+    def dims_of(t):
+        n = []
+        while op(t) in ARRAYS: n.append(consts.get(d[t][3], 0) if op(t) == dmsh_spv.T_ARRAY else 0); t = d[t][2]
+        return n
+    def member_size(t, md):   # spirv-cross get_declared_struct_member_size
+        o = op(t)
+        if o in ARRAYS: return dec.get(t, {}).get(D_ARRAY_STRIDE, [0])[0] * (consts.get(d[t][3], 0) if o == dmsh_spv.T_ARRAY else 0)
+        if o == dmsh_spv.T_STRUCT: return struct_size(t)
+        if o == T_MATRIX: return (d[d[t][2]][3] if D_ROW_MAJOR in md else d[t][3]) * md.get(D_MATRIX_STRIDE, [0])[0]
+        _, n, width = m.type_shape(t, d)
+        return n * width // 8
+    def struct_size(t):
+        best, size = -1, 0
+        for k, mt in enumerate(d[t][2:]):
+            md = mdec.get((t, k), {}); off = md.get(D_OFFSET, [0])[0]
+            if off > best: best, size = off, member_size(mt, md)
+        return max(best, 0) + size
+    def struct_type(t):
+        key = f'_{t}'
+        if key in out['types']: return
+        out['types'][key] = e = {'name': names.get(t, key), 'members': []}
+        for k, mt in enumerate(d[t][2:]):
+            md = mdec.get((t, k), {}); mb = {'name': mnames.get((t, k), f'_m{k}'), 'type': name_of(mt), 'offset': md.get(D_OFFSET, [0])[0]}
+            if dims_of(mt): mb['array'] = dims_of(mt); mb['array_stride'] = dec.get(mt, {}).get(D_ARRAY_STRIDE, [0])[0]
+            if D_MATRIX_STRIDE in md: mb['matrix_stride'] = md[D_MATRIX_STRIDE][0]
+            e['members'].append(mb)
+    def builtin(var, t):
+        if dmsh_spv.D_BUILTIN in dec.get(var, {}): return True
+        while op(t) in ARRAYS: t = d[t][2]
+        return op(t) == dmsh_spv.T_STRUCT and any(dmsh_spv.D_BUILTIN in mdec.get((t, k), {}) for k in range(len(d[t]) - 2))
+    def entry(var, t):
+        e = {'type': name_of(t), 'name': names.get(var, f'_{var}')}
+        if dims_of(t): e['array'] = dims_of(t)
+        for key, dk in (('location', dmsh_spv.D_LOCATION), ('set', dmsh_spv.D_DESCRIPTOR_SET), ('binding', dmsh_spv.D_BINDING)):
+            if dk in dec.get(var, {}): e[key] = dec[var][dk][0]
+        return e
+    for var, ptr, sc in m.variables():
+        t = base = d[ptr][3]
+        while op(base) in ARRAYS: base = d[base][2]
+        bo = op(base)
+        if sc in (dmsh_spv.SC_INPUT, dmsh_spv.SC_OUTPUT):
+            if var in iface and not builtin(var, t): out.setdefault('inputs' if sc == dmsh_spv.SC_INPUT else 'outputs', []).append(entry(var, t))
+        elif sc == dmsh_spv.SC_UNIFORM and bo == dmsh_spv.T_STRUCT and D_BLOCK in dec.get(base, {}):
+            e = entry(var, t); e['type'] = name_of(base); e['block_size'] = struct_size(base); out.setdefault('ubos', []).append(e)
+        elif sc in (dmsh_spv.SC_UNIFORM, dmsh_spv.SC_STORAGE_BUFFER): out.setdefault('ssbos', []).append(entry(var, t))   # a BufferBlock, or a storage buffer
+        elif sc == SC_PUSH_CONSTANT: out.setdefault('push_constants', []).append(entry(var, t))
+        elif sc == dmsh_spv.SC_UNIFORM_CONSTANT:
+            kind = ('textures' if bo == dmsh_spv.T_SAMPLED_IMAGE else 'separate_samplers' if bo == dmsh_spv.T_SAMPLER else
+                    'images' if bo == dmsh_spv.T_IMAGE and d[base][7] == 2 else 'separate_images' if bo == dmsh_spv.T_IMAGE else None)
+            if kind: out.setdefault(kind, []).append(entry(var, t))
+    for k in ('inputs', 'outputs'):
+        if k in out: out[k].sort(key=lambda e: (e.get('location', 1 << 30), e['name']))
+    return out
+
+def set_descriptor_set(m, s):
+    """Every resource of module m in descriptor set s (the fragment stage's: 1); → the decorations written"""
+    n, dec = 0, m.decorations()
+    for i in m.ins:
+        if i[0] & 0xffff == dmsh_spv.DECORATE and i[2] == dmsh_spv.D_DESCRIPTOR_SET: i[3] = s; n += 1
+    for var, _, sc in m.variables():
+        if sc in (dmsh_spv.SC_UNIFORM, dmsh_spv.SC_UNIFORM_CONSTANT, dmsh_spv.SC_STORAGE_BUFFER) and dmsh_spv.D_DESCRIPTOR_SET not in dec.get(var, {}):
+            m.decorate(var, dmsh_spv.D_DESCRIPTOR_SET, s); n += 1
+    return n
+
+def clip_z(m):
+    """GL's clip z (−w to w) → Vulkan's (0 to w): position.z = (position.z + position.w) * 0.5 before each return of the vertex entry point, the formula spirv-cross's
+    --fixup-clipspace writes into the MSL; → the returns changed (0 when the module writes no position)"""
+    eps = [e for e in m.entry_points() if e[0] == 'vs']
+    if not eps: return 0
+    fn, iface = eps[0][2], set(eps[0][3])
+    d, dec, mdec = m.defs(), m.decorations(), m.member_decorations()
+    target = None   # (the output variable, the position's member index in it or None)
+    for var, ptr, _ in m.variables(dmsh_spv.SC_OUTPUT):
+        if var not in iface: continue
+        t = d[ptr][3]
+        if dec.get(var, {}).get(dmsh_spv.D_BUILTIN, [None])[0] == dmsh_spv.BUILTIN_POSITION: target = (var, None); break
+        if d[t][0] & 0xffff == dmsh_spv.T_STRUCT:
+            k = next((k for k in range(len(d[t]) - 2) if mdec.get((t, k), {}).get(dmsh_spv.D_BUILTIN, [None])[0] == dmsh_spv.BUILTIN_POSITION), None)
+            if k is not None: target = (var, k); break
+    if not target: return 0
+    f32 = m.float_type(); v4 = m.vector_type(f32, 4); pv4 = m.pointer_type(dmsh_spv.SC_OUTPUT, v4)
+    half = m.constant(f32, struct.unpack('<I', struct.pack('<f', 0.5))[0])
+    idx = m.constant(m.int_type(True), target[1]) if target[1] is not None else None
+    n, k, inside = 0, 0, False
+    while k < len(m.ins):
+        i = m.ins[k]; o = i[0] & 0xffff
+        if o == dmsh_spv.FUNCTION: inside = i[2] == fn
+        elif o == dmsh_spv.FUNCTION_END: inside = False
+        elif o == OP_RETURN and inside:
+            code, ptr = [], target[0]
+            if idx is not None: ptr = m.new_id(); code.append([5 << 16 | dmsh_spv.ACCESS_CHAIN, pv4, ptr, target[0], idx])
+            v, z, w, s, h, nv = (m.new_id() for _ in range(6))
+            code += [[4 << 16 | dmsh_spv.LOAD, v4, v, ptr], [5 << 16 | dmsh_spv.COMPOSITE_EXTRACT, f32, z, v, 2], [5 << 16 | dmsh_spv.COMPOSITE_EXTRACT, f32, w, v, 3],
+                     [5 << 16 | OP_FADD, f32, s, z, w], [5 << 16 | OP_FMUL, f32, h, s, half], [6 << 16 | OP_COMPOSITE_INSERT, v4, nv, h, v, 2], [3 << 16 | dmsh_spv.STORE, ptr, nv]]
+            m.ins[k:k] = code; k += len(code); n += 1
+        k += 1
+    return n
+
+def translate_vk(src, stage, key, tmp):
+    """GLSL → SPIR-V for the Vulkan backend's GL layer (--vk); returns (spv path, table fields) or an error string"""
+    r = spirv_of(src, stage, key, tmp)
+    if isinstance(r, str): return r
+    spv, pre, _, renamed, active = r
+    try: m = dmsh_spv.Module.read(spv)
+    except ValueError as e: return f'glslang output: {e}'
+    f = table_fields_vk(reflect(m), pre, stage, active)
+    if isinstance(f, str): return f
+    dmsh_spv.precise(m)
+    if stage == 'vert': clip_z(m)
+    else: set_descriptor_set(m, 1)
+    out = os.path.join(tmp, f'gl_{key}_{stage[0]}.spv'); m.write(out)
+    val = shutil.which('spirv-val')
+    if val:
+        r = subprocess.run([val, '--target-env', 'vulkan1.0', out], capture_output=True, text=True)
+        if r.returncode: return 'spirv-val: ' + ' | '.join((r.stdout + r.stderr).split('\n'))[:400]
+    return out, game_names(f, renamed)
+
+def one(item, tmp, tr=translate):
+    """[(key, stage, fields, msl or spv, where)], or [(key, None, errors, None, where)] when no stage translates"""
     src, stage, where = item
     key = hashlib.sha256(src).hexdigest()[:16]
     out, errs = [], []
     for st in [stage] if stage else ['vert', 'frag']:
-        r = translate(src, st, key, tmp)
+        r = tr(src, st, key, tmp)
         if isinstance(r, tuple): out.append((key, st, r[1], r[0], where))
         else: errs.append(f'{st}: {r}')
     return out or [(key, None, errs, None, where)]
@@ -432,7 +628,11 @@ def main():
     if '--ios' in a: i = a.index('--ios'); ios = a[i + 1]; del a[i:i + 2]
     fixed = '--fixed-function' in a
     if fixed: a.remove('--fixed-function')
-    if len(a) < 2: sys.exit('usage: gl_shaders.py <input path>... <out dir> [--ios <dir>] [--fixed-function]')
+    vk = '--vk' in a
+    if vk: a.remove('--vk')
+    if vk and ios: sys.exit('gl_shaders.py: --vk and --ios make one library each: run it twice')
+    if vk and fixed: sys.exit('gl_shaders.py: --fixed-function is the Metal host\'s fixed-function shaders; the Vulkan GL layer has no --vk form of it')
+    if len(a) < 2: sys.exit('usage: gl_shaders.py <input path>... <out dir> [--ios <dir>] [--fixed-function] [--vk]')
     roots, out = a[:-1], a[-1]
     items, seen_src = [], set()
     for s, st, where in sources(roots):
@@ -441,7 +641,8 @@ def main():
     if fixed and items: red('GLSL sources found in a fixed-function build')
     if not fixed and not items: red(f'no GLSL shaders in {" ".join(roots)}')
     with tempfile.TemporaryDirectory() as tmp:
-        with cf.ThreadPoolExecutor(os.cpu_count()) as ex: rows = [r for rs in ex.map(lambda it: one(it, tmp), items) for r in rs]
+        tr = translate_vk if vk else translate
+        with cf.ThreadPoolExecutor(os.cpu_count()) as ex: rows = [r for rs in ex.map(lambda it: one(it, tmp, tr), items) for r in rs]
         seen, failed = {}, []
         for key, stage, f, msl, where in rows:
             if not stage: failed.append((key, where, f)); continue
@@ -449,6 +650,7 @@ def main():
         for key, where, errs in failed:
             if not any(k == key for k, _ in seen): print(f'[RED] {where} ({key}) does not translate: {" / ".join(errs)}')
         if not fixed and not seen: red('no GLSL shaders translated')
+        if vk: return write_vk(seen, failed, out)
         tsv = [TABLE_ABI, '# GL shaders (dm/gfx/tools/gl_shaders.py): key = sha256(GLSL source)[:16], Metal function gl_<key>_v / gl_<key>_f; a: vertex inputs, u: default uniform block members '
                '(offset:type:count:stride), r: argument buffer (slot:count), b: the block (id:size), n: named blocks (name=id:size), t: combined samplers (texture-id:sampler-id:type), o: fragment outputs']
         if fixed:
@@ -469,6 +671,22 @@ def main():
             lib = metallib(msls, d, sdk, extra)
             open(os.path.join(d, 'gl_shaders.tsv'), 'w').write('\n'.join(tsv) + '\n')
             print(f'{sdk}: {len(seen)} shaders ({sum(1 for v in seen.values() if v[0] == "vert")} vertex) → {lib}' + (f'; {len(failed)} failed' if failed else ''))
+
+def write_vk(seen, failed, out):
+    """--vk: <out>/gl-vk/gl_<key>_v.spv / gl_<key>_f.spv and gl_shaders.tsv, rows as in the Metal library's table (the host's lookup is the same: the key and the stage)"""
+    d = os.path.join(out, 'gl-vk'); os.makedirs(d, exist_ok=True)
+    for (key, stage), v in seen.items():
+        with open(v[2], 'rb') as f: data = f.read()
+        dst = os.path.join(d, f'gl_{key}_{stage[0]}.spv'); tmp = f'{dst}.{os.getpid()}.tmp'
+        with open(tmp, 'wb') as f: f.write(data)
+        os.replace(tmp, dst)   # whole files only
+    tsv = ['# GL shaders for Vulkan (dm/gfx/tools/gl_shaders.py --vk): key = sha256(GLSL source)[:16], module gl_<key>_v.spv / gl_<key>_f.spv (entry point main; the vertex '
+           "stage's resources in descriptor set 0, the fragment stage's in set 1); a: vertex inputs (location:type), u: default uniform block members (offset:type:count:stride), "
+           'b: the block (binding:size), t: combined samplers (binding:type), o: fragment outputs',
+           '# ' + ' '.join(subprocess.run(['glslangValidator', '--version'], capture_output=True, text=True).stdout.split()[:3]) + '; no spirv-cross (reflected from the module)']
+    tsv += [f'{k[0]}\t{v[0]}\t{" ".join(v[1])}\t{v[3]}' for k, v in sorted(seen.items())]
+    with open(os.path.join(d, 'gl_shaders.tsv'), 'w') as f: f.write('\n'.join(tsv) + '\n')
+    print(f'vk: {len(seen)} shaders ({sum(1 for v in seen.values() if v[0] == "vert")} vertex) → {d}' + (f'; {len(failed)} failed' if failed else ''))
 
 if __name__ == '__main__':
     import nso

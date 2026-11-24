@@ -1,0 +1,55 @@
+// Jump tables recovered on the lifted IR by data flow (docs/design/aot-recompiler.md section 1.3), not by instruction shapes: for a br, the
+// function's blocks from one of the br block's dominators to the br are lifted into one LLVM function (src/lift, Region::follow keeps the region
+// to the blocks that reach the br; Region::calls continues past calls with what their summaries say they change), promoted to SSA and simplified
+// (SROA, EarlyCSE), and the br's target (the operand of the nxaot.indirect marker, Region::mark_indirect) must reduce to a function
+// of one guest load whose address is a function of one index: a value of the address's expression that the address is a function of alone,
+// whatever computed it from how many values; LLVM's LazyValueInfo bounds the index at the br (a dominating unsigned compare, a
+// mask) and known bits narrow it; the entries are read from the image and every target must be a decoded instruction of the function.
+// The region is sound only when it is closed: every block of it that reaches the br, except its first, is entered only from inside it.
+#pragma once
+
+#include <functional>
+#include <map>
+#include <memory>
+#include <optional>
+#include <string>
+#include <vector>
+
+#include "analysis/discover.h"
+#include "lift/lifter.h"
+#include "module/image.h"
+
+namespace nxaot::analysis {
+
+using CallEffects = std::function<std::optional<lift::CallEffect>(uint64_t call_pc)>;
+
+struct TableResult {
+    std::optional<JumpTable> table;
+    std::string why;        // why not, when there is no table
+    unsigned regions = 0;   // regions lifted
+    unsigned reused = 0;    // regions whose analysis came from the memo
+};
+
+// The analyses of the regions lifted so far, by everything a region's lifting and analysis read (jumptable.cpp, RegionKey): the br, the
+// region's first block and its blocks, the function's bounds, and the call effects and known tables at the region's calls and brs. A br
+// tried again after its function's walk changed somewhere else, or after the summaries were computed again, lifts only the regions whose key
+// is new; the analysis of a region is a function of its key, so the result is the one a lifting would give. One per discovery
+struct RegionMemo {
+    struct Outcome;
+    std::map<std::vector<uint32_t>, std::shared_ptr<const Outcome>> regions;  // the keys in 32-bit words (jumptable.cpp)
+};
+uint64_t BytesOf(const RegionMemo& memo);  // its bytes, keys and outcomes (src/analysis/memory.h)
+
+// fn: the function with its blocks (its known tables become switches in the regions); valid: whether an address may be a target (a decoded
+// instruction of the function); calls: empty, or the call effects a region may continue past. optimistic: ignore the blocks only the function's
+// speculative roots reach (Function::speculative), so that a switch whose cases loop back to it can be bounded before its cases are known; such
+// a result is tentative until a closed region with the cases gives it again (discover.cpp, Verify). memo: null, or the regions analysed so far.
+// guess_refs: null, or a guess of guarded cases (discover.cpp Guesses; README.md, "Static cases of a br left to the dispatcher"), whose result is no table but
+// candidates: a table whose index nothing bounds is scanned from its lowest index while its entries' addresses are in the image and none of guess_refs (the
+// addresses the module's code names, sorted: another object starts there), at most options.max_table entries, and its targets kept up to the first that is
+// not valid; a bounded table keeps its valid targets and drops the others. None valid: no result
+TableResult ResolveJumpTable(const module::Image& image, const Function& fn, uint64_t br, const DiscoverOptions& options,
+                             const std::function<bool(uint64_t)>& valid, const CallEffects& calls, bool optimistic, RegionMemo* memo = nullptr,
+                             const std::vector<uint64_t>* guess_refs = nullptr);
+
+}  // namespace nxaot::analysis

@@ -21,7 +21,18 @@
 #include "hle.h"
 #include <pthread.h>
 #include <stdbool.h>
-#include <sys/mman.h>
+// A blank image's storage is guest memory, which the game makes a texture on: anonymous pages on Apple (plat_vm_alloc, as mmap), the arena's on the x86-64 engine (aot.h).
+// A call of the SDK's own nn::os functions (guest code) is GUEST_CALL: the plain call where the guest's code is native, aot.h DM_GUEST_CALL on the x86-64 engine
+#if DM_NATIVE_EXEC || defined(DM_TEST_GUEST_C)
+#define BLANK_ALLOC(n) plat_vm_alloc(n)
+#define BLANK_FREE(p, n) plat_vm_release(p, n)
+#define GUEST_CALL(f, ...) f(__VA_ARGS__)
+#else
+#include "aot.h"
+#define BLANK_ALLOC(n) dm_guest_alloc(n)
+#define BLANK_FREE(p, n) dm_guest_free(p, n)
+#define GUEST_CALL DM_GUEST_CALL
+#endif
 #include "vpx/vpx_decoder.h"
 #include "vpx/vp8dx.h"
 #include "hle_movie_yuv.h"
@@ -218,13 +229,13 @@ static struct { uint32_t w, h; uint8_t *mem; uint64_t size; } g_blank[BLANK_MAX]
 static uint32_t blank_stride(uint32_t w) { return (w * 16 + 63) & ~63u; }
 uint32_t dm_native_image_blank(uint32_t w, uint32_t h) {   // a blank image's handle; 0 when there is no room
     uint64_t size = ((uint64_t)blank_stride(w) * h + CV_NATIVE_ALIGN - 1) & ~(CV_NATIVE_ALIGN - 1);
-    void *mem = size ? mmap(NULL, size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0) : MAP_FAILED;
-    if (mem == MAP_FAILED) return 0;
+    void *mem = size ? BLANK_ALLOC(size) : NULL;
+    if (!mem) return 0;
     dm_host_mutex_lock(&g_cv_mu);
     uint32_t k = 0; while (k < BLANK_MAX && g_blank[k].mem) k++;
     if (k < BLANK_MAX) { g_blank[k].w = w; g_blank[k].h = h; g_blank[k].mem = mem; g_blank[k].size = size; }
     pthread_mutex_unlock(&g_cv_mu);
-    if (k == BLANK_MAX) { munmap(mem, size); LOG("[RED] native images: more than %d blank images", BLANK_MAX); return 0; }
+    if (k == BLANK_MAX) { BLANK_FREE(mem, size); LOG("[RED] native images: more than %d blank images", BLANK_MAX); return 0; }
     return 0x80000000u | (k + 1);
 }
 void dm_native_image_blank_free(uint32_t handle) {   // a texture on it must be finalized first, as on the console
@@ -233,7 +244,7 @@ void dm_native_image_blank_free(uint32_t handle) {   // a texture on it must be 
     dm_host_mutex_lock(&g_cv_mu);
     uint8_t *mem = g_blank[k].mem; uint64_t size = g_blank[k].size; memset(&g_blank[k], 0, sizeof g_blank[k]);
     pthread_mutex_unlock(&g_cv_mu);
-    if (mem) munmap(mem, size);
+    if (mem) BLANK_FREE(mem, size);
 }
 // A native image handle's picture for hle_nvn.c: 1 and its memory, size and layout; 0 for a handle no pool or blank image holds
 int dm_native_image(uint32_t handle, uint8_t **mem, uint64_t *size, uint32_t *w, uint32_t *h, uint32_t *stride) {
@@ -328,7 +339,7 @@ static Result cv_dec_fin(void *t) {
     // The submission-ready event goes with the decoder, as in the SDK. Kept, it stayed in the host's bound-event table, so the next decoder initialised in the same memory found its
     // event "bound" and was not given one: the game had cleared that memory, and nn::os aborted on the uninitialised event (Donkey Kong Bananza, its second movie)
     static void (*destroy)(void *); if (!destroy && !(destroy = guest_sym("_ZN2nn2os18DestroySystemEventEPNS0_15SystemEventTypeE"))) die("nn::os::DestroySystemEvent missing");
-    destroy(d->event);
+    GUEST_CALL(destroy, d->event);
     pthread_cond_destroy(&d->work); pthread_mutex_destroy(&d->mu); free(d); *(cv_dec **)t = NULL;
     return 0;
 }
@@ -460,11 +471,11 @@ static void cv_decode(cv_dec *d, const uint8_t *data, uint64_t size, int64_t ts,
 }
 // The decoder's thread: the packets in the order they were taken, one at a time; a packet's pictures wait for released buffers (end of stream marks the last one, or comes as a
 // buffer of its own). It starts a packet, and adds a picture to those waiting, only with room for one (a release makes some, fill): no picture is dropped for want of it
-void dm_host_helper_qos(qos_class_t q);   // hle_thread.c
+void dm_host_helper_qos(plat_qos_t q);   // hle_thread.c
 static void *cv_worker(void *arg) {
     cv_dec *d = arg;
-    pthread_setname_np("dm codec video");
-    dm_host_helper_qos(QOS_CLASS_USER_INITIATED);   // under DM_QOS_MAP: decodes ahead of playback, not on the frame's critical path (as hle_movie.c's decoder thread)
+    plat_thread_set_name("dm codec video");
+    dm_host_helper_qos(PLAT_QOS_USER_INITIATED);   // under DM_QOS_MAP: decodes ahead of playback, not on the frame's critical path (as hle_movie.c's decoder thread)
     pthread_mutex_lock(&d->mu);
     for (;;) {
         while (!d->quit && (!d->qcount || d->nheld >= CV_HOLD)) pthread_cond_wait(&d->work, &d->mu);
@@ -687,7 +698,7 @@ HLE_FORCE("_ZN2nn6syncpt3sdk20CreateSyncPointEventEPNS1_18SyncPointEventTypeE", 
 }
 HLE_FORCE("_ZN2nn6syncpt3sdk25InitializeMultiWaitHolderEPNS_2os19MultiWaitHolderTypeEPNS1_18SyncPointEventTypeE", "links the event's SystemEvent", void, h_spt_holder, void *holder, void *e) {
     static void (*init)(void *, void *); if (!init && !(init = guest_sym("_ZN2nn2os25InitializeMultiWaitHolderEPNS0_19MultiWaitHolderTypeEPNS0_15SystemEventTypeE"))) die("nn::os::InitializeMultiWaitHolder(SystemEventType) missing");
-    init(holder, e);
+    GUEST_CALL(init, holder, e);
 }
 HLE_FORCE("_ZN2nn6syncpt3sdk21RequestSyncPointEventEPNS1_18SyncPointEventTypeERKNS1_15SyncPointHandleE", "signalled when the decoder fills the awaited buffer",
           Result, h_spt_request, void *e, const cv_sync *s) {
@@ -703,10 +714,10 @@ HLE_FORCE("_ZN2nn6syncpt3sdk20CancelSyncPointEventEPNS1_18SyncPointEventTypeE", 
 // request (main+0x19e779c, SDK 19.3.3); the SDK's own went through the same null table as CreateSyncPointEvent (pc 0)
 HLE_FORCE("_ZN2nn6syncpt3sdk21TryWaitSyncPointEventEPKNS1_18SyncPointEventTypeE", "the event's SystemEvent is signalled", bool, h_spt_trywait, const void *e) {
     static uint32_t (*tw)(void *); if (!tw && !(tw = guest_sym("_ZN2nn2os18TryWaitSystemEventEPNS0_15SystemEventTypeE"))) die("nn::os::TryWaitSystemEvent missing");
-    return (tw((void *)e) & 0xff) != 0;
+    return (GUEST_CALL(tw, (void *)e) & 0xff) != 0;
 }
 HLE_FORCE("_ZN2nn6syncpt3sdk21DestroySyncPointEventEPNS1_18SyncPointEventTypeE", "destroys the event's SystemEvent", void, h_spt_destroy, void *e) {
     spt_unarm(e);
     static void (*destroy)(void *); if (!destroy && !(destroy = guest_sym("_ZN2nn2os18DestroySystemEventEPNS0_15SystemEventTypeE"))) die("nn::os::DestroySystemEvent missing");
-    destroy(e); SPT(e)->magic = 0;
+    GUEST_CALL(destroy, e); SPT(e)->magic = 0;
 }

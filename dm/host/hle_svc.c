@@ -1,10 +1,12 @@
 // Horizon kernel system calls (triggered by the SDK runtime once the SDK is loaded). Only what the P1 boot chain needs is implemented: memory layout + heap + query + debug output + timing.
 // Register convention: inputs w1.. / outputs w0=Result, x1=value (GetInfo / SetHeapSize), consistent with the public Horizon ABI.
 #include "dm.h"
+#include <sys/stat.h>
+#if DM_NATIVE_EXEC
 #include <sys/mman.h>
 #include <sys/mount.h>
 #include <sys/resource.h>
-#include <sys/stat.h>
+#endif
 #include <errno.h>
 #include <fcntl.h>
 #include <unistd.h>
@@ -12,6 +14,18 @@
 #include <sched.h>
 #include <time.h>
 #include <stdatomic.h>
+#if !DM_NATIVE_EXEC
+// The x86-64 execution engine (aot.h, aot_arena.c): what the guest sees lives in its arena below 2^39 (design 5.2): the guest block, the user exception
+// context area; and the main thread's guest stack is one the host made there
+void *dm_guest_reserve(size_t n);
+void *dm_guest_alloc(size_t n);
+int dm_aot_main_stack(uint64_t *lo, uint64_t *size);
+// The graphics backend (dm/gfx/nvn/nvn_be.h; docs/design/vulkan-backend.md 4.2): guest memory the SVCs below commit, and guest memory they are about to decommit, so that the
+// Vulkan backend releases an import of it first. Apple's nvn_be.h has them as empty inline functions (Metal needs neither): on Apple the SVCs do not call them
+void be_guest_map(void *mem, uint64_t size);
+void be_guest_unmap(void *mem, uint64_t size);
+#endif
+#if DM_NATIVE_EXEC   // the guest in files (DM_GUEST_FILE) and the process limit QueryMemory reports: Apple's
 #include <mach/mach.h>
 #include <mach/vm_param.h>
 #include <TargetConditionals.h>
@@ -19,8 +33,14 @@
 #if TARGET_OS_IPHONE
 #include <os/proc.h>   // os_proc_available_memory
 #endif
+#endif
 
 #define SWITCH_ALIAS  DM_SWITCH_ALIAS    // a Switch's alias region: 64 GB
+#if DM_NATIVE_EXEC
+#define VM_MAX_ADDR MACH_VM_MAX_ADDRESS   // the process's address limit: QueryMemory reports what lies past it as Horizon's reserved block
+#else
+#define VM_MAX_ADDR (UINT64_C(1) << 47)   // x86-64 user space ends there (Linux, Windows): the process's address limit QueryMemory reports past
+#endif
 #define SWITCH2_ALIAS DM_SWITCH2_ALIAS   // a Switch 2's alias region on Mac: 128 GB
 // Reserve one whole block of guest address space, partitioned the Horizon way (address values are the real addresses returned by the host's mmap).
 // It only takes address space, not memory.
@@ -76,15 +96,20 @@ static size_t env_size(const char *name, size_t min, size_t align) {
 // Mac that and 8 GB, as it can swap instead. A file is unlinked before it is sized, so one left behind holds nothing. guest_file_thread stops the game when the room left falls under the minimum later.
 // What the game gives back goes PROT_NONE in the files and its blocks are punched out (guest_release, guest_file_punch; DM_GUEST_FILE_PUNCH=0 keeps them), and it reads 0 when it is opened again
 // (alias_initialize, SetHeapSize)
+#if DM_NATIVE_EXEC
 int proc_pid_rusage(int pid, int flavor, rusage_info_t *buffer);   // libproc.h, which the iOS SDK does not have
+#endif
 #define GF_MAX 1024
-static int g_gf_tab[GF_MAX];       // the files, open for reading and writing
 static int g_gf_n;                 // how many, or 0 for anonymous memory. Set before mem_init returns and before guest_file_thread starts
+#if DM_NATIVE_EXEC   // the rest is the files' own state, which only Apple's guest files use (below)
+static int g_gf_tab[GF_MAX];       // the files, open for reading and writing
 static size_t g_gf_chunk;          // each file's size; the last one holds the rest of the block
 static uint64_t g_gf_min_free;     // DM_GUEST_FILE_MIN_FREE in bytes: the free space on the files' disk, less what the dirty pages may still take, under which the game is stopped; 0 = never
 static int g_gf_punch = 1;         // DM_GUEST_FILE_PUNCH=0: what the game gives back keeps its disk blocks (only PROT_NONE), as before
 static _Atomic uint64_t g_gf_punched;   // bytes given back as holes (guest_file_punch)
+#endif
 
+#if DM_NATIVE_EXEC   // to the end of guest_file_init: the files are Apple's (the #else below)
 // Give the files' blocks under [lo, hi) (whole host pages, inside the block) back to the disk with F_PUNCHHOLE. Over a mapped range it also drops the pages, written out or still dirty, and they read 0
 // again (measured on the Mac: a 64 MB shared mapping, half written out: blocks 32 MB → 16 MB after punching a written and a dirty quarter, both read 0, and a later msync writes nothing for them). A
 // wired page (mlock, as under a Metal no-copy buffer the GPU still holds) keeps its bytes and is written back later, so the caller still zeroes the range when it is opened again (guest_zero, which
@@ -310,11 +335,21 @@ static void guest_file_init(void) {
         LOG("[RED] [mem] guest file: the files may take up to the memory pool, %.1f GB, and %.1f GB is free: the game is stopped if under %.1f GB is left", DM_GAME_APP_POOL / G, most / G, g_gf_min_free / G);
     if (strcmp(fs.f_fstypename, "apfs") || !(fs.f_flags & MNT_LOCAL)) LOG("[RED] [mem] guest file: not on a local APFS volume, where it may not be sparse, or be slow");
 }
+#else
+// The guest's memory in files answers iOS's footprint limit with Apple's file calls (F_PUNCHHOLE, mincore's MINCORE_MODIFIED, the volume's purgeable space). The x86-64 engine's guest
+// memory is the arena's, which the graphics backend imports page range by page range (be_guest_map): it stays anonymous, so g_gf_n stays 0 and every path that serves the files
+// is dead here. DM_GUEST_FILE=1 says so once
+static void guest_file_init(void) {
+    const char *e = getenv("DM_GUEST_FILE");
+    if (e && atoi(e) > 0) LOG("[RED] [mem] DM_GUEST_FILE=%s: the guest's memory in files is Apple's (macOS, iOS); on this platform it stays anonymous", e);
+}
+static void *guest_file_thread(void *arg) { (void)arg; return NULL; }
+#endif
 
 static void *alias_windows_thread(void *arg);
 static void *regions_thread(void *arg);
 static void mem_init_once(void) {
-    size_t pg = (size_t)getpagesize();
+    size_t pg = (size_t)plat_page_size();
     if (RESERVE < 0x10000000 || DM_GAME_MEM_ALIAS > RESERVE - 0x10000000 ||
         DM_GAME_MEM_STACK > RESERVE - 0x10000000 - DM_GAME_MEM_ALIAS ||
         ((RESERVE | DM_GAME_MEM_ALIAS | DM_GAME_MEM_STACK) & (pg - 1)))
@@ -325,8 +360,12 @@ static void mem_init_once(void) {
     // stacks as they are; the profile's value reproduces an iPhone's address space on the Mac (the NSP script's heap check)
     size_t alias = dm_alias_size_for(dm_sdk_ounce());
     g_reserve = RESERVE - DM_GAME_MEM_ALIAS + alias;
-    g_as = mmap(NULL, g_reserve, PROT_NONE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (g_as == MAP_FAILED) {
+#if DM_NATIVE_EXEC
+    g_as = plat_vm_reserve(g_reserve);
+#else
+    g_as = dm_guest_reserve(g_reserve);   // x86-64 engine: in the arena (inaccessible until the heap, stack and alias regions open their pages, as here)
+#endif
+    if (!g_as) {
 #if TARGET_OS_IPHONE
         if (g_reserve > ((size_t)6 << 30))
             die("reserve guest AS (%.2f GiB, errno %d): on iOS this requires the com.apple.developer.kernel.extended-virtual-addressing entitlement", g_reserve / 1073741824.0, errno);
@@ -417,6 +456,7 @@ static unsigned g_shared_maps;   // under g_map_lock
 static int g_nmap;
 static hle_transfer_mapping *g_transfer_mappings;   // in-place service mappings, under g_map_lock
 static pthread_mutex_t g_map_lock = PTHREAD_MUTEX_INITIALIZER;
+#if DM_NATIVE_EXEC   // the guest in files (Apple's)
 // Punch the alias region's host pages that the game gave back before the last sweep and has not mapped again since (g_alias_aged), then age the ones given back since. Under g_map_lock,
 // so no MapPhysicalMemory opens a page while it is punched. Called by guest_file_thread every 10 s
 static void guest_file_sweep(void) {
@@ -435,6 +475,7 @@ static void guest_file_sweep(void) {
     }
     pthread_mutex_unlock(&g_map_lock);
 }
+#endif
 // A hole-free read / write of guest heap bytes for the cheat VM (hle_cheats.c): under g_map_lock no concurrent SetHeapSize
 // can mprotect the span away between the bounds check and the copy (both hold this same lock), so a live heap address cannot
 // turn into a fault while the cheat VM touches it. Both return 0 when every byte was inside the currently opened (readable
@@ -520,6 +561,16 @@ static void alias_query(uint64_t addr, uint64_t *base, uint64_t *size, int *mapp
 // alias: the range lies in the alias region, where the game maps and unmaps the same ranges every frame (Zelda: about 0.5 GB a second): punching those at once would make every page fault
 // in again from a hole; they are only marked (g_alias_rel), and guest_file_sweep punches those still given back after a whole sweep interval. The heap's are punched at once
 static int guest_release(uintptr_t lo, uintptr_t hi, int alias) {
+#if !DM_NATIVE_EXEC
+    // The x86-64 engine: the arena's pages (never in files). The graphics backend lets go of its import first (be_guest_unmap), then the range goes inaccessible and its pages are
+    // dropped (plat_vm_discard: MADV_FREE, or MADV_DONTNEED before Linux 4.5; a decommit on Windows). MADV_FREE may leave the old bytes until the kernel wants the memory, so the
+    // range is not known to read 0: 0, and what is opened again is zeroed (alias_initialize, SetHeapSize)
+    (void)alias;
+    be_guest_unmap((void *)lo, hi - lo);
+    if (plat_vm_protect((void *)lo, hi - lo, PLAT_PROT_NONE)) die("guest_release mprotect %#lx+%#lx errno=%d", (unsigned long)lo, (unsigned long)(hi - lo), errno);
+    (void)plat_vm_discard((void *)lo, hi - lo);
+    return 0;
+#else
     if (g_gf_n) {
         if (mprotect((void *)lo, hi - lo, PROT_NONE)) die("guest_release mprotect %#lx+%#lx errno=%d", (unsigned long)lo, (unsigned long)(hi - lo), errno);
         if (g_gf_punch && !alias) guest_file_punch(lo, hi);
@@ -530,6 +581,7 @@ static int guest_release(uintptr_t lo, uintptr_t hi, int alias) {
     static _Atomic int nred; if (atomic_fetch_add(&nred, 1) < 8) LOG("[RED] guest memory %#lx+%#lx not given back (errno %d): it stays resident", (unsigned long)lo, (unsigned long)(hi - lo), errno);
     if (mprotect((void *)lo, hi - lo, PROT_NONE)) die("guest_release mprotect %#lx+%#lx errno=%d", (unsigned long)lo, (unsigned long)(hi - lo), errno);
     return 0;
+#endif
 }
 // Zero the 4 KB pages [a, a + n) over the files: one that reads 0 already is left as it is, since reading a hole maps a clean zero page and dirties nothing, where the memset would dirty it and the
 // kernel then write zeros back, as it would for all of a range the game mapped and unmapped without touching it
@@ -547,7 +599,7 @@ static void alias_zero(uint64_t p, uint64_t q) {
 // Initialize holes using the OLD commit bitmap. Fresh anonymous host pages stay
 // lazy; after any exposure, even an untouched 4 KiB sibling may hold stale bytes.
 static void alias_initialize(uint64_t off, size_t size) {
-    size_t pg = (size_t)getpagesize(), ratio = pg >> 12;
+    size_t pg = (size_t)plat_page_size(), ratio = pg >> 12;
     uint64_t end = (off + size) >> 12;
     for (uint64_t p = off >> 12; p < end;) {
         int mapped = (atomic_load(&g_alias_bits[p >> 6]) >> (p & 63)) & 1;
@@ -724,7 +776,7 @@ static void query_gap_bound(uint64_t addr, uint64_t start, uint64_t end, uint64_
 
 static void query_external_gap(uint64_t addr, uint64_t stack_lo, uint64_t stack_hi, const module_t *inactive,
                                uint64_t *base, uint64_t *size) {
-    uint64_t lo = 0, hi = MACH_VM_MAX_ADDRESS;
+    uint64_t lo = 0, hi = VM_MAX_ADDR;
     uint64_t guest = (uintptr_t)g_as;
     query_gap_bound(addr, guest, guest + g_reserve, &lo, &hi);
     query_gap_bound(addr, stack_lo, stack_hi, &lo, &hi);
@@ -774,12 +826,16 @@ static _Thread_local uint64_t t_rgn_size, t_rgn_via; static _Thread_local char t
 // Where a request at an sdk function's entry gate returns to in the game: buf gets "main+0x…", *via the outermost sdk return address on the way (0 = none)
 static void guest_caller(const uint64_t *r, char *buf, size_t n, uint64_t *via) {
     // at the function's entry the return address is the x30 the gate block pushed (at the block's sp, regs[99]: x29, x30; entry.S), x30 itself holds the gate's own
+#if DM_NATIVE_EXEC
     uint64_t lr = ((const uint64_t *)(uintptr_t)r[99])[1], fp = r[29]; module_t *m = module_of((void *)(uintptr_t)lr);
+#else
+    uint64_t lr = r[30], fp = r[29]; module_t *m = module_of((void *)(uintptr_t)lr);   // x86-64 engine: r is the state block, whose x30 is the caller's (design 2.4)
+#endif
     *via = 0;
     for (int i = 0; i < 32 && m && !strcmp(m->name, "sdk"); i++) {
         *via = lr - (uint64_t)(uintptr_t)m->base;   // AArch64 frame records: [fp] = the caller's fp, [fp + 8] = its return address
-        uint64_t rec[2]; vm_size_t got = 0;   // read safely: static constructors run on the host's main thread, whose stack is outside the guest block
-        if (!fp || (fp & 15) || vm_read_overwrite(mach_task_self(), (vm_address_t)fp, sizeof rec, (vm_address_t)rec, &got) || got != sizeof rec) break;
+        uint64_t rec[2]; size_t got = 0;   // read safely: static constructors run on the host's main thread, whose stack is outside the guest block
+        if (!fp || (fp & 15) || plat_mem_read(fp, rec, sizeof rec, &got) || got != sizeof rec) break;
         lr = rec[1]; fp = rec[0]; m = module_of((void *)(uintptr_t)lr);
     }
     if (m) snprintf(buf, n, "%s+%#llx", m->name, (unsigned long long)(lr - (uint64_t)(uintptr_t)m->base));
@@ -879,7 +935,7 @@ static void bits_span(const uint64_t *b, uint64_t lo, uint64_t hi, int64_t *firs
 // the sdk offset it came through
 static void *regions_thread(void *arg) {
     const char *path = arg; char tmp[1024]; snprintf(tmp, sizeof tmp, "%s.partial", path);
-    uint64_t hpg = (uint64_t)getpagesize();
+    uint64_t hpg = (uint64_t)plat_page_size();
     for (;;) {
         FILE *f = fopen(tmp, "w");
         if (f) {
@@ -904,6 +960,10 @@ static void *regions_thread(void *arg) {
 }
 
 int svc_thread(int num, uint64_t *regs);   // hle_thread.c: thread and synchronization kind
+#if !DM_NATIVE_EXEC
+static uint64_t g_user_exc;   // GetInfo UserExceptionContextAddress: a page of the arena (x86-64 engine)
+static void user_exc_alloc(void) { g_user_exc = (uint64_t)(uintptr_t)dm_guest_alloc(0x1000); }
+#endif
 
 uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
     { void hlecount_svc(int); hlecount_svc(num); }   // DM_HLECOUNT: svc counts by number
@@ -927,11 +987,15 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
             pthread_mutex_unlock(&g_map_lock); regs[0] = 0x10801; return 0;
         }
         int rc = 0;
-        if (size > g_heap_cur) rc = mprotect(g_heap + g_heap_cur, size - g_heap_cur, PROT_READ | PROT_WRITE);
-        else if (size < g_heap_cur) (void)guest_release((uintptr_t)g_heap + size, (uintptr_t)g_heap + g_heap_cur, 0);
+        if (size > g_heap_cur) rc = plat_vm_protect(g_heap + g_heap_cur, size - g_heap_cur, PLAT_PROT_READ | PLAT_PROT_WRITE);
+        else if (size < g_heap_cur) (void)guest_release((uintptr_t)g_heap + size, (uintptr_t)g_heap + g_heap_cur, 0);   // the x86-64 engine's releases the backend's import first (be_guest_unmap)
         if (rc) die("SetHeapSize mprotect failed: req=%#zx errno=%d", size, errno);
+#if !DM_NATIVE_EXEC
+        if (size > g_heap_cur) be_guest_map(g_heap + g_heap_cur, size - g_heap_cur);   // the heap grew
+#endif
         // With the guest in files a heap given back kept its old bytes (guest_release): one that grows back over them reads 0 there, as the fresh mapping reads without the files
-        if (size > g_heap_cur && g_heap_seen > g_heap_cur && g_gf_n) guest_zero(g_heap + g_heap_cur, (size < g_heap_seen ? size : g_heap_seen) - g_heap_cur);
+        // The x86-64 engine's release (plat_vm_discard: MADV_FREE on Linux) may leave the old bytes too, so a heap growing back over them is zeroed there as well
+        if (size > g_heap_cur && g_heap_seen > g_heap_cur && (g_gf_n || !DM_NATIVE_EXEC)) guest_zero(g_heap + g_heap_cur, (size < g_heap_seen ? size : g_heap_seen) - g_heap_cur);
         if (size > g_heap_seen) g_heap_seen = size;
         if (g_flag.svc) LOG("SetHeapSize %#zx -> base %p mprotect=%d errno=%d", size, g_heap, rc, errno);
         else if (size > g_heap_cur) LOG("[mem] heap %.2f GB (heap region %.2f GB)", size / 1073741824.0, g_heap_cap / 1073741824.0);
@@ -955,10 +1019,13 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         else if (g_nmap == MAX_MAP) result = 0xCE01;
         if (result) { pthread_mutex_unlock(&g_map_lock); regs[0] = result; LOG("[RED] MapMemory refused (%#x): %#llx <- %#llx +%#llx", result, (unsigned long long)dst, (unsigned long long)src, (unsigned long long)size); return 0; }
         // Apple pages are 16K, Horizon pages 4K: the accessible region is extended to a 16K boundary (the extra pages opened are unused pages of the same region, semantics unaffected)
-        uint64_t mask = (size_t)getpagesize() - 1;
+        uint64_t mask = (size_t)plat_page_size() - 1;
         uint64_t lo = dst & ~mask, hi = (dst + size + mask) & ~mask;
-        if (mprotect((void *)lo, hi - lo, PROT_READ | PROT_WRITE)) die("MapMemory mprotect errno=%d", errno);
+        if (plat_vm_protect((void *)lo, hi - lo, PLAT_PROT_READ | PLAT_PROT_WRITE)) die("MapMemory mprotect errno=%d", errno);
         dm_guest_write_prepare((void *)lo, hi - lo);
+#if !DM_NATIVE_EXEC
+        be_guest_map((void *)lo, hi - lo);   // the destination is committed (UnmapMemory gives its whole pages back through guest_release, which calls be_guest_unmap first)
+#endif
         memcpy((void *)dst, (void *)src, size);   // move semantics: the source region is not accessed while mapped (Horizon makes it inaccessible)
         map_add(dst, size, src, 0x0B /*MappedMemory*/);
         pthread_mutex_unlock(&g_map_lock);
@@ -980,7 +1047,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         // Random stack addresses leave dirty pages throughout the region. Reclaim whole anonymous host pages and preserve any 4 KiB neighbors
         // sharing an edge page. MapMemory reopens reclaimed pages. File-backed stacks retain their backing.
         if (!g_gf_n) {
-            uintptr_t mask = (size_t)getpagesize() - 1;
+            uintptr_t mask = (size_t)plat_page_size() - 1;
             uintptr_t release_lo = (dst + mask) & ~mask, release_hi = (dst + size) & ~mask;
             if (release_hi > release_lo) (void)guest_release(release_lo, release_hi, 0);
         }
@@ -1019,7 +1086,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
             dm_exl_view_remove(dst, src, size);   // sync before removing the mapping so no concurrent map can reuse dst first
             map_del(k - 1);
             if (!g_gf_n) {
-                uintptr_t mask = (size_t)getpagesize() - 1;
+                uintptr_t mask = (size_t)plat_page_size() - 1;
                 uintptr_t release_lo = (dst + mask) & ~mask, release_hi = (dst + size) & ~mask;
                 if (release_hi > release_lo) (void)guest_release(release_lo, release_hi, 0);
             }
@@ -1028,9 +1095,12 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         }
         if (k) { pthread_mutex_unlock(&g_map_lock); regs[0] = 0xD401; return 0; }
         if (g_nmap == MAX_MAP) { pthread_mutex_unlock(&g_map_lock); regs[0] = 0xCE01; return 0; }
-        uint64_t mask = (size_t)getpagesize() - 1, lo = dst & ~mask, hi = (dst + size + mask) & ~mask;
-        if (mprotect((void *)lo, hi - lo, PROT_READ | PROT_WRITE)) die("MapProcessMemory mprotect errno=%d", errno);
+        uint64_t mask = (size_t)plat_page_size() - 1, lo = dst & ~mask, hi = (dst + size + mask) & ~mask;
+        if (plat_vm_protect((void *)lo, hi - lo, PLAT_PROT_READ | PLAT_PROT_WRITE)) die("MapProcessMemory mprotect errno=%d", errno);
         dm_guest_write_prepare((void *)lo, hi - lo);
+#if !DM_NATIVE_EXEC
+        be_guest_map((void *)lo, hi - lo);   // the view's pages are committed (guest_release lets the backend go of them)
+#endif
         memcpy((void *)dst, (void *)src, size);
         if (dm_exl_view_add(dst, src, size)) {
             if (!g_gf_n) {
@@ -1103,14 +1173,19 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
                 base = mb + lo; size = hi - lo;
             }
         }
-        else if (addr >= MACH_VM_MAX_ADDRESS) {
+        else if (addr >= VM_MAX_ADDR) {
             // Horizon describes addresses past the process limit with a reserved block whose end wraps to zero.
-            base = MACH_VM_MAX_ADDRESS; size = 0 - base; state = 0x10; perm = 0;
+            base = VM_MAX_ADDR; size = 0 - base; state = 0x10; perm = 0;
         } else {
             // The address lies in "the current host thread's stack": report the whole stack (state 0xB = stack). When the SDK initializes the main thread record it queries here with the sp at that moment and takes the reported range as the main thread stack;
             // later nn::os::GetCurrentStackInfo asserts that sp is still inside that range and aborts if not. Previously every address outside the guest address space was reported as "the 4 KiB page containing it",
             // so the main thread stack was recorded as one page. Whether the sp at init and a later sp share a page depends on the absolute position of the host stack top, which moves with the total length of environment variables / launch arguments (a different environment occasionally aborts at startup).
-            uint64_t top = (uintptr_t)pthread_get_stackaddr_np(pthread_self()), ssz = pthread_get_stacksize_np(pthread_self());
+#if DM_NATIVE_EXEC
+            uint64_t top = 0, ssz = 0; plat_thread_stack(&top, &ssz);
+#else
+            // x86-64 engine: the guest stack the host made for the calling thread (the main thread's, in the arena); its native stack is no guest memory
+            uint64_t top = 0, ssz = 0, slo = 0; if (dm_aot_main_stack(&slo, &ssz)) top = slo + ssz;
+#endif
             uint64_t bottom = top - ssz;
             if (addr < top && addr >= bottom) { base = bottom; size = ssz; state = 0xB/*Stack*/; perm = 3; }
             else { query_external_gap(addr, bottom, top, mm, &base, &size); state = 0/*Free*/; perm = 0; }
@@ -1127,7 +1202,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
     }
     case 0x13: case 0x14: {  // MapSharedMemory / UnmapSharedMemory: immutable service data, in free alias pages
         const hle_readonly_shmem *memory = hle_get_readonly_shmem((uint32_t)regs[0]);
-        uintptr_t addr = regs[1]; size_t size = regs[2], pg = (size_t)getpagesize();
+        uintptr_t addr = regs[1]; size_t size = regs[2], pg = (size_t)plat_page_size();
         if (!memory) { regs[0] = 0xe401u; return 0; }
         if (addr & (pg - 1)) { regs[0] = 0xcc01u; return 0; }
         if (size != memory->size || !size || (size & (pg - 1))) { regs[0] = 0xca01u; return 0; }
@@ -1138,10 +1213,13 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         uint32_t result = 0xd401u;
         if (num == 0x13 && !k && g_nmap < MAX_MAP && alias_unmapped(addr - (uintptr_t)g_alias, size) == (int64_t)(size / 4096)) {
             void *dst = (void *)addr;
-            if (mprotect(dst, size, PROT_READ | PROT_WRITE)) die("MapSharedMemory writable mapping: errno=%d", errno);
+            if (plat_vm_protect(dst, size, PLAT_PROT_READ | PLAT_PROT_WRITE)) die("MapSharedMemory writable mapping: errno=%d", errno);
+#if !DM_NATIVE_EXEC
+            be_guest_map(dst, size);   // committed (UnmapSharedMemory's guest_release lets the backend go of it)
+#endif
             dm_guest_write_prepare(dst, size);
             memcpy(dst, memory->bytes, size);
-            if (mprotect(dst, size, PROT_READ)) die("MapSharedMemory read-only protection: errno=%d", errno);
+            if (plat_vm_protect(dst, size, PLAT_PROT_READ)) die("MapSharedMemory read-only protection: errno=%d", errno);
             if (g_gf_n) {
                 size_t first = (addr - (uintptr_t)g_alias) / pg;
                 for (size_t i = first; i < first + size / pg; ++i) {
@@ -1196,7 +1274,7 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         }
         // Host pages are 16 KB, Horizon pages 4 KB: a map is rounded out to host pages (the extra neighboring 4K pages are inside the alias region and merely become writable early, harmless);
         // An edge host page is reclaimed only when no live logical neighbor remains.
-        uintptr_t pg = (uintptr_t)getpagesize(), lo = (uintptr_t)a, hi = (uintptr_t)a + size;
+        uintptr_t pg = (uintptr_t)plat_page_size(), lo = (uintptr_t)a, hi = (uintptr_t)a + size;
         uintptr_t mlo = lo & ~(pg - 1), mhi = (hi + pg - 1) & ~(pg - 1);
         int commit = num == 0x2C;
         int64_t changed = commit ? need : (int64_t)size - need;
@@ -1206,9 +1284,12 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         }
         if (changed && mhi > mlo) {
             if (commit) {
-                if (mprotect((void *)mlo, mhi - mlo, PROT_READ | PROT_WRITE))
+                if (plat_vm_protect((void *)mlo, mhi - mlo, PLAT_PROT_READ | PLAT_PROT_WRITE))
                     die("SVC %#x mprotect %p+%#zx errno=%d", num, (void *)a, size, errno);
                 dm_guest_write_prepare((void *)mlo, mhi - mlo);
+#if !DM_NATIVE_EXEC
+                be_guest_map((void *)mlo, mhi - mlo);   // the host pages committed above (guest_release below lets the backend go of them first)
+#endif
                 if (g_gf_n) for (uint64_t h = (mlo - (uintptr_t)g_alias) / pg, e = (mhi - (uintptr_t)g_alias) / pg; h < e; h++) {   // in use again: not to be punched
                     uint64_t m = ~(UINT64_C(1) << (h & 63)); g_alias_rel[h >> 6] &= m; g_alias_aged[h >> 6] &= m; }
             } else if (guest_release(mlo, mhi, 1)) {   // fresh zero pages: alias_initialize has nothing to clear when they are mapped again
@@ -1282,7 +1363,11 @@ uint64_t svc_dispatch(int num, uint64_t *regs, uint64_t orig_addr) {
         // 96 threads (pm_spec.cpp BaseApplicationThreads; a boost raises it to 256). Monster Train 2's Unity 2022.3 player creates a thread only when this is at least 1: the 0 it got here
         // left its main thread waiting at boot for a thread it never created (main+0x3e1ac4)
         case I_FreeThreadCount: { int thr_limit_used(void); int u = thr_limit_used(); v = u < 96 ? 96 - u : 0; break; }
+#if DM_NATIVE_EXEC
         case I_UserExcAddr: { static _Alignas(0x1000) uint8_t ctx[0x1000]; v = (uint64_t)ctx; break; }   // user exception context area: newer SDKs' SetDyingMessageRegion writes to +0x1c0 (0 would write through a null pointer)
+#else
+        case I_UserExcAddr: { static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, user_exc_alloc); v = g_user_exc; break; }   // the same area, in the arena (x86-64 engine)
+#endif
         // The kernel's page size (Switch 2 SDKs): nn::ro::ProtectRelro takes it as the alignment of the RELRO bounds (value − 1 as a mask, 0 aborts), the VammManager maps that much up front.
         // Horizon's pages are 4 KB, the alignment of every module's segments (Donkey Kong Bananza)
         case I_PageSize: v = 0x1000; break;

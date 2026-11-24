@@ -3,33 +3,66 @@
 // section stores it as a mutex's owner and compares it in IsLockedByCurrentThread, where SDK 16 compared the object pointer). Here each thread gets a zero-initialized object allocated and
 // written in, and its ID once the thread table has one (guest_thread_set_id)
 #include "dm.h"
+#if DM_NATIVE_EXEC
 #include <sys/mman.h>
+#endif
 #define TLS_SIZE 8192
 #define TLR_SIZE 0x200
 #define THREAD_OBJ_SIZE 0x400
+#if !DM_NATIVE_EXEC
+// The x86-64 execution engine (aot.h): the TLS block and the thread-local region are guest memory in its arena below 2^39 (design 5.2), and the thread's
+// state block holds them as tpidr_el0 / tpidrro_el0 (2.4), which recompiled code and the JIT read; the TSD slots are the Apple rewriter's scheme
+void *dm_guest_alloc(size_t n);
+void dm_guest_free(void *p, size_t n);
+void dm_aot_set_tls(uint64_t tpidr_el0, uint64_t tpidrro_el0);
+#endif
 static pthread_key_t g_keyown;   // raw pointers of the TLS block / thread-local region this thread allocated (see the end of guest_thread_init)
 static pthread_once_t g_keyown_once = PTHREAD_ONCE_INIT;
+#if DM_NATIVE_EXEC
 static void own_free(void *p) { void **own = p; free(own[0]); free(own[1]); free(own); }
+#else
+static void own_free(void *p) { void **own = p; dm_guest_free(own[0], TLS_SIZE); dm_guest_free(own[1], TLR_SIZE + THREAD_OBJ_SIZE); free(own); }
+#endif
 static void own_key_init(void) { if (pthread_key_create(&g_keyown, own_free)) die("cannot create the free key for thread-local blocks"); }
 void guest_thread_init(void) {
+#if DM_NATIVE_EXEC
     pthread_setspecific(g_key18, 0);
+#endif
     // The TLS block and the thread-local region are freed when the thread exits. The guest overwrites the slots of the TLS / thread-local-region keys (it sets its own thread pointer), so they cannot be freed by the current value in the key:
     // the raw pointers that were allocated are recorded separately on this file's own key g_keyown and freed by its destructor (key destructors run at pthread_exit, like crash.c's signal alternate stack; the destructor only calls free, which is safe on a guest thread's small stack too).
     // They used not to be freed: every short-lived thread the game started leaked 8192 + 0x200 + 0x400 = 9728 bytes. The thread-local region and the current thread object are one block (the SDK may also overwrite the TLR[0x1f8] slot)
     pthread_once(&g_keyown_once, own_key_init);
+#if DM_NATIVE_EXEC
     void **own = calloc(2, sizeof *own); uint8_t *tlr = calloc(1, TLR_SIZE + THREAD_OBJ_SIZE);
+#else
+    void **own = calloc(2, sizeof *own); uint8_t *tlr = dm_guest_alloc(TLR_SIZE + THREAD_OBJ_SIZE);   // zero, as calloc's
+#endif
     if (!own || !tlr) die("guest thread-local block allocation failed");
+#if DM_NATIVE_EXEC
     own[0] = calloc(1, TLS_SIZE); own[1] = tlr;
+#else
+    own[0] = dm_guest_alloc(TLS_SIZE); own[1] = tlr;
+#endif
     if (!own[0]) die("guest thread TLS block allocation failed");
     *(void **)(tlr + 0x1f8) = tlr + TLR_SIZE;               // current thread object
+#if DM_NATIVE_EXEC
     pthread_setspecific(g_keytls, own[0]); pthread_setspecific(g_keytlr, tlr);
+#else
+    dm_aot_set_tls((uint64_t)(uintptr_t)own[0], (uint64_t)(uintptr_t)tlr);   // into the calling thread's state block (aot_thread.c)
+#endif
     void **prev = pthread_getspecific(g_keyown); if (prev) own_free(prev);   // re-initialised on the same thread: free the previous set first (the new one is what the slots now point to)
     pthread_setspecific(g_keyown, own);
 }
 // The thread's kernel ID at TLR[0x110], the one svcGetThreadId answers (hle_thread.c's thr_t id, never 0: 0 is the owner word of an unlocked mutex). Without it every
 // unlocked SDK 22 mutex reads as the caller's and the first heap lock aborts (docs/reference/threads.md)
+#if DM_NATIVE_EXEC
 void guest_thread_set_id(uint64_t id) { *(uint32_t *)((uint8_t *)pthread_getspecific(g_keytlr) + 0x110) = (uint32_t)id; }
+#else
+// The x86-64 engine keeps the TLR in the thread's state block (tpidrro_el0, read-only to the guest): the block guest_thread_init gave it (own[1])
+void guest_thread_set_id(uint64_t id) { void **own = pthread_getspecific(g_keyown); *(uint32_t *)((uint8_t *)own[1] + 0x110) = (uint32_t)id; }
+#endif
 
+#if DM_NATIVE_EXEC
 // Gate stacks (entry.S dm_gate): the SVC gate's register frame and the host's SVC handlers run on a stack of the thread's own, never below the guest's sp, as on Horizon, whose kernel leaves a
 // thread's stack untouched during an SVC. Each thread holds a gate slot k: its KGATE slot points to entry.S stub k, which loads dm_gate_top[k]. A guest thread (hle_thread.c thread_main) runs
 // its guest code on the guest stack the SDK gave it, so its gate stack is the rest of its own pthread stack (1 MB), below thread_main's frame: it lives exactly as long as the thread, which
@@ -73,3 +106,7 @@ __attribute__((noinline)) void guest_gate_stack(int own_stack) {
     dm_gate_top[k] = (uint64_t)(uintptr_t)top & ~15ull;
     pthread_setspecific(g_keygate, (void *)(dm_gate_stubs + 16 * k));
 }
+#else
+// No SVC gate without native execution: the x86-64 engine calls the SVC handlers as host code on the host thread's own stack, so a thread has no gate stack to set
+void guest_gate_stack(int own_stack) { (void)own_stack; }
+#endif

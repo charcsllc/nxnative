@@ -15,10 +15,12 @@ import functools
 import io
 import mmap as _mmap
 import os as _os
+import re as _re
 from pathlib import Path as _Path
 import stat as _stat
 import struct
 import sys
+import threading
 from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
@@ -119,10 +121,10 @@ def reuse_descriptors(roots):
 
 def _resolve(path):
     p = _os.path.abspath(_os.fsdecode(path))
-    parts = p.split('/')
+    parts = p.split('/') if _os.altsep is None else _re.split(r'[\\/]', p)   # Windows paths hold either separator; the image's path is joined with the native one
     for i, part in enumerate(parts):
         if not part.endswith('.img'): continue
-        image = '/'.join(parts[:i + 1])
+        image = _os.sep.join(parts[:i + 1])
         try: st = _os.stat(image)
         except OSError: continue
         if not _stat.S_ISREG(st.st_mode): continue
@@ -137,13 +139,26 @@ def source(extraction):
 
 
 _fd_ranges = {}
+# Reads at an offset: os.pread on POSIX; Windows has none, so there a read seeks the descriptor first, under the file's lock (a reader shared between threads
+# then cannot move another read's position between its seek and its read). O_BINARY: Windows opens descriptors in text mode otherwise (CR LF and ^Z translated)
+_pread = getattr(_os, 'pread', None)
+_O_BINARY = getattr(_os, 'O_BINARY', 0)
+
+
+def _read_at(fd, size, offset, lock):
+    if _pread is not None: return _pread(fd, size, offset)
+    with lock:
+        _os.lseek(fd, offset, _os.SEEK_SET)
+        return _os.read(fd, size)
 
 
 class _File(io.RawIOBase):
     def __init__(self, image, k):
         descriptors = _scan_descriptors.get()
-        backing = descriptors.get(image.path) if descriptors is not None else None
-        self.fd = _os.dup(backing[1]) if backing is not None and backing[0] == _identity(image.stat) else _os.open(image.path, _os.O_RDONLY)
+        # a duplicate shares its file position with the backing descriptor, so it is taken only where reads give their offset (pread); on Windows each reader opens its own
+        backing = descriptors.get(image.path) if descriptors is not None and _pread is not None else None
+        self.fd = _os.dup(backing[1]) if backing is not None and backing[0] == _identity(image.stat) else _os.open(image.path, _os.O_RDONLY | _O_BINARY)
+        self.lock = threading.Lock()
         self.start, self.length = image.entry(k)[:2]
         self.pos = 0
         _fd_ranges[self.fd] = (self.start, self.length)
@@ -157,7 +172,7 @@ class _File(io.RawIOBase):
         self.pos = pos; return pos
     def readinto(self, buffer):
         size = min(len(buffer), max(0, self.length - self.pos))
-        data = _os.pread(self.fd, size, self.start + self.pos)
+        data = _read_at(self.fd, size, self.start + self.pos, self.lock)
         buffer[:len(data)] = data; self.pos += len(data)
         return len(data)
     def close(self):

@@ -1,0 +1,933 @@
+# The portable host for Linux and Windows (x86-64): the host's portable sources as a static library, libvpx, and the host unit tests that run without native ARM64
+# execution or an Apple frontend, registered with CTest. Apple builds keep using the Makefiles (make -C dm/host, make -C dm/host/tests). docker/README.md has the commands.
+#   cmake -S dm/host -B build/linux -G Ninja -DGAME=<base game title ID>
+# Windows: the same with -DCMAKE_TOOLCHAIN_FILE=<absolute path of dm/host/cmake/x86_64-w64-mingw32.cmake> (llvm-mingw; a relative path is taken from the build folder first, then from
+# dm/host). The test .exe files then run on a Windows PC: dm/host/tests/run_win64_tests.ps1 (PowerShell) or dm/host/tests/run_host_tests.sh (Git Bash) read the list this file writes
+# (<build folder>/host_tests.tsv) and record a log per test in logs/<platform>/ (logs/README.md). CTest runs the same tests where the tree was configured (Linux, Docker)
+cmake_minimum_required(VERSION 3.20)
+project(nxnative_host C)
+
+set(GAME "" CACHE STRING "game profile (dm/games/<base game title ID>): the profile the host starts with when nxhost-run is not told another (--profile, --game)")
+set(REPO ${CMAKE_CURRENT_SOURCE_DIR}/../..)
+cmake_path(NORMAL_PATH REPO)
+find_package(Python3 REQUIRED COMPONENTS Interpreter)
+if(NOT GAME)   # there is no default game: name the profiles, as the Makefile does
+    execute_process(COMMAND ${Python3_EXECUTABLE} ${REPO}/dm/games/game.py list OUTPUT_VARIABLE profiles)
+    message(FATAL_ERROR "GAME is not set: cmake -DGAME=<base game title ID>. Profiles:\n${profiles}")
+endif()
+if(NOT CMAKE_SYSTEM_PROCESSOR MATCHES "^(x86_64|AMD64|amd64)$")
+    message(FATAL_ERROR "the CMake host build targets x86-64 Linux and Windows (got ${CMAKE_SYSTEM_PROCESSOR}); Apple arm64 builds use dm/host/Makefile")
+endif()
+if(APPLE)
+    message(FATAL_ERROR "Apple builds use dm/host/Makefile and dm/host/tests/Makefile")
+endif()
+
+# ---- The game profile: read at run time, so one nxhost-run serves every profile (dm/host/game_rt.c) ----
+# Apple's Makefiles compile a host for one profile (game.py header <id>: each DM_GAME_* a constant). Here game.py header --runtime writes game_profile.h's runtime form, the
+# same for every profile (each DM_GAME_* a read of dm_game's field; DM_GAME_RUNTIME marks the port's code), and game.py table the table of every profile in dm/games with
+# dm_game initialised to GAME's row: the default, so every program and test that is not told another profile runs as a host built for GAME did. nxhost-run picks another at
+# start with --profile <file> (game.py runtime <id> <file>; DM_GAME_PROFILE=<file>) or --game <title ID>. Nothing else in the tree depends on GAME: two trees configured with
+# different GAMEs build the same programs except for gen/profile/game_profiles.c's default row. GAME's folder is found as game.py finds it, now: a profile outside dm/games
+# (DM_GAMES_DIR, DM_GAMES_FIRST at configure time) becomes a row of its own in the table. nxprofile is the generated table and game_rt.c, linked by everything that includes
+# game_profile.h (nxhost and the libraries it links, the PROFILE tests)
+execute_process(COMMAND ${Python3_EXECUTABLE} ${REPO}/dm/games/game.py dir ${GAME} OUTPUT_VARIABLE GAME_DIR ERROR_VARIABLE game_err RESULT_VARIABLE game_rc OUTPUT_STRIP_TRAILING_WHITESPACE)
+if(game_rc)
+    message(FATAL_ERROR "GAME=${GAME}: ${game_err}")
+endif()
+set(GEN ${CMAKE_BINARY_DIR}/gen/profile)
+set(GAME_H ${GEN}/game_profile.h)
+set(GAME_TABLE_C ${GEN}/game_profiles.c)
+file(GLOB GAME_TSVS CONFIGURE_DEPENDS ${REPO}/dm/games/*/game.tsv)
+# The shader maps too: a constant comes from them (game.py upscaler_keys: DM_GAME_UPSCALER_KEYS, the game's own upscaler shaders)
+file(GLOB GAME_MAPS CONFIGURE_DEPENDS ${REPO}/dm/games/*/shader_map.tsv)
+add_custom_command(OUTPUT ${GAME_H} ${GAME_TABLE_C}
+    COMMAND ${Python3_EXECUTABLE} ${REPO}/dm/games/game.py header --runtime ${GAME_H}
+    COMMAND ${Python3_EXECUTABLE} ${REPO}/dm/games/game.py table ${GAME_TABLE_C} ${GAME_DIR}
+    DEPENDS ${REPO}/dm/games/game.py ${GAME_TSVS} ${GAME_MAPS} ${GAME_DIR}/game.tsv
+    COMMENT "game profiles: game_profile.h's runtime form and the table of every profile (default ${GAME})" VERBATIM)
+add_custom_target(game_profile DEPENDS ${GAME_H} ${GAME_TABLE_C})
+
+# ---- Compiler settings ----
+set(CMAKE_C_STANDARD 17)
+set(CMAKE_C_EXTENSIONS ON)   # GNU C, as on Apple: ?:, typeof, statement expressions
+# The host's own C at -O2 (Apple's Makefiles keep -O1, chosen with the first Mac host and never measured): measured on 2026-11-14 with clang 18 in nxnative-build, each level's
+# tree built alone and the benchmark modes of docker/README.md ("Optimisation level") run interleaved, medians of seven runs. Against -O1, -O2 decodes ASTC on the CPU 19 to 26%
+# faster (every block size, 1024 x 1024), deswizzles 18 to 19% faster (2048 x 2048 RGBA8, RGBA16F) and applies the output volume 20% faster; the replay's CPU time per draw, the
+# execution engine's guest calls, gates, host calls and dispatcher lookups and the descriptor benchmark do not move beyond noise. -O3 adds nothing measurable over -O2 except
+# the CPU index conversion, a fallback past the GPU path's limit (15% faster), and nxhost-run grows 0.5% at -O2, 1.6% at -O3. The same check counts and CTest totals at every
+# level. -g stays, for a debugger. The crash report (aot_fault.c) names guest code through the packs' line tables and walks the guest's x29 chain, which the host's level
+# does not touch; host code it names by the nearest exported symbol (dladdr), which more inlining at -O2 can make the caller's. Frame pointers are omitted at -O1 already.
+# -DHOST_OPT=<flags> (a list: "-O1;-fno-inline") builds another level for a measurement
+set(HOST_OPT -O2 CACHE STRING "optimisation flags of the host's own C (HOST_FLAGS); a list")
+set(HOST_FLAGS ${HOST_OPT} -g -Wall -Wno-unused-function)
+if(WIN32)
+    # Windows 10 1803+ (VirtualAlloc2 / high-resolution waitable timers era); 64-bit file offsets for game files over 2 GB
+    # _POSIX_THREAD_SAFE_FUNCTIONS: mingw-w64's localtime_r / gmtime_r
+    set(PLAT_DEFS _WIN32_WINNT=0x0A00 WINVER=0x0A00 _FILE_OFFSET_BITS=64 __USE_MINGW_ANSI_STDIO=0 _POSIX_THREAD_SAFE_FUNCTIONS=200112L)
+    set(PLAT_SRC plat/plat_win32.c plat/sha256.c)
+    set(PLAT_LIBS pthread bcrypt)   # pthread: mingw-w64's winpthreads
+    add_link_options(-static)   # winpthreads and the C++-free runtime linked in: the test .exe files run on a stock Windows
+    # The application manifest, in every executable (host_test below; a host executable target takes it the same way): the process ANSI code page is UTF-8, so the C runtime's narrow
+    # file calls and getenv agree with the platform layer's UTF-8 paths and a non-ASCII guest name (a Japanese save file) is one name on disk (plat/win32_utf8.manifest, plat_win32.c).
+    # A resource in a static library is never linked in (nothing references it), so it is a source of each executable
+    enable_language(RC)
+    set(WIN32_MANIFEST_RC ${CMAKE_CURRENT_SOURCE_DIR}/plat/win32_utf8.rc)
+    set_source_files_properties(${WIN32_MANIFEST_RC} PROPERTIES OBJECT_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/plat/win32_utf8.manifest)
+else()
+    set(PLAT_DEFS _GNU_SOURCE)
+    set(PLAT_SRC plat/plat_linux.c plat/sha256.c)
+    set(PLAT_LIBS pthread dl m)
+    # The host prints uint64_t with %llx / %llu (Apple's uint64_t is unsigned long long); glibc's is unsigned long, the same width, which -Wformat reports at every log line
+    list(APPEND HOST_FLAGS -Wno-format)
+endif()
+
+# ---- The platform layer ----
+add_library(nxplat STATIC ${PLAT_SRC})
+target_compile_options(nxplat PRIVATE ${HOST_FLAGS})
+target_compile_definitions(nxplat PUBLIC ${PLAT_DEFS})
+target_include_directories(nxplat PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
+target_link_libraries(nxplat PUBLIC ${PLAT_LIBS})
+
+# ---- The game profile of a run: the generated table and its loader (game_rt.c; "The game profile" above) ----
+add_library(nxprofile STATIC ${GAME_TABLE_C} game_rt.c)
+add_dependencies(nxprofile game_profile)
+target_compile_options(nxprofile PRIVATE ${HOST_FLAGS})
+target_include_directories(nxprofile PUBLIC ${GEN})
+target_link_libraries(nxprofile PUBLIC nxplat)
+
+# ---- libvpx: the VP8 / VP9 decoders, C only (config/generic: no NEON, no x86 assembly) ----
+set(VPX ${REPO}/dm/third_party/libvpx)
+file(GLOB_RECURSE VPX_SRC CONFIGURE_DEPENDS ${VPX}/*.c)
+list(FILTER VPX_SRC EXCLUDE REGEX "/arm/|aarch64_cpudetect")
+add_library(vpx STATIC ${VPX_SRC})
+target_include_directories(vpx PUBLIC ${VPX} ${VPX}/config/generic)
+target_compile_options(vpx PRIVATE -O2 -w)
+if(NOT WIN32)
+    target_link_libraries(vpx PUBLIC pthread m)
+endif()
+
+# ---- SDL3: the Linux and Windows front end (front_sdl.c: window, keyboard, mouse, controllers, motion, rumble) and audio output (hle_audio.c) ----
+# Pinned by release tag and the commit it names (docker/README.md has the version, its date and why). A shallow clone of the tag; the commit is checked after it, so a moved tag
+# stops the configure step. Offline: -DFETCHCONTENT_SOURCE_DIR_SDL3=<a copy of that release> builds from the copy instead (not downloaded; its commit is checked when it is a git checkout).
+# A static library with only what the host uses: video (with the dummy driver the tests run on, X11 and Wayland, Windows), the software renderer for the progress screen, Vulkan
+# surfaces, events, joystick and gamepad (HIDAPI for the PlayStation, Switch and Xbox controllers' gyro and rumble), haptic, sensor (the gyro of PC handhelds whose controller has
+# none of its own), audio (PipeWire, PulseAudio, ALSA, WASAPI, the dummy driver) and the file dialogs of the launcher's Add game and Browse... (dm/launcher: the Windows dialogs;
+# on Linux the XDG desktop portal over D-Bus, else zenity; nxhost-run calls none of it). The Linux libraries are loaded at run time with dlopen (SDL_DEPS_SHARED), so a PC
+# without one of them still starts: that driver is skipped
+set(SDL3_TAG release-3.4.14)
+set(SDL3_COMMIT 147a8ee32dbf9ac02f3794964490687b6bbda1bc)
+if(WIN32)
+    enable_language(CXX)   # SDL's Windows core has C++ sources (GameInput), so the programs that link it link as C++; the language is enabled here, above every target that links SDL
+endif()
+include(FetchContent)
+FetchContent_Declare(SDL3 GIT_REPOSITORY https://github.com/libsdl-org/SDL.git GIT_TAG ${SDL3_TAG} GIT_SHALLOW TRUE)
+foreach(opt SDL_SHARED SDL_TEST_LIBRARY SDL_TESTS SDL_EXAMPLES SDL_INSTALL SDL_UNINSTALL SDL_GPU SDL_CAMERA SDL_POWER SDL_TRAY
+            SDL_OPENGL SDL_OPENGLES SDL_RENDER_VULKAN SDL_RENDER_D3D SDL_RENDER_D3D11 SDL_RENDER_D3D12 SDL_KMSDRM SDL_OFFSCREEN SDL_DISKAUDIO
+            SDL_JACK SDL_SNDIO SDL_OSS SDL_FRIBIDI SDL_LIBTHAI SDL_LIBURING SDL_HIDAPI_LIBUSB)
+    set(${opt} OFF)
+endforeach()
+foreach(opt SDL_STATIC SDL_VIDEO SDL_RENDER SDL_VULKAN SDL_AUDIO SDL_JOYSTICK SDL_HAPTIC SDL_HIDAPI SDL_SENSOR SDL_DUMMYVIDEO SDL_DUMMYAUDIO SDL_VIRTUAL_JOYSTICK SDL_DIALOG)
+    set(${opt} ON)
+endforeach()
+FetchContent_MakeAvailable(SDL3)
+if(NOT FETCHCONTENT_SOURCE_DIR_SDL3 OR EXISTS ${sdl3_SOURCE_DIR}/.git)
+    find_package(Git REQUIRED)
+    execute_process(COMMAND ${GIT_EXECUTABLE} -C ${sdl3_SOURCE_DIR} rev-parse HEAD OUTPUT_VARIABLE sdl3_head OUTPUT_STRIP_TRAILING_WHITESPACE ERROR_QUIET)
+    if(NOT sdl3_head STREQUAL SDL3_COMMIT)
+        message(FATAL_ERROR "SDL3 at ${sdl3_SOURCE_DIR} is commit '${sdl3_head}', not ${SDL3_COMMIT} (${SDL3_TAG}): the tag moved or the copy is another version")
+    endif()
+else()
+    message(STATUS "SDL3 from ${FETCHCONTENT_SOURCE_DIR_SDL3}, not a git checkout: its version is not checked (it must be ${SDL3_TAG})")
+endif()
+if(NOT CMAKE_BUILD_TYPE)
+    target_compile_options(SDL3-static PRIVATE -O2)   # SDL as a subproject gets no optimization of its own: its audio conversion and mixing run on every device callback
+endif()
+
+# ---- The portable host sources ----
+# Not here: the parts tied to native ARM64 execution (entry.S, hle_bigstack.c, crash.c, probe.c; the x86-64 execution engine replaces them: aot_*.c below, aot_fault.c
+# for crash.c's fault hooks and watchdog), the program entries (Apple's main.c; main_x86.c is the program nxhost-run below), and the Apple frontend files (*.m).
+# front_sdl.c is the front end here. hle_fdstat.c compiles to nothing on Windows. hle_table.c, Apple's C library passthrough (guest calls go straight into libc there), is
+# replaced by libc_pass.c: the same functions as PASS entries with the guest's types, which get host-call thunks like the other entries.
+# The HLE files of dm/gfx (hle_vi.c: nn::vi's display, layer, crop and frame number; hle_nv.c: nv::'s graphics allocator and driver start), which the Makefile takes with
+# dm/gfx's wildcard on Apple: plain C, part of nxhost as of every Apple host (the guest Vulkan and GL layers read the layer crop and size from hle_vi.c)
+file(GLOB HLE_SRC CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/hle_*.c)
+list(FILTER HLE_SRC EXCLUDE REGEX "/hle_(bigstack|table)\\.c$")
+# Apple's own by nature, so not built here; apple_null.c gives the rest of the host what it calls in them, as declared [RED] null forms: hle_exl.c (exlaunch plugins write the
+# game's code through a writable alias of its pages, which a recompiled pack does not read), hle_cheats.c (the cheat VM's code writes and the Mac Cheats panel: mach_vm_remap,
+# libdispatch), hle_jit.c (nn::jit: runs the JIT plugin's ARM64 output natively or serves a captured image at fixed distances), hle_movie_av1.c (AV1 on VideoToolbox, and dav1d
+# built for arm64 only). Their guest entries are then unimplemented imports, as before the merge that brought them (docs/design/migration-status.md)
+list(FILTER HLE_SRC EXCLUDE REGEX "/hle_(exl|cheats|jit|movie_av1)\\.c$")
+file(GLOB GFX_HLE_SRC CONFIGURE_DEPENDS ${REPO}/dm/gfx/hle_*.c)
+# audio_input.c: the microphone streams' shared part (its platform backend is Apple's audio_input_mac.m; audio_input.h gives the others a backend with no device).
+# apple_null.c: the declared null forms of the Apple-only sources above and of save_sync.c (iCloud Drive save sync), which is not built here either
+set(NXHOST_SRC hle.c loader.c thread.c front_sdl.c libc_pass.c audio_input.c apple_null.c)
+list(TRANSFORM NXHOST_SRC PREPEND ${CMAKE_CURRENT_SOURCE_DIR}/)
+list(APPEND NXHOST_SRC ${HLE_SRC} ${GFX_HLE_SRC})
+# The host-call thunks of the x86-64 execution engine (docs/design/aot-recompiler.md 2.4): generated from the HLE entries of exactly the sources nxhost compiles,
+# so an entry in a file that is not built here gets no thunk. The generator also reads the quoted headers beside them (typedefs, wrapper macros). aot_hostfn.c is the
+# host-function page that gives each thunk its guest-visible address
+set(GEN_HLE_THUNKS ${CMAKE_CURRENT_SOURCE_DIR}/tools/gen_hle_thunks.py)
+set(HLE_THUNKS_C ${CMAKE_BINARY_DIR}/gen/hle_thunks.c)
+file(GLOB HOST_H CONFIGURE_DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/*.h ${CMAKE_CURRENT_SOURCE_DIR}/plat/*.h)
+
+# ---- The NVN frontend (docs/design/vulkan-backend.md, step M6) ----
+# The NVN interface layer (hle_nvn.c, with its dirty-page tracker and texture layout) and the plain C parts of the replay every graphics backend shares: the draw state, the GPU-write
+# ledger, handle resolution, the pool table, the decoder, the shader reflection parser (over cJSON) and the pipeline description, with dm/gfx/tex's deswizzling and format table.
+# They reach a backend only through dm/gfx/nvn/nvn_be.h. Part of nxhost, so the thunk generator reads their entries (NVN( and NVN_NOPROTO(, hle_nvn.c; NVN's own header through
+# -I). Apple builds keep dm/host/Makefile and the Metal backend; here nxhost links the Vulkan one (dm/gfx/hostvk, the nvn_vk library below; NXHOST_VULKAN=OFF: nvn_null).
+# nvn_names.c: the NVN names in load order, written from names.txt (nvn_thunks.S holds them on Apple)
+set(NVN_FRONTEND_SRC
+    ${REPO}/dm/gfx/nvn/hle_nvn.c ${REPO}/dm/gfx/nvn/nvn_dirty.c ${REPO}/dm/gfx/nvn/nvn_tex.c ${REPO}/dm/gfx/nvn/nvn_state.c ${REPO}/dm/gfx/nvn/nvn_gpuwrite.c
+    ${REPO}/dm/gfx/nvn/nvn_resolve.c ${REPO}/dm/gfx/nvn/nvn_pools.c ${REPO}/dm/gfx/nvn/nvn_replay.c ${REPO}/dm/gfx/nvn/nvn_refl.c ${REPO}/dm/gfx/nvn/nvn_pipe.c
+    ${REPO}/dm/gfx/nvn/nvn_capture.c ${REPO}/dm/gfx/tex/nvn_fmt_mtl.c ${REPO}/dm/gfx/tex/nvn_deswizzle.c ${REPO}/dm/third_party/cjson/cJSON.c)
+set_source_files_properties(${NVN_FRONTEND_SRC} PROPERTIES INCLUDE_DIRECTORIES ${REPO}/dm/gfx/nvn/include)
+set(NVN_NAMES_C ${CMAKE_BINARY_DIR}/gen/nvn_names.c)
+file(STRINGS ${REPO}/dm/gfx/nvn/names.txt NVN_NAMES REGEX "^nvn")
+list(LENGTH NVN_NAMES NVN_NNAMES)
+set(nvn_names_text "// Generated by dm/host/CMakeLists.txt from dm/gfx/nvn/names.txt: the NVN names in load order (nvn_thunks.S holds them on Apple); do not edit\n")
+string(APPEND nvn_names_text "#include \"${REPO}/dm/gfx/nvn/nvn_count.h\"\nconst char *nvn_names[NVN_NFUNC] = {\n")
+foreach(name IN LISTS NVN_NAMES)
+    string(APPEND nvn_names_text "    \"${name}\",\n")
+endforeach()
+string(APPEND nvn_names_text "};\n_Static_assert(${NVN_NNAMES} == NVN_NFUNC, \"names.txt and nvn_count.h count different names: run dm/gfx/tools/gen_protos.py\");\n")
+file(GENERATE OUTPUT ${NVN_NAMES_C} CONTENT "${nvn_names_text}")
+set_source_files_properties(${NVN_NAMES_C} PROPERTIES GENERATED TRUE)
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${REPO}/dm/gfx/nvn/names.txt)
+list(APPEND NXHOST_SRC ${NVN_FRONTEND_SRC} ${NVN_NAMES_C})
+file(GLOB NVN_H CONFIGURE_DEPENDS ${REPO}/dm/gfx/nvn/*.h ${REPO}/dm/gfx/nvn/include/*.h ${REPO}/dm/gfx/tex/*.h)
+list(APPEND HOST_H ${NVN_H})
+set(GEN_HLE_THUNKS_INC -I ${REPO}/dm/gfx/nvn/include)
+# The null backend (dm/gfx/nvn/nvn_null.c): every backend function as a red line on its first call and a neutral answer, for a host binary with no GPU backend yet; a library of its
+# own, so that a binary links exactly one backend (nxhost takes the Vulkan one unless NXHOST_VULKAN=OFF; t_frontend this one)
+add_library(nvn_null STATIC ${REPO}/dm/gfx/nvn/nvn_null.c)
+target_compile_options(nvn_null PRIVATE ${HOST_FLAGS})
+target_include_directories(nvn_null PRIVATE ${REPO}/dm/gfx/nvn/include)
+target_link_libraries(nvn_null PUBLIC nxplat)
+
+# The graphics backend nxhost links (below): the Vulkan one unless NXHOST_VULKAN=OFF. With it, the guest graphics API layers on that backend are part of a host binary too
+# (dm/gfx/hostvk: guest_vk.c, the guest Vulkan shim of step P9a; guest_gl.c, the guest OpenGL layer of step P9b; their libraries below), so their entries (VK( / VKB(,
+# GL( / GLB( / EGL() get host-call thunks like the HLE entries: the generator's one run reads nxhost's sources and theirs, with the Vulkan headers on its include path
+option(NXHOST_VULKAN "nxhost links the Vulkan graphics backend (nvn_vk) instead of the null one (nvn_null)" ON)
+set(GUEST_VK_SRC ${REPO}/dm/gfx/hostvk/guest_vk.c)
+set(GUEST_GL_SRC ${REPO}/dm/gfx/hostvk/guest_gl.c)
+set(HLE_THUNKS_SRC ${NXHOST_SRC})
+if(NXHOST_VULKAN)
+    list(APPEND HLE_THUNKS_SRC ${GUEST_VK_SRC} ${GUEST_GL_SRC})
+    list(APPEND GEN_HLE_THUNKS_INC -I ${REPO}/dm/third_party/vulkan-headers/include)
+    list(APPEND HOST_H ${REPO}/dm/gfx/hostvk/guest_vk.h ${REPO}/dm/gfx/hostvk/guest_gl.h)
+endif()
+add_custom_command(OUTPUT ${HLE_THUNKS_C}
+    COMMAND ${Python3_EXECUTABLE} ${GEN_HLE_THUNKS} -o ${HLE_THUNKS_C} ${GEN_HLE_THUNKS_INC} ${HLE_THUNKS_SRC}
+    DEPENDS ${GEN_HLE_THUNKS} ${HLE_THUNKS_SRC} ${HOST_H}
+    COMMENT "host-call thunks from the HLE entries" VERBATIM)
+# The x86-64 execution engine (docs/design/aot-recompiler.md; dm/host/aot.h): the run time of a pack's recompiled code in the host. Its arena below 2^39, module
+# images and packs (aot_arena.c), what a pack imports and dm_guest_call (aot_run.c), guest threads (aot_thread.c), faults (aot_fault.c) and the floating-point
+# helpers (aot_fp.c), the sampler that writes nxaot's profiles (aot_profile.c, DM_AOT_PROFILE) and beside them the targets the inline caches were bound to (aot_targets.c, design
+# 12's hot indirect targets). A pack's library resolves those imports against the executable that links them (ENABLE_EXPORTS)
+set(AOT_SRC aot_hostfn.c aot_arena.c aot_run.c aot_thread.c aot_fault.c aot_fp.c aot_profile.c aot_targets.c)
+add_library(nxhost STATIC ${NXHOST_SRC} ${AOT_SRC} ${HLE_THUNKS_C})
+add_dependencies(nxhost game_profile)
+target_compile_options(nxhost PRIVATE ${HOST_FLAGS})
+target_include_directories(nxhost PUBLIC ${REPO}/dm/third_party/stb_vorbis ${REPO}/dm/tools/aot/include)
+target_link_libraries(nxhost PUBLIC nxprofile nxplat vpx SDL3::SDL3-static)
+if(WIN32)
+    # Movies on Windows (hle_movie_win32.c): COM (ole32) and Media Foundation's attribute and format GUIDs (mfuuid, a static library). mfplat.dll is loaded at the first movie,
+    # not linked, so the programs start on a Windows without Media Foundation (an N edition without the Media Feature Pack)
+    set(MOVIE_WIN32_LIBS ole32 mfuuid)
+    target_link_libraries(nxhost PUBLIC ${MOVIE_WIN32_LIBS})
+endif()
+# The JIT fallback of the engine (design section 11): dynarmic's A64 JIT behind the C interface of dm/tools/aot/src/rt/jit.h, the glue nxaot's own run time uses
+# (jit.cpp, with the decoder glue it calls). dynarmic needs a C++20 compiler and Boost's headers: the system's where CMake finds them (the Linux images' libboost-dev:
+# docker/Dockerfile.build since its Boost layer, Dockerfile.aot), else the subset of Boost 1.83.0 in dm/third_party/boost (the headers dynarmic includes and every header
+# they include, with all of boost/config: its VENDOR.md), which the Windows cross-build takes (the llvm-mingw image has no Boost). So it is on by default wherever a C++
+# compiler is found (the engine is part of every tree this file configures: x86-64 Linux and Windows, not Apple), off with a configure-time message where none is:
+# without it, guest code with no compiled entry stops the process with a [RED] line and status 3 (aot.h DM_AOT_JIT_NEEDED). -DNXHOST_JIT=ON makes it required (the CI's
+# Linux and Windows jobs), -DNXHOST_JIT=OFF leaves it out. host_tests.tsv's "# engine:" line says which the tree has.
+# The JIT stops at the packs' gate sites (the observation gates and spin-wait back-edges compiled code calls nxaot_rt_gate at) and aot_run.c serves them as compiled code
+# does; its code is every module's text and aux region (the frame-step stubs). DM_AOT_JIT_ALL=1 runs everything in it (t_aot_module's JIT-forced runs)
+include(CheckLanguage)
+check_language(CXX)
+cmake_path(SET NXHOST_BOOST_SUBSET NORMALIZE ${REPO}/dm/third_party/boost)
+find_package(Boost 1.57 QUIET)
+if(NOT Boost_FOUND)
+    # The subset: CMake's FindBoost, which dynarmic's own find_package(Boost) runs too, takes a Boost_INCLUDE_DIR that holds boost/version.hpp as found (Boost::boost then
+    # names it). Kept in the cache, so a reconfigure finds it first; -DBoost_INCLUDE_DIR=<folder> names another Boost
+    set(Boost_INCLUDE_DIR ${NXHOST_BOOST_SUBSET} CACHE PATH "Boost's headers (the subset vendored for dynarmic: dm/third_party/boost/VENDOR.md)" FORCE)
+    find_package(Boost 1.57 QUIET)
+endif()
+cmake_path(SET nxhost_boost_dir NORMALIZE "${Boost_INCLUDE_DIR}")   # FindBoost keeps the folder normalized ("/src/" + "/dm/..." is not)
+if(Boost_FOUND AND nxhost_boost_dir STREQUAL NXHOST_BOOST_SUBSET)
+    set(NXHOST_BOOST_FROM "the subset in dm/third_party/boost")
+else()
+    set(NXHOST_BOOST_FROM "the one find_package found")
+endif()
+if(CMAKE_CXX_COMPILER AND Boost_FOUND)
+    set(NXHOST_JIT_DEFAULT ON)
+else()
+    set(NXHOST_JIT_DEFAULT OFF)
+endif()
+option(NXHOST_JIT "x86-64 execution engine: build the JIT fallback (dynarmic; needs C++20 and Boost's headers)" ${NXHOST_JIT_DEFAULT})
+if(NOT NXHOST_JIT)
+    message(STATUS "NXHOST_JIT off (C++ compiler: '${CMAKE_CXX_COMPILER}', Boost found: ${Boost_FOUND}): no JIT fallback; guest code with no compiled entry stops the "
+                   "process with status 3 (the JIT needs a C++20 compiler; Boost's headers are the system's or dm/third_party/boost)")
+endif()
+if(NXHOST_JIT)
+    enable_language(CXX)
+    find_package(Boost 1.57)
+    if(NOT Boost_FOUND)
+        message(FATAL_ERROR "NXHOST_JIT needs Boost's headers (dynarmic includes boost/icl and boost/variant): neither the system's nor the subset in dm/third_party/boost "
+                            "(Boost_INCLUDE_DIR: '${Boost_INCLUDE_DIR}') was found")
+    endif()
+    message(STATUS "NXHOST_JIT on: the JIT fallback (dynarmic) with Boost ${Boost_VERSION} (${NXHOST_BOOST_FROM}) and ${CMAKE_CXX_COMPILER}")
+    set(DYNARMIC_TESTS OFF CACHE BOOL "" FORCE)
+    set(DYNARMIC_WARNINGS_AS_ERRORS OFF CACHE BOOL "" FORCE)
+    set(DYNARMIC_USE_PRECOMPILED_HEADERS OFF CACHE BOOL "" FORCE)
+    set(DYNARMIC_USE_BUNDLED_EXTERNALS ON CACHE BOOL "" FORCE)
+    set(DYNARMIC_FRONTENDS "A64" CACHE STRING "" FORCE)
+    # dynarmic and its mcl force CMAKE_BUILD_TYPE=Release into the cache when it is empty, which would make the whole tree a Release build: -O3 -DNDEBUG on every host
+    # test, whose assert() calls then vanish (t_svc_memory, t_heap_size, t_audren_work, t_preempt and t_notify_sched failed that way). With no build type chosen,
+    # dynarmic's directories get Release as a variable of their own scope and the cache stays empty
+    if(NOT CMAKE_BUILD_TYPE AND NOT CMAKE_CONFIGURATION_TYPES)
+        set(CMAKE_BUILD_TYPE Release)
+        add_subdirectory(${REPO}/dm/third_party/dynarmic ${CMAKE_BINARY_DIR}/dynarmic EXCLUDE_FROM_ALL)
+        unset(CMAKE_BUILD_TYPE)
+    else()
+        add_subdirectory(${REPO}/dm/third_party/dynarmic ${CMAKE_BINARY_DIR}/dynarmic EXCLUDE_FROM_ALL)
+    endif()
+    add_library(nxhost_jit STATIC ${REPO}/dm/tools/aot/src/rt/jit.cpp ${REPO}/dm/tools/aot/src/decode/translate.cpp)
+    set_target_properties(nxhost_jit PROPERTIES CXX_STANDARD 20 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+    # The tree has no build type, so without this the glue (and the copy of dynarmic's decoder table builder it instantiates) was compiled with no optimisation at all:
+    # the decoder table took 181 to 207 ms to build against 62 to 70 at -O2, and every JIT memory callback ran unoptimised (docs/reference/threads.md, the JIT's first use)
+    target_compile_options(nxhost_jit PRIVATE -O2)
+    target_include_directories(nxhost_jit PUBLIC ${REPO}/dm/tools/aot/include ${REPO}/dm/tools/aot/src)
+    target_link_libraries(nxhost_jit PUBLIC dynarmic merry::mcl fmt::fmt tsl::robin_map Boost::boost)
+    target_compile_definitions(nxhost PUBLIC NXHOST_JIT=1)
+    target_link_libraries(nxhost PUBLIC nxhost_jit)
+endif()
+
+# ---- Unit tests (dm/host/tests: each includes the host sources it exercises, so a test links the platform layer, not nxhost) ----
+# host_test(<name> SOURCES <files> [PROFILE] [VPX] [SDL] [POSIX] [DEFS <macros>] [RUNS <arguments; one run each, "-" = none>] [TMPDIR] [ENV <VAR=value ...>])
+#   PROFILE: needs the game profile header; SDL: links SDL3 (front_sdl.c, hle_audio.c); POSIX: needs fork() (death tests in a child), so Linux only for now;
+#   ENV: the environment of the CTest run only (host_tests.tsv does not carry it, so the runners do not set it: the test must also run without it)
+include(CTest)
+set(TESTS ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+# The test list for the runners (dm/host/tests/run_host_tests.sh, run_win64_tests.ps1), which run where CTest cannot: CTest's files name this machine's paths, and a Windows tree
+# cross-built in Docker runs on the PC. One line per run, tab-separated: name, executable, arguments (separated by spaces), "tmpdir" when it needs TMPDIR=<build folder>/tmp;
+# an empty field is "-" (a POSIX shell's read merges adjacent tabs)
+if(WIN32)
+    set(LOG_PLATFORM win64)
+else()
+    set(LOG_PLATFORM linux)
+endif()
+string(TIMESTAMP configured "%Y-%m-%dT%H:%M:%SZ" UTC)
+set(MANIFEST "# nxnative host unit tests, written by dm/host/CMakeLists.txt: name<TAB>executable<TAB>arguments<TAB>tmpdir\n")
+string(APPEND MANIFEST "# platform: ${LOG_PLATFORM}\n# system: ${CMAKE_SYSTEM_NAME} ${CMAKE_SYSTEM_PROCESSOR}\n# compiler: ${CMAKE_C_COMPILER_ID} ${CMAKE_C_COMPILER_VERSION} (${CMAKE_C_COMPILER})\n")
+string(APPEND MANIFEST "# game: ${GAME}\n# configured: ${configured}\n")
+if(NXHOST_JIT)   # the engine the AOT tests run (the runners copy these lines into summary.txt)
+    string(APPEND MANIFEST "# engine: the packs with the JIT fallback (NXHOST_JIT on: dynarmic, Boost ${Boost_VERSION}, ${NXHOST_BOOST_FROM})\n")
+else()
+    string(APPEND MANIFEST "# engine: the packs without the JIT fallback (NXHOST_JIT off): guest code with no compiled entry stops with status 3\n")
+endif()
+# The tests that are scripts (a Python driver, a shell script) rather than test programs, for the same runners: host_scripts.tsv, written by host_script_test() below
+# beside host_tests.tsv (whose rows stay as they are). One line per test, tab-separated: name, interpreter (python3 or sh), script (from the repository root), arguments
+# (separated by spaces; "" is an empty argument), environment (VAR=value, separated by spaces), the variables it reads from the runner's environment (separated by
+# spaces), the exit code that means skipped. In arguments and environment, {build} stands for the build folder and {repo} for the repository root. An empty field is "-"
+set(SCRIPTS "# nxnative host script tests, written by dm/host/CMakeLists.txt: name<TAB>interpreter<TAB>script<TAB>arguments<TAB>environment<TAB>reads<TAB>skip code\n")
+string(APPEND SCRIPTS "# platform: ${LOG_PLATFORM}\n")
+function(host_test name)
+    cmake_parse_arguments(T "PROFILE;VPX;SDL;POSIX;TMPDIR" "" "SOURCES;DEFS;RUNS;INCLUDES;ENV" ${ARGN})
+    if(T_POSIX AND WIN32)
+        string(APPEND MANIFEST "# not built for this platform: ${name} (POSIX: fork() death tests)\n")
+        set(MANIFEST "${MANIFEST}" PARENT_SCOPE)
+        return()
+    endif()
+    list(TRANSFORM T_SOURCES PREPEND ${TESTS}/)
+    add_executable(${name} ${T_SOURCES} ${WIN32_MANIFEST_RC})   # WIN32_MANIFEST_RC: the UTF-8 code page manifest, Windows only (empty elsewhere)
+    target_compile_options(${name} PRIVATE ${HOST_FLAGS})
+    target_compile_definitions(${name} PRIVATE ${T_DEFS})
+    target_include_directories(${name} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${T_INCLUDES})
+    target_link_libraries(${name} PRIVATE nxplat)
+    if(T_PROFILE)
+        add_dependencies(${name} game_profile)
+        target_link_libraries(${name} PRIVATE nxprofile)   # game_profile.h's runtime form, the table and dm_game: GAME's constants unless the test picks another
+    endif()
+    if(T_VPX)
+        target_link_libraries(${name} PRIVATE vpx)
+        target_include_directories(${name} PRIVATE ${REPO}/dm/third_party/stb_vorbis)
+    endif()
+    if(T_SDL)
+        target_link_libraries(${name} PRIVATE SDL3::SDL3-static)
+    endif()
+    if(NOT T_RUNS)
+        set(T_RUNS -)
+    endif()
+    set(tmp ${CMAKE_BINARY_DIR}/tmp)
+    foreach(run IN LISTS T_RUNS)
+        set(test_name ${name})
+        set(args)
+        if(NOT run STREQUAL "-")
+            set(test_name ${name}${run})
+            set(args ${run})
+        endif()
+        add_test(NAME ${test_name} COMMAND ${name} ${args} WORKING_DIRECTORY ${CMAKE_BINARY_DIR})
+        set(tmpdir -)
+        set(env ${T_ENV})
+        if(T_TMPDIR)
+            file(MAKE_DIRECTORY ${tmp})
+            list(APPEND env "TMPDIR=${tmp}")
+            set(tmpdir tmpdir)
+        endif()
+        if(env)
+            set_tests_properties(${test_name} PROPERTIES ENVIRONMENT "${env}")
+        endif()
+        set_tests_properties(${test_name} PROPERTIES TIMEOUT 120)
+        string(JOIN " " argv ${args})
+        if(argv STREQUAL "")
+            set(argv -)
+        endif()
+        string(APPEND MANIFEST "${test_name}\t${name}${CMAKE_EXECUTABLE_SUFFIX}\t${argv}\t${tmpdir}\n")
+    endforeach()
+    set(MANIFEST "${MANIFEST}" PARENT_SCOPE)
+endfunction()
+# host_script_test(<name> INTERPRETER <python3|sh> SCRIPT <absolute path> [ARGS <arguments>] [ENV <VAR=value ...>] [READS <VAR ...>] [WORKING_DIRECTORY <folder>]
+#                  [SKIP_RETURN_CODE <code>] [TIMEOUT <seconds>] [NOT_WINDOWS <why>])
+# registers the script with CTest (python3: the interpreter CMake found) and writes its row into host_scripts.tsv from the same arguments, so the two cannot differ. READS
+# names what the script takes from the environment when it is set (the runners pass their environment through and say in the summary when such a variable was not set).
+# NOT_WINDOWS: the script does not run on Windows; on a Windows tree it is still registered with CTest (as the caller's conditions say) but has no row, and host_tests.tsv
+# lists it as "not run on Windows: <name> (<why>)", which both runners copy into summary.txt. The runners give each test their own time limit, not TIMEOUT
+function(host_script_test name)
+    cmake_parse_arguments(PARSE_ARGV 1 T "" "INTERPRETER;SCRIPT;WORKING_DIRECTORY;SKIP_RETURN_CODE;TIMEOUT;NOT_WINDOWS" "ARGS;ENV;READS")
+    if(T_INTERPRETER STREQUAL "python3")
+        set(interp ${Python3_EXECUTABLE})
+    elseif(T_INTERPRETER STREQUAL "sh")
+        set(interp sh)
+    else()
+        message(FATAL_ERROR "host_script_test(${name}): INTERPRETER is python3 or sh, not '${T_INTERPRETER}'")
+    endif()
+    # add_test through a bracket-quoted call, so an empty argument stays an argument (an unquoted list expansion drops it)
+    set(code "add_test(NAME ${name} COMMAND [==[${interp}]==] [==[${T_SCRIPT}]==]")
+    foreach(a IN LISTS T_ARGS)
+        string(APPEND code " [==[${a}]==]")
+    endforeach()
+    if(T_WORKING_DIRECTORY)
+        string(APPEND code " WORKING_DIRECTORY [==[${T_WORKING_DIRECTORY}]==]")
+    endif()
+    cmake_language(EVAL CODE "${code})")
+    if(NOT T_SKIP_RETURN_CODE STREQUAL "")
+        set_tests_properties(${name} PROPERTIES SKIP_RETURN_CODE ${T_SKIP_RETURN_CODE})
+    endif()
+    if(T_TIMEOUT)
+        set_tests_properties(${name} PROPERTIES TIMEOUT ${T_TIMEOUT})
+    endif()
+    if(T_ENV)
+        set_tests_properties(${name} PROPERTIES ENVIRONMENT "${T_ENV}")
+    endif()
+    if(WIN32 AND T_NOT_WINDOWS)
+        string(APPEND MANIFEST "# not run on Windows: ${name} (${T_NOT_WINDOWS})\n")
+        set(MANIFEST "${MANIFEST}" PARENT_SCOPE)
+        return()
+    endif()
+    # The manifest's form: the build folder and the repository root as {build} and {repo} (the runners' machine has other paths), the script from the repository root
+    file(RELATIVE_PATH script ${REPO} ${T_SCRIPT})
+    set(fields)
+    foreach(kind IN ITEMS ARGS ENV)
+        set(words)
+        foreach(a IN LISTS T_${kind})
+            string(REPLACE "${CMAKE_BINARY_DIR}" "{build}" a "${a}")
+            string(REPLACE "${REPO}" "{repo}/" a "${a}")
+            string(REPLACE "{repo}//" "{repo}/" a "${a}")
+            if(a STREQUAL "")
+                set(a "\"\"")
+            elseif(a MATCHES "[ \t]")
+                message(FATAL_ERROR "host_script_test(${name}): '${a}' holds a space, which host_scripts.tsv cannot carry")
+            endif()
+            list(APPEND words "${a}")
+        endforeach()
+        string(JOIN " " joined ${words})
+        if(joined STREQUAL "")
+            set(joined -)
+        endif()
+        list(APPEND fields "${joined}")
+    endforeach()
+    list(GET fields 0 argv)
+    list(GET fields 1 envv)
+    string(JOIN " " reads ${T_READS})
+    foreach(v IN ITEMS reads T_SKIP_RETURN_CODE)
+        if("${${v}}" STREQUAL "")
+            set(${v} -)
+        endif()
+    endforeach()
+    string(APPEND SCRIPTS "${name}\t${T_INTERPRETER}\t${script}\t${argv}\t${envv}\t${reads}\t${T_SKIP_RETURN_CODE}\n")
+    set(SCRIPTS "${SCRIPTS}" PARENT_SCOPE)
+endfunction()
+
+host_test(t_motion SOURCES t_motion.c)
+host_test(t_motion_pro SOURCES t_motion_pro.c)
+host_test(t_haptics SOURCES t_haptics.c ../hle_haptics.c)
+host_test(t_vorbis SOURCES t_vorbis.c)
+host_test(t_vorbis_divides SOURCES t_vorbis.c DEFS STB_VORBIS_DIVIDES_IN_RESIDUE)
+host_test(t_touch SOURCES t_touch.c ../hle_touch.c PROFILE)
+host_test(t_gesture SOURCES t_gesture.c ../hle_touch.c PROFILE)
+host_test(t_thread_leak SOURCES t_thread_leak.c PROFILE)
+host_test(t_env_rule SOURCES t_env_rule.c)   # an empty value is unset on every platform (plat.h plat_env_scrub)
+host_test(t_timed_wait SOURCES t_timed_wait.c)   # a short timed wait ends on time (Windows: the system timer at 1 ms, plat_win32.c timer_period_1ms)
+host_test(t_swkbd SOURCES t_swkbd.c ../hle_swkbd.c PROFILE DEFS DM_TEST_GUEST_C)   # its keyboard callbacks are C functions
+host_test(t_pctl SOURCES t_pctl.c PROFILE DEFS DM_TEST_GUEST_C)   # DM_TEST_GUEST_C: the host files a test includes take their native form (hle_misc.c, hle_ro.c, hle_guestthread.c, and every GUEST_CALL site)
+host_test(t_time SOURCES t_time.c ../libc_pass.c PROFILE DEFS DM_TEST_GUEST_C)   # DM_TEST_GUEST_C here and below: the included host file's native form (no arena: aot.h, "Host memory the guest sees").
+# libc_pass.c: the C library passthrough whose mktime / localtime_r the test reads from the swhle table (hle_table.c in Apple's Makefile)
+host_test(t_hid SOURCES t_hid.c ../hle_haptics.c PROFILE)
+host_test(t_audio_spsc SOURCES t_audio_spsc.c ../audio_input.c PROFILE SDL DEFS DM_TEST_GUEST_C)
+host_test(t_audio_sdl SOURCES t_audio_sdl.c ../audio_input.c PROFILE SDL DEFS DM_TEST_GUEST_C)
+host_test(t_front_sdl SOURCES t_front_sdl.c ../hle_haptics.c PROFILE SDL)
+host_test(t_audren_work SOURCES t_audren_work.c PROFILE DEFS DM_TEST_GUEST_C)
+host_test(t_nro SOURCES t_nro.c PROFILE DEFS DM_TEST_GUEST_C)
+# hle_fs.c takes the local profiles (hle_account_users.c) and the cloud save sync (save_sync.c on Apple, its null form in apple_null.c here); DM_TEST_GUEST_C: its SDK calls are C calls
+host_test(t_fs SOURCES t_fs.c t_fs_stub.c ../hle_account_users.c ../apple_null.c PROFILE TMPDIR DEFS DM_TEST_GUEST_C)
+host_test(t_fs_commit_list SOURCES t_fs_commit_list.c t_fs_stub.c ../hle_account_users.c ../apple_null.c PROFILE TMPDIR DEFS DM_TEST_GUEST_C)
+host_test(t_fs_case SOURCES t_fs_case.c ../hle_account_users.c ../apple_null.c PROFILE TMPDIR DEFS DM_TEST_GUEST_C)
+host_test(t_condvar SOURCES t_condvar.c t_condvar_stub.c ../hle_thread.c PROFILE DEFS DM_TEST_HOOKS DM_TEST_GUEST_C INCLUDES ${REPO}/dm/tools/aot/include)
+host_test(t_condvar_old SOURCES t_condvar.c t_condvar_stub.c ../hle_thread.c PROFILE DEFS DM_TEST_HOOKS DM_TEST_CV_OLD_ORDER DM_TEST_GUEST_C INCLUDES ${REPO}/dm/tools/aot/include)
+host_test(t_preempt SOURCES t_preempt.c t_condvar_stub.c PROFILE DEFS DM_TEST_GUEST_C RUNS - --all-peers INCLUDES ${REPO}/dm/tools/aot/include)
+host_test(t_notify_sched SOURCES t_notify_sched.c t_condvar_stub.c PROFILE DEFS DM_TEST_THREAD_ENTER DM_TEST_GUEST_C RUNS - --all-peers INCLUDES ${REPO}/dm/tools/aot/include)
+# The deterministic guest clock (DM_DETCLOCK; hle_os.c and hle_thread.c, both included): a thread that presents only after a worker's sleeps and timeouts on the guest clock
+# runs on, every clock value at its exact virtual time, and no jump while that thread waits for a host-signalled event; the clock from its origin, the host's threads that feed
+# the game at a random wall-clock pace on it, and its trace in TMPDIR (docs/reference/threads.md)
+host_test(t_detclock SOURCES t_detclock.c PROFILE TMPDIR DEFS DM_TEST_THREAD_ENTER DM_TEST_GUEST_C INCLUDES ${REPO}/dm/tools/aot/include)
+host_test(t_movie_vpx SOURCES t_movie_vpx.c PROFILE VPX DEFS DM_TEST_GUEST_C)
+# The port's H.264 stopgap: a black picture per access unit, in presentation order (hle_movie_avc.c without VideoToolbox; on Windows the same pictures from hle_movie_win32.c
+# with Media Foundation taken as absent, an N edition's case)
+host_test(t_movie_avc SOURCES t_movie_avc.c PROFILE DEFS DM_TEST_GUEST_C)
+if(WIN32)
+    target_link_libraries(t_movie_avc PRIVATE ${MOVIE_WIN32_LIBS})
+    # Media Foundation's H.264 and AAC transforms behind the movie decoder's interfaces (hle_movie_win32.c), on streams a script writes without an encoder (tests/movie_streams.py:
+    # I_PCM, P_Skip and B_Skip pictures whose decoded samples are known exactly, silent AAC frames). Skipped with its reason where the transforms are missing (an N edition, or
+    # Wine without GStreamer's plugins)
+    add_custom_command(OUTPUT ${CMAKE_BINARY_DIR}/gen/tests/movie_streams.h
+        COMMAND ${Python3_EXECUTABLE} ${TESTS}/movie_streams.py ${CMAKE_BINARY_DIR}/gen/tests/movie_streams.h
+        DEPENDS ${TESTS}/movie_streams.py COMMENT "movie test streams (movie_streams.py)" VERBATIM)
+    file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/gen/tests)
+    add_custom_target(movie_streams DEPENDS ${CMAKE_BINARY_DIR}/gen/tests/movie_streams.h)
+    host_test(t_movie_mf SOURCES t_movie_mf.c PROFILE DEFS DM_TEST_GUEST_C INCLUDES ${CMAKE_BINARY_DIR}/gen/tests)
+    add_dependencies(t_movie_mf movie_streams)
+    target_link_libraries(t_movie_mf PRIVATE ${MOVIE_WIN32_LIBS})
+endif()
+# The NVN replay's draw and render-target state and its GPU-write ledger (dm/gfx/nvn, plain C; dm/gfx/tests/Makefile builds the same two on the Mac)
+host_test(t_state SOURCES ../../gfx/tests/t_state.c ../../gfx/nvn/nvn_state.c INCLUDES ${REPO}/dm/gfx/nvn ${REPO}/dm/gfx/nvn/include)
+host_test(t_gpuwrite SOURCES ../../gfx/tests/t_gpuwrite.c ../../gfx/nvn/nvn_gpuwrite.c INCLUDES ${REPO}/dm/gfx/nvn)
+# Its handle resolution and memory pool table (the same, step M2b)
+host_test(t_resolve SOURCES ../../gfx/tests/t_resolve.c ../../gfx/nvn/nvn_resolve.c ../../gfx/nvn/nvn_state.c ../../gfx/nvn/nvn_gpuwrite.c INCLUDES ${REPO}/dm/gfx/nvn ${REPO}/dm/gfx/nvn/include)
+host_test(t_pools SOURCES ../../gfx/tests/t_pools.c ../../gfx/nvn/nvn_pools.c INCLUDES ${REPO}/dm/gfx/nvn)
+# Its decoder of command lists over a stub backend (step M3)
+host_test(t_replay SOURCES ../../gfx/tests/t_replay.c ../../gfx/nvn/nvn_replay.c ../../gfx/nvn/nvn_state.c INCLUDES ${REPO}/dm/gfx/nvn ${REPO}/dm/gfx/nvn/include)
+# Its neutral pipeline description and the prewarm lists' pipeline rows (step M5): t_pipe reads every profile's pso_manifest.tsv, finding the repository by walking up from
+# the build folder (DM_REPO overrides); the inverse of the NVN to Metal format table beside it (dm/gfx/tex)
+host_test(t_pipe SOURCES ../../gfx/tests/t_pipe.c ../../gfx/nvn/nvn_pipe.c ../../gfx/tex/nvn_fmt_mtl.c INCLUDES ${REPO}/dm/gfx/nvn ${REPO}/dm/gfx/nvn/include ${REPO}/dm/gfx/tex)
+host_test(t_fmt_inv SOURCES ../../gfx/tex/tests/t_fmt_inv.c ../../gfx/tex/nvn_fmt_mtl.c INCLUDES ${REPO}/dm/gfx/tex)
+# The block-linear layout of textures (dm/gfx/tex/nvn_deswizzle.c, nvn_tex.c): round trips, hand-calculated addresses, the row form WriteTexels uses, 3D and sparse layouts
+host_test(t_tex SOURCES ../../gfx/tex/tests/t_tex.c ../../gfx/tex/nvn_deswizzle.c ../../gfx/nvn/nvn_tex.c INCLUDES ${REPO}/dm/gfx/tex ${REPO}/dm/gfx/nvn ${REPO}/dm/gfx/nvn/include)
+# The shader reflection parser in plain C, with its JSON reader (dm/gfx/nvn/nvn_refl.c, dm/third_party/cjson): every backend's since step M6, the Metal one's too
+host_test(t_refl_c SOURCES ../../gfx/tests/t_refl_c.c ../../gfx/nvn/nvn_refl.c ../../third_party/cjson/cJSON.c INCLUDES ${REPO}/dm/gfx/nvn ${REPO}/dm/third_party/cjson)
+# The Vulkan backend's device layer and host-memory import (dm/gfx/hostvk; docs/design/vulkan-backend.md 3.6, 4.2, 9.1), over volk: the Vulkan loader is loaded at run time,
+# so nothing links against libvulkan or vulkan-1.dll (dl, which volk needs on Linux, comes with the platform layer). Headless. Without a Vulkan loader or device they print
+# "note: no Vulkan device: skipped" and pass (the Windows CI runner has no Vulkan driver); CTest on Linux runs them on Mesa's lavapipe under the validation layer, both in the
+# nxnative-build image (docker/README.md), and then a missing driver or layer fails them
+set(HOSTVK_SRC ../../gfx/hostvk/vk_device.c ../../gfx/hostvk/vk_import.c ../../third_party/volk/volk.c)
+set(HOSTVK_INC ${REPO}/dm/gfx/hostvk ${REPO}/dm/third_party/volk ${REPO}/dm/third_party/vulkan-headers/include)
+set(HOSTVK_ENV)
+if(NOT WIN32)
+    set(HOSTVK_ENV VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json VK_LOADER_DRIVERS_SELECT=lvp* VK_INSTANCE_LAYERS=VK_LAYER_KHRONOS_validation)
+endif()
+host_test(t_vk_device SOURCES ../../gfx/hostvk/tests/t_vk_device.c ${HOSTVK_SRC} PROFILE DEFS VK_NO_PROTOTYPES INCLUDES ${HOSTVK_INC} ENV ${HOSTVK_ENV})
+host_test(t_vk_import SOURCES ../../gfx/hostvk/tests/t_vk_import.c ${HOSTVK_SRC} PROFILE DEFS VK_NO_PROTOTYPES INCLUDES ${HOSTVK_INC} ENV ${HOSTVK_ENV})
+# The Vulkan backend behind dm/gfx/nvn/nvn_be.h (dm/gfx/hostvk; docs/design/vulkan-backend.md, step P3): a library of its own beside nvn_null, so that a binary links exactly one
+# backend (nxhost links it: NXHOST_VULKAN below). Its own shaders are SPIR-V arrays in committed headers (dm/gfx/hostvk/shaders/gen/, written by shaders/gen_spirv.sh), so building needs no glslang
+set(HOSTVK_BACKEND_SRC vk_backend.c vk_memory.c vk_texture.c vk_shader.c vk_pipeline.c vk_commands.c vk_device.c vk_import.c vk_gpl.c vk_cache.c vk_prewarm.c   # vk_gpl, vk_cache, vk_prewarm: phase P5
+    vk_predict.c   # the look-ahead over the rest of a submission (P5, design 3.3)
+    vk_present.c   # the window presenter and the vsync source (step P4a)
+    vk_alloc.c     # the device memory allocator (decision D2, step D2)
+    vk_index.c     # the index conversions on the GPU (design 2.7)
+    vk_dump.c)     # the pass and texture dumps of DM_CTL (passdump, texdump, texraw, texlist)
+list(TRANSFORM HOSTVK_BACKEND_SRC PREPEND ${REPO}/dm/gfx/hostvk/)
+list(APPEND HOSTVK_BACKEND_SRC ${REPO}/dm/gfx/tex/nvn_fmt_vk.c ${REPO}/dm/gfx/tex/astc_decode.c ${REPO}/dm/third_party/volk/volk.c)   # astc_decode.c: the CPU fallback of the ASTC decode (P7)
+add_library(nvn_vk STATIC ${HOSTVK_BACKEND_SRC})
+add_dependencies(nvn_vk game_profile)
+target_compile_options(nvn_vk PRIVATE ${HOST_FLAGS})
+target_compile_definitions(nvn_vk PUBLIC VK_NO_PROTOTYPES)
+target_include_directories(nvn_vk PUBLIC ${HOSTVK_INC} PRIVATE ${REPO}/dm/gfx/nvn/include)
+target_link_libraries(nvn_vk PUBLIC nxprofile nxplat)
+# The graphics backend nxhost links (step M7, done at step P8): the Vulkan one on Linux and Windows, which takes the null backend's forms itself when no Vulkan device meets the
+# baseline of design 9.1 (vk_backend.c: one red line, nothing drawn, the CPU side runs); OFF links the null backend (nvn_null). t_frontend keeps the null backend either way. The
+# device comes up at the frontend's first call that needs it (a memory pool, a texture, a submission), as the Metal backend's mtl_init does: the host calls no be_init of its own.
+# The backend and the frontend in nxhost reference each other, so a binary links the pair twice (LINK_INTERFACE_MULTIPLICITY). The option is declared above, with the thunk
+# generator's command
+if(NXHOST_VULKAN)
+    target_link_libraries(nxhost PUBLIC nvn_vk)
+else()
+    target_link_libraries(nxhost PUBLIC nvn_null)
+endif()
+set_target_properties(nxhost PROPERTIES LINK_INTERFACE_MULTIPLICITY 2)
+# The guest Vulkan layer on that backend (dm/gfx/hostvk/guest_vk.c; docs/design/vulkan-backend.md 8.1, step P9a): the game's vk* imports forwarded to the backend's device. A
+# library of its own beside nvn_vk, because it is a game-facing API layer like hle_nvn.c (import-table entries, host services: the frame tick, the vi layer crop, the graphics
+# gate), not part of the NVN backend that the GPU tests link; nxhost links it with the Vulkan backend. Its VK( / VKB( entries register in the import table and get host-call
+# thunks like the HLE entries (the generator's command above reads its source, GUEST_VK_SRC). The thunk table references every entry's C function, so linking it pulls the
+# shim's object, and its entries, into a host binary
+add_library(guest_vk STATIC ${GUEST_VK_SRC})
+add_dependencies(guest_vk game_profile)
+target_compile_options(guest_vk PRIVATE ${HOST_FLAGS})
+target_include_directories(guest_vk PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${REPO}/dm/gfx/nvn/include)
+target_link_libraries(guest_vk PUBLIC nvn_vk)
+# The guest OpenGL layer on that backend (dm/gfx/hostvk/guest_gl.c; docs/design/vulkan-backend.md 8.2, step P9b): dm/gfx/gl/hle_gl.m's state machine with a Vulkan encoder, for
+# the games that render with NVIDIA's desktop GL through EGL. A library of its own beside guest_vk, for the same reason; its GL( / GLB( / EGL( entries get thunks through the same
+# generator command (GUEST_GL_SRC), which pulls its object into a host binary. Its shaders are the SPIR-V library dm/gfx/tools/gl_shaders.py --vk writes (<DM_MSL_DIR>/gl-vk/)
+add_library(guest_gl STATIC ${GUEST_GL_SRC})
+add_dependencies(guest_gl game_profile)
+target_compile_options(guest_gl PRIVATE ${HOST_FLAGS})
+target_include_directories(guest_gl PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${REPO}/dm/gfx/nvn/include)
+target_link_libraries(guest_gl PUBLIC nvn_vk)
+if(NXHOST_VULKAN)
+    target_link_libraries(nxhost PUBLIC guest_vk guest_gl)
+endif()
+
+# ---- The host program: nxhost-run (main_x86.c; docker/README.md, "Running the host program") ----
+# nxhost-run <the game's aot_<version> folder> [module...] [-- game arguments]: the game's modules through the x86-64 engine's loader, the SDK start and nnMain as guest calls on
+# the engine's main thread, the SDL3 front end (DM_WINDOW) and the Vulkan backend with its window presenter. Named nxhost-run, not nxhost: that is the library every test builds on,
+# and the name says what the program does, as Apple's dmhost runs a game's rewritten modules. The library is linked whole (--whole-archive): a pack's library resolves the engine's
+# entry points and floating-point helpers against the executable (ENABLE_EXPORTS) when the game loads it, so they must be in it although nothing in the program calls them.
+# Windows: the UTF-8 code page manifest, and a 64 MiB main thread stack (front_sdl.c gives the guest thread 64 MiB with a window; without one the guest runs on the main thread)
+option(NXHOST_PROGRAM "build the host program nxhost-run (main_x86.c)" ON)
+if(NXHOST_PROGRAM)
+    add_executable(nxhost-run main_x86.c ${WIN32_MANIFEST_RC})
+    add_dependencies(nxhost-run game_profile)
+    target_compile_options(nxhost-run PRIVATE ${HOST_FLAGS})
+    target_link_libraries(nxhost-run PRIVATE -Wl,--whole-archive nxhost -Wl,--no-whole-archive)
+    set_target_properties(nxhost-run PROPERTIES ENABLE_EXPORTS ON)
+    if(NXHOST_VULKAN)
+        target_compile_definitions(nxhost-run PRIVATE NXHOST_VULKAN=1)   # registers the front end's window with the presenter (vk_present.h)
+    endif()
+    if(WIN32)
+        target_link_options(nxhost-run PRIVATE -Wl,--stack,67108864)
+    endif()
+endif()
+# Its GPU tests (dm/gfx/tests/vk; t_vk_harness.h says what they share): the NVN frontend, as objects so that the backend's references to it resolve whatever the link order,
+# over nvn_vk, each drawing headless and reading pixels back. Without a Vulkan device they skip as t_vk_device does; CTest on Linux runs them on lavapipe under the validation layer
+add_library(nvn_front_obj OBJECT ${NVN_FRONTEND_SRC} ${NVN_NAMES_C})
+add_dependencies(nvn_front_obj game_profile)
+target_compile_options(nvn_front_obj PRIVATE ${HOST_FLAGS})
+target_include_directories(nvn_front_obj PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${REPO}/dm/gfx/nvn ${REPO}/dm/gfx/nvn/include)
+target_link_libraries(nvn_front_obj PUBLIC nxprofile nxplat)
+target_compile_definitions(nvn_front_obj PRIVATE DM_TEST_GUEST_C)   # these tests call the frontend as C functions and link no execution engine: its guest call (the command-memory callback) takes the plain form
+foreach(t IN ITEMS queue_origin clear_ds clear_tex depth16_clear integer_blend primitive_restart rast_discard vbuf readback view_swizzle queries cond_render copy_alias index_convert provoking dump draw_params reupload bc_image no_device write_texels raster_shrink desc_reuse)
+    host_test(t_vk_${t} SOURCES ../../gfx/tests/vk/t_vk_${t}.c PROFILE INCLUDES ${REPO}/dm/gfx/nvn ${REPO}/dm/gfx/nvn/include ${REPO}/dm/gfx/tests/vk TMPDIR ENV ${HOSTVK_ENV})
+    target_link_libraries(t_vk_${t} PRIVATE nvn_front_obj nvn_vk)
+endforeach()
+# The descriptor microbenchmark (design 2.3): cached sets with dynamic offsets against push descriptors over 4,900 draws a frame, a table of CPU times. Without the validation
+# layer (its cost would be what is measured), so its CTest environment names the driver only
+set(HOSTVK_ENV_BENCH)
+if(NOT WIN32)
+    set(HOSTVK_ENV_BENCH VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/lvp_icd.json VK_LOADER_DRIVERS_SELECT=lvp*)
+endif()
+# The NVN → Vulkan format table against NVN's block sizes and the formats' names (plain C, no Vulkan)
+host_test(t_fmt_vk SOURCES ../../gfx/tex/tests/t_fmt_vk.c ../../gfx/tex/nvn_fmt_vk.c ../../gfx/nvn/nvn_tex.c INCLUDES ${REPO}/dm/gfx/tex ${REPO}/dm/gfx/nvn ${REPO}/dm/gfx/nvn/include ${REPO}/dm/third_party/vulkan-headers/include)
+host_test(t_vk_descbench SOURCES ../../gfx/hostvk/tests/t_vk_descbench.c ${HOSTVK_SRC} PROFILE DEFS VK_NO_PROTOTYPES INCLUDES ${HOSTVK_INC} ENV ${HOSTVK_ENV_BENCH})
+# The committed SPIR-V headers rebuild byte for byte (gen_spirv.sh --check): where glslang and spirv-val are installed, in the version the headers name (the nxnative-build
+# image); skipped elsewhere (exit 77). A shell script: host_scripts.tsv lists it for the runners
+if(NOT WIN32)
+    host_script_test(t_vk_spirv INTERPRETER sh SCRIPT ${REPO}/dm/gfx/hostvk/shaders/gen_spirv.sh ARGS --check SKIP_RETURN_CODE 77 TIMEOUT 120)
+else()
+    string(APPEND MANIFEST "# not run on Windows: t_vk_spirv (a POSIX shell script; glslangValidator and spirv-val of the version the headers name are in the nxnative-build image: the Linux tree checks the headers)\n")
+endif()
+# Pipelines without stutter (dm/gfx/hostvk vk_gpl.c, vk_cache.c, vk_prewarm.c, vk_predict.c; docs/design/vulkan-backend.md section 3, step P5), on lavapipe under the validation layer as the
+# GPU tests above, skipped without a Vulkan device: t_vk_gpl_identity (the same draws through fast-linked, optimized, level-B, level-C and level-D pipelines, bit for bit),
+# t_vk_pipeline_cache (the cache file written, read back at a second start, invalidated, a corrupt file ignored) and t_vk_prewarm (a manifest of about 200 rows prewarmed in the
+# background and with the prebuild, cold and warm). The last two run themselves again as child processes for each start (t_vk_harness.h hv_spawn). t_vk_predict: the look-ahead
+# over the rest of a submission (vk_predict.c) on levels A, B, C and D, on and off, through called lists and later handles, its budget, and the same pictures either way.
+# t_vk_noperspective: an input read without perspective over quads larger than the window, through plain Vulkan on the backend's device and through these pipelines alike
+# (lavapipe's clipper gets the clipped ones whose w differ wrong: recorded there; docs/reference/rendering.md, "A NoPerspective input reads wrong values on lavapipe")
+foreach(t IN ITEMS gpl_identity pipeline_cache prewarm predict noperspective)
+    host_test(t_vk_${t} SOURCES ../../gfx/tests/vk/t_vk_${t}.c PROFILE INCLUDES ${REPO}/dm/gfx/nvn ${REPO}/dm/gfx/nvn/include ${REPO}/dm/gfx/tests/vk TMPDIR ENV ${HOSTVK_ENV})
+    target_link_libraries(t_vk_${t} PRIVATE nvn_front_obj nvn_vk)
+endforeach()
+# Textures (docs/design/vulkan-backend.md section 5, step P7): t_astc, the ASTC decoder in plain C (dm/gfx/tex/astc_decode.c) over blocks it writes and predicts (every host, no
+# Vulkan); on lavapipe under the validation layer as the GPU tests above: t_vk_astc (synthetic ASTC of every block size held natively, decoded by the compute shader and decoded by
+# the C decoder: the compute decode equal to the C one bit for bit, lavapipe's own decode compared), t_vk_formats (every row of the format table with a path, sampled and drawn,
+# through the device's formats and through every substitute), t_vk_depth24 (DEPTH24 and DEPTH24_STENCIL8 as D24 and as 32-bit float with the bias of decision D10, uploads,
+# copies and partial clears of the depth-stencil formats, stencil views) and t_vk_deswizzle (the GPU deswizzle against the CPU one, bit for bit, with both timed)
+host_test(t_astc SOURCES ../../gfx/tex/tests/t_astc.c ../../gfx/tex/astc_decode.c INCLUDES ${REPO}/dm/gfx/tex ${REPO}/dm/gfx/tex/tests)
+# t_astc_mesa: the same decoder against an independent one, Mesa's, through desktop OpenGL on llvmpipe (lavapipe's Vulkan device has no ASTC). CTest only, on Linux where EGL
+# and GL are found (the nxnative-build image); it exits 77 (skipped) without a GL context or the ASTC extension. Test-only: nothing of the host links EGL or GL
+if(NOT WIN32)
+    find_path(EGL_INCLUDE EGL/egl.h)
+    find_library(EGL_LIB EGL)
+    find_library(GL_LIB GL)
+    if(EGL_INCLUDE AND EGL_LIB AND GL_LIB)
+        add_executable(t_astc_mesa ${REPO}/dm/gfx/tex/tests/t_astc_mesa.c ${REPO}/dm/gfx/tex/astc_decode.c)
+        target_compile_options(t_astc_mesa PRIVATE ${HOST_FLAGS})
+        target_include_directories(t_astc_mesa PRIVATE ${EGL_INCLUDE} ${REPO}/dm/gfx/tex/tests)
+        target_link_libraries(t_astc_mesa PRIVATE ${EGL_LIB} ${GL_LIB})
+        add_test(NAME t_astc_mesa COMMAND t_astc_mesa)
+        set_tests_properties(t_astc_mesa PROPERTIES SKIP_RETURN_CODE 77 TIMEOUT 120)
+        string(APPEND MANIFEST "# CTest only: t_astc_mesa (EGL and GL: the ASTC decoder against Mesa's)\n")
+    endif()
+endif()
+foreach(t IN ITEMS astc formats depth24 deswizzle)
+    host_test(t_vk_${t} SOURCES ../../gfx/tests/vk/t_vk_${t}.c PROFILE INCLUDES ${REPO}/dm/gfx/nvn ${REPO}/dm/gfx/nvn/include ${REPO}/dm/gfx/tests/vk ${REPO}/dm/gfx/tex TMPDIR ENV ${HOSTVK_ENV})
+    target_link_libraries(t_vk_${t} PRIVATE nvn_front_obj nvn_vk)
+endforeach()
+# The native features Metal lacks (docs/design/vulkan-backend.md section 6, step P8), on lavapipe under the validation layer as the GPU tests above, skipped without a Vulkan
+# device: t_vk_transform_feedback (the Metal test's captures, pauses, resumes, three streams, a geometry capture and DrawTransformFeedback, plus indexed and instanced captures
+# and two capturing pipelines in one pass), t_vk_geometry (the Metal test's geometry expansion over array, indexed, indirect and GPU-written draws, a line strip with adjacency
+# widened into quads, and layered rendering from the geometry and the vertex stage), t_vk_tessellation (quad and triangle domains, the triangles made counted by a capture),
+# t_vk_feedback (draws that sample their own attachment, the pass split when the pass wrote it) and t_vk_raster (Bresenham lines on levels A and D, advanced blend modes,
+# indirect quads, an array of descriptor handles, draw-based copies); t_vk_queries above covers the counters of step P8. t_vk_adv_blend: NVN's advanced blend modes against a CPU
+# reference of NV_blend_equation_advanced (the exact and the conditional fixed-function reductions; VK_EXT_blend_operation_advanced where the device has it, skipped on lavapipe)
+foreach(t IN ITEMS transform_feedback geometry tessellation feedback raster adv_blend)
+    host_test(t_vk_${t} SOURCES ../../gfx/tests/vk/t_vk_${t}.c PROFILE INCLUDES ${REPO}/dm/gfx/nvn ${REPO}/dm/gfx/nvn/include ${REPO}/dm/gfx/tests/vk TMPDIR ENV ${HOSTVK_ENV})
+    target_link_libraries(t_vk_${t} PRIVATE nvn_front_obj nvn_vk)
+endforeach()
+# The device memory allocator (dm/gfx/hostvk/vk_alloc.c, decision D2) and the pools' shared imports (vk_memory.c; docs/design/vulkan-backend.md 4.2, step D2), on lavapipe under the
+# validation layer as the GPU tests above, skipped without a Vulkan device: the test lowers the allocation limit to 64 (DM_VK_MAX_ALLOCATIONS, set before the device comes up) and
+# makes hundreds of buffers, images and memory pools under it; alignment and bufferImageGranularity, release and reuse, empty blocks returned after their grace, allocations of
+# their own, a host-visible range written through its pointer and read back through GPU copies, pools moved off a shared import by a decommit beside them
+host_test(t_vk_alloc SOURCES ../../gfx/hostvk/tests/t_vk_alloc.c PROFILE INCLUDES ${REPO}/dm/gfx/nvn ${REPO}/dm/gfx/nvn/include ${REPO}/dm/gfx/tests/vk TMPDIR ENV ${HOSTVK_ENV})
+target_link_libraries(t_vk_alloc PRIVATE nvn_front_obj nvn_vk)
+# The shaders' constants packed into shared banks as the Metal backend packs them (dm/gfx/hostvk/vk_shader.c c1_make, after the profile's c1_full_vk.tsv; step D2), likewise:
+# three starts as child processes (t_vk_harness.h hv_spawn), without the table, with a stale one and with one stamped for the library, each loading and dispatching synthetic
+# compute shaders that read their c1 back on the GPU
+host_test(t_vk_c1 SOURCES ../../gfx/hostvk/tests/t_vk_c1.c PROFILE INCLUDES ${REPO}/dm/gfx/nvn ${REPO}/dm/gfx/nvn/include ${REPO}/dm/gfx/tests/vk TMPDIR ENV ${HOSTVK_ENV})
+target_link_libraries(t_vk_c1 PRIVATE nvn_front_obj nvn_vk)
+# The guest Vulkan layer (docs/design/vulkan-backend.md 8.1, step P9a): t_vk_guest drives guest_vk.c through the entry points a game gets from its vkGetInstanceProcAddr (found by
+# name in the import table, as the loader binds them) on lavapipe under the validation layer, skipped without a Vulkan device as the GPU tests above: the Tegra shape, memory,
+# buffers and images, render passes, pipelines (the two SPIR-V fix-ups among them), draws read back, queries, and a swapchain presented with a layer crop through the backend's
+# headless presenter; t_vk_spirv_fix runs the SPIR-V checks and fix-ups on hand-written modules (no device; spirv-val checks what they produce where it is installed). The
+# shim reads the layer crop from dm/gfx/hle_vi.c, as in nxhost: both link it, and t_vk_guest crops through its vi::SetLayerCrop
+foreach(t IN ITEMS guest spirv_fix)
+    host_test(t_vk_${t} SOURCES ../../gfx/tests/vk/t_vk_${t}.c ../../gfx/hle_vi.c PROFILE INCLUDES ${REPO}/dm/gfx/nvn ${REPO}/dm/gfx/nvn/include ${REPO}/dm/gfx/tests/vk TMPDIR ENV ${HOSTVK_ENV})
+    target_link_libraries(t_vk_${t} PRIVATE nvn_front_obj guest_vk nvn_vk)
+endforeach()
+# t_vk_guest takes the x86-64 engine's arena (aot_arena.c, docs/design/aot-recompiler.md 5.2): the memory the layer maps for the game is arena pages it imports (guest_vk.c
+# gmem_import, VK_EXT_external_memory_host) and the test checks the mappings lie below 2^39; hle_vi.c's objects are the arena's too. t_vk_spirv_fix maps nothing: hle_vi.c
+# takes its native form there (DM_TEST_GUEST_C)
+target_sources(t_vk_guest PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/aot_arena.c ${CMAKE_CURRENT_SOURCE_DIR}/aot_hostfn.c)
+target_include_directories(t_vk_guest PRIVATE ${REPO}/dm/tools/aot/include)
+target_compile_definitions(t_vk_spirv_fix PRIVATE DM_TEST_GUEST_C)
+# The guest OpenGL layer (docs/design/vulkan-backend.md 8.2, step P9b): t_vk_guest_gl drives guest_gl.c through the EGL and GL entries a game gets (eglGetProcAddress found by
+# name in the import table, the GL names from it) on lavapipe under the validation layer, skipped without a Vulkan device as the GPU tests above. Its shader library is built
+# here from the GLSL of dm/gfx/tests/vk/shaders/gl by dm/gfx/tools/gl_shaders.py --vk, so every build checks the tool's output against the layer (glslang 15 in the
+# nxnative-build image; nothing generated is committed, so no glslang version is pinned); where glslangValidator is missing the test is built and skips with a note
+set(T_GL_SHADERS ${REPO}/dm/gfx/tests/vk/shaders/gl)
+set(T_GL_LIB ${CMAKE_BINARY_DIR}/gen/gl_test)
+file(GLOB T_GL_SHADER_FILES CONFIGURE_DEPENDS ${T_GL_SHADERS}/*.vert ${T_GL_SHADERS}/*.frag)
+host_test(t_vk_guest_gl SOURCES ../../gfx/tests/vk/t_vk_guest_gl.c ../../gfx/hle_vi.c PROFILE INCLUDES ${REPO}/dm/gfx/nvn ${REPO}/dm/gfx/nvn/include ${REPO}/dm/gfx/tests/vk TMPDIR ENV ${HOSTVK_ENV})
+target_link_libraries(t_vk_guest_gl PRIVATE nvn_front_obj guest_gl nvn_vk)
+target_compile_definitions(t_vk_guest_gl PRIVATE "T_GL_SHADERS=\"${T_GL_SHADERS}\"" "T_GL_LIB=\"${T_GL_LIB}\"")
+# t_vk_guest_gl takes the x86-64 engine's arena as t_vk_guest does: guest_gl.c puts what the game sees of host memory there (its buffer mappings as imported arena pages, its
+# strings, its fence objects) and the test checks it lies below 2^39; hle_vi.c's objects are the arena's too
+target_sources(t_vk_guest_gl PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/aot_arena.c ${CMAKE_CURRENT_SOURCE_DIR}/aot_hostfn.c)
+target_include_directories(t_vk_guest_gl PRIVATE ${REPO}/dm/tools/aot/include)
+find_program(GLSLANG_VALIDATOR glslangValidator)
+if(GLSLANG_VALIDATOR)
+    add_custom_command(OUTPUT ${T_GL_LIB}/gl-vk/gl_shaders.tsv
+        COMMAND ${Python3_EXECUTABLE} ${REPO}/dm/gfx/tools/gl_shaders.py ${T_GL_SHADERS} ${T_GL_LIB} --vk
+        DEPENDS ${REPO}/dm/gfx/tools/gl_shaders.py ${REPO}/dm/gfx/tools/dmsh_spv.py ${T_GL_SHADER_FILES}
+        COMMENT "the GL test's SPIR-V library (gl_shaders.py --vk)" VERBATIM)
+    add_custom_target(t_vk_guest_gl_lib DEPENDS ${T_GL_LIB}/gl-vk/gl_shaders.tsv)
+    add_dependencies(t_vk_guest_gl t_vk_guest_gl_lib)
+else()
+    target_compile_definitions(t_vk_guest_gl PRIVATE T_GL_NO_GLSLANG=1)
+    string(APPEND MANIFEST "# t_vk_guest_gl skips: glslangValidator was not found when the tree was configured (no GL shader library)\n")
+endif()
+# The window presenter and the vsync source (dm/gfx/hostvk/vk_present.c; docs/design/vulkan-backend.md 7.2 to 7.4, step P4a), on lavapipe under the validation layer as the GPU tests
+# above: a swapchain on a surface of VK_EXT_headless_surface (the window the test registers in place of the front end's), frames of a known picture through be_present_ext, read
+# back from the swapchain images as they go to the presentation engine: the raw bytes of an sRGB frame, the layer crop, the bilinear scale and the black letterbox, the lower-left
+# origin's flip, a new window size remaking the swapchain, the vsync source's ticks; the headless presenter with DM_VK_HEADLESS=1. Skipped without a Vulkan device; without
+# VK_EXT_headless_surface only the headless parts run (a note says what did not)
+host_test(t_vk_present SOURCES t_vk_present.c PROFILE INCLUDES ${REPO}/dm/gfx/nvn ${REPO}/dm/gfx/nvn/include ${REPO}/dm/gfx/hostvk RUNS - --mailbox --headless TMPDIR ENV ${HOSTVK_ENV})
+target_link_libraries(t_vk_present PRIVATE nvn_front_obj nvn_vk)
+# The NVN frontend linked over the null backend (step M6): its entry points called as C functions, a device, a queue and a memory pool made, a command list recorded, submitted and
+# handed by the decoder to the null backend (dm/gfx/tests/t_frontend.c). Here only: on Apple nvn_be.h's functions are the Metal backend's
+host_test(t_frontend SOURCES ../../gfx/tests/t_frontend.c ../../gfx/nvn/hle_nvn.c ../../gfx/nvn/nvn_dirty.c ../../gfx/nvn/nvn_tex.c ../../gfx/nvn/nvn_state.c ../../gfx/nvn/nvn_pools.c
+          ../../gfx/nvn/nvn_replay.c ../../gfx/nvn/nvn_capture.c ../../gfx/tex/nvn_deswizzle.c PROFILE DEFS DM_TEST_GUEST_C INCLUDES ${REPO}/dm/gfx/nvn ${REPO}/dm/gfx/nvn/include)
+target_sources(t_frontend PRIVATE ${NVN_NAMES_C})
+target_link_libraries(t_frontend PRIVATE nvn_null)
+# The host-call thunks and the host-function page: the generator's output for the synthetic entries of t_hle_thunks_entries.c, which t_hle_thunks.c includes
+# (its death tests are skipped on Windows)
+set(T_HLE_THUNKS_C ${CMAKE_BINARY_DIR}/gen/t_hle_thunks.c)
+add_custom_command(OUTPUT ${T_HLE_THUNKS_C}
+    COMMAND ${Python3_EXECUTABLE} ${GEN_HLE_THUNKS} -o ${T_HLE_THUNKS_C} ${TESTS}/t_hle_thunks_entries.c
+    DEPENDS ${GEN_HLE_THUNKS} ${TESTS}/t_hle_thunks_entries.c ${HOST_H}
+    COMMENT "host-call thunks of the test entries" VERBATIM)
+add_custom_target(t_hle_thunks_gen DEPENDS ${T_HLE_THUNKS_C})
+set_source_files_properties(${TESTS}/t_hle_thunks.c PROPERTIES OBJECT_DEPENDS ${T_HLE_THUNKS_C})
+host_test(t_hle_thunks SOURCES t_hle_thunks.c t_hle_thunks_entries.c ../aot_hostfn.c PROFILE INCLUDES ${CMAKE_BINARY_DIR} ${REPO}/dm/tools/aot/include)
+add_dependencies(t_hle_thunks t_hle_thunks_gen)
+# The garena, the one rule's allocator for host memory the guest sees (aot.h, "Host memory the guest sees"; aot_arena.c), over the real arena below 2^39 with the engine's other
+# files left out: size classes and alignments, large blocks and their reuse, the commit hooks, strings and statics, the scoped region and its exhaustion, and the guest-call side
+# of the arena guard (DM_AOT_ARENA_CHECK)
+host_test(t_garena SOURCES t_garena.c ../aot_arena.c ../aot_hostfn.c PROFILE INCLUDES ${REPO}/dm/tools/aot/include)
+# The x86-64 execution engine in the host on the corpus of dm/tools/aot (t_aot_host.c): every corpus NRO mapped by the host's loader, its pack loaded, _start run
+# through dm_aot_run with the host's SVC path, its lines compared with corpus/expected; excl's threads on hle_thread.c, its pause test through SetThreadActivity
+# and GetThreadContext3; a guest call into the host-function page; a write-protected data segment resumed by a fault hook. Each run is a child process. The packs
+# come from dm/tools/aot/tests/build_packs.sh (the nxnative-aot image): this option, or the environment variable NXAOT_PACKS when it is empty; with neither the
+# test prints a note and passes (the Windows runner, a tree built without the packs). Its own host functions get thunks from the generator, as the host's do
+set(NXAOT_PACKS "" CACHE PATH "folder of the corpus packs (dm/tools/aot/tests/build_packs.sh) that t_aot_host runs; empty: the environment variable NXAOT_PACKS")
+set(T_AOT_HOST_THUNKS_C ${CMAKE_BINARY_DIR}/gen/t_aot_host_thunks.c)
+add_custom_command(OUTPUT ${T_AOT_HOST_THUNKS_C}
+    COMMAND ${Python3_EXECUTABLE} ${GEN_HLE_THUNKS} -o ${T_AOT_HOST_THUNKS_C} ${TESTS}/t_aot_host_entries.c
+    DEPENDS ${GEN_HLE_THUNKS} ${TESTS}/t_aot_host_entries.c ${HOST_H}
+    COMMENT "host-call thunks of t_aot_host's entries" VERBATIM)
+set(AOT_TEST_SRC)
+foreach(f IN LISTS AOT_SRC ITEMS hle_svc.c hle_thread.c thread.c loader.c)
+    list(APPEND AOT_TEST_SRC ../${f})
+endforeach()
+host_test(t_aot_host SOURCES t_aot_host.c ../apple_null.c t_aot_host_entries.c t_aot_host_stub.c ${AOT_TEST_SRC} PROFILE INCLUDES ${REPO}/dm/tools/aot/include)
+target_sources(t_aot_host PRIVATE ${T_AOT_HOST_THUNKS_C})
+target_compile_definitions(t_aot_host PRIVATE "T_AOT_CORPUS=\"${REPO}/dm/tools/aot/corpus\"" "T_AOT_PACKS=\"${NXAOT_PACKS}\"")
+set_target_properties(t_aot_host PROPERTIES ENABLE_EXPORTS ON)   # a pack's library resolves dm_aot_svc, nxaot_rt_* and the floating-point helpers against it
+if(NXHOST_JIT)
+    target_compile_definitions(t_aot_host PRIVATE NXHOST_JIT=1)
+    target_link_libraries(t_aot_host PRIVATE nxhost_jit)
+endif()
+set_tests_properties(t_aot_host PROPERTIES TIMEOUT 600)
+# The hot indirect targets of design 12 (t_aot_targets.c; aot_targets.c): fnptr's corpus packs run with DM_AOT_PROFILE write <module>.targets.tsv, a row per inline-cache site
+# and the target it was bound to, as the program's source says (with_cleanup's calls through work_ptr, the vtables, the init and fini arrays), merged across sessions of the
+# image; a host function's target is no row; with nxaot (the environment variable NXAOT) the file round-trips through nxaot build --profile into guarded direct calls that
+# print the program's lines and bind nothing at their sites. The same packs as t_aot_host (without them, a note and a pass); its one host function has a thunk of its own
+host_test(t_aot_targets SOURCES t_aot_targets.c ../apple_null.c t_aot_host_stub.c ${AOT_TEST_SRC} PROFILE INCLUDES ${REPO}/dm/tools/aot/include)
+target_compile_definitions(t_aot_targets PRIVATE "T_AOT_CORPUS=\"${REPO}/dm/tools/aot/corpus\"" "T_AOT_PACKS=\"${NXAOT_PACKS}\"")
+set_target_properties(t_aot_targets PROPERTIES ENABLE_EXPORTS ON)   # a pack's library resolves its imports against it
+if(NXHOST_JIT)
+    target_compile_definitions(t_aot_targets PRIVATE NXHOST_JIT=1)
+    target_link_libraries(t_aot_targets PRIVATE nxhost_jit)
+endif()
+set_tests_properties(t_aot_targets PROPERTIES TIMEOUT 300)
+# A game module through the engine's game-module path (t_aot_module.c): the synthetic module of dm/tools/tests/aot_synth.py (no game files), its behaviour image and
+# manifest as patch_nso.py --aot writes them, packed by build_packs.sh into <packs>/module; loader.c's load_modules maps it, registers its gates, binds its imports into
+# its GOT (a host function of t_aot_module_entries.c, an unimplemented import) and loads its pack; the module runs through dm_aot_run, and its SetHeapSize reaches the
+# stub backend's be_guest_map; an image that is not its manifest's and a pack of another image are refused. The same packs as t_aot_host (without them, a note and a pass)
+set(T_AOT_MODULE_THUNKS_C ${CMAKE_BINARY_DIR}/gen/t_aot_module_thunks.c)
+add_custom_command(OUTPUT ${T_AOT_MODULE_THUNKS_C}
+    COMMAND ${Python3_EXECUTABLE} ${GEN_HLE_THUNKS} -o ${T_AOT_MODULE_THUNKS_C} ${TESTS}/t_aot_module_entries.c
+    DEPENDS ${GEN_HLE_THUNKS} ${TESTS}/t_aot_module_entries.c ${HOST_H}
+    COMMENT "host-call thunks of t_aot_module's entries" VERBATIM)
+host_test(t_aot_module SOURCES t_aot_module.c ../apple_null.c t_aot_module_entries.c t_aot_module_stub.c ${AOT_TEST_SRC} ../hle.c PROFILE INCLUDES ${REPO}/dm/tools/aot/include)
+target_sources(t_aot_module PRIVATE ${T_AOT_MODULE_THUNKS_C})
+target_compile_definitions(t_aot_module PRIVATE "T_AOT_PACKS=\"${NXAOT_PACKS}\"")
+set_target_properties(t_aot_module PROPERTIES ENABLE_EXPORTS ON)   # the pack's imports resolve against it, as against nxhost
+if(NXHOST_JIT)
+    target_compile_definitions(t_aot_module PRIVATE NXHOST_JIT=1)
+    target_link_libraries(t_aot_module PRIVATE nxhost_jit)
+endif()
+set_tests_properties(t_aot_module PROPERTIES TIMEOUT 300)
+# Every way a function address crosses between the host and recompiled code (t_aot_hostfn.c): the host-function module of aot_synth.py --hostfn, packed by build_packs.sh into
+# <packs>/hostfn with its NRO's pack. Its imports bind to the C library passthrough (libc_pass.c), to its entries (t_aot_hostfn_entries.c) and to nn::ro (hle_ro.c); it calls a
+# host function an entry returns, host functions the host wrote into its tables (dm_guest_fnptr), a guest thread the host makes (hle_guestthread.c), and an NRO it loads at
+# run time; and the host calls its code back (aot.h dm_gcall: nested, two levels deep, from a host-created guest thread and from a plain host thread, through hle_thread.c's
+# system events, and a process stop inside a nested call). The generator reads those four sources for the test's thunk table, as it reads nxhost's. The same packs as t_aot_host (without them, a note and a pass)
+set(T_AOT_HOSTFN_THUNKS_C ${CMAKE_BINARY_DIR}/gen/t_aot_hostfn_thunks.c)
+set(T_AOT_HOSTFN_GEN_SRC ${TESTS}/t_aot_hostfn_entries.c ${CMAKE_CURRENT_SOURCE_DIR}/libc_pass.c ${CMAKE_CURRENT_SOURCE_DIR}/hle_ro.c ${CMAKE_CURRENT_SOURCE_DIR}/hle_guestthread.c)
+add_custom_command(OUTPUT ${T_AOT_HOSTFN_THUNKS_C}
+    COMMAND ${Python3_EXECUTABLE} ${GEN_HLE_THUNKS} -o ${T_AOT_HOSTFN_THUNKS_C} ${T_AOT_HOSTFN_GEN_SRC}
+    DEPENDS ${GEN_HLE_THUNKS} ${T_AOT_HOSTFN_GEN_SRC} ${HOST_H}
+    COMMENT "host-call thunks of t_aot_hostfn's entries" VERBATIM)
+host_test(t_aot_hostfn SOURCES t_aot_hostfn.c ../apple_null.c t_aot_hostfn_entries.c t_aot_module_stub.c ../libc_pass.c ../hle_ro.c ../hle_guestthread.c ${AOT_TEST_SRC} ../hle.c
+          PROFILE INCLUDES ${REPO}/dm/tools/aot/include)
+target_sources(t_aot_hostfn PRIVATE ${T_AOT_HOSTFN_THUNKS_C})
+target_compile_definitions(t_aot_hostfn PRIVATE "T_AOT_PACKS=\"${NXAOT_PACKS}\"")
+set_target_properties(t_aot_hostfn PROPERTIES ENABLE_EXPORTS ON)   # the packs' imports resolve against it, as against nxhost
+if(NXHOST_JIT)
+    target_compile_definitions(t_aot_hostfn PRIVATE NXHOST_JIT=1)
+    target_link_libraries(t_aot_hostfn PRIVATE nxhost_jit)
+endif()
+set_tests_properties(t_aot_hostfn PROPERTIES TIMEOUT 300)
+# The host program itself (t_host_program.c): nxhost-run, found beside the test, run as a child process on t_aot_module's synthetic module (DM_AOT_RAW=1: it has no SDK) with
+# SDL's dummy drivers and the headless Vulkan presenter, through its window path (DM_WINDOW=1) and its windowless one; its exit status and its log lines checked; the SDK start's
+# refusal of a module set without nnMain; the usage. Without the packs only the usage and the refusal run (a note says so), as on the Windows runner
+if(NXHOST_PROGRAM)
+    # The linked forced take-over table, checked as Apple's Makefile checks dmhost after its link (nxhost-run --check-tables, loader.c dm_check_tables). Here only: a cross-built
+    # nxhost-run.exe does not run where it is built
+    add_test(NAME nxhost_check_tables COMMAND nxhost-run --check-tables)
+endif()
+if(NXHOST_PROGRAM)
+    host_test(t_host_program SOURCES t_host_program.c DEFS "T_AOT_PACKS=\"${NXAOT_PACKS}\"")
+    add_dependencies(t_host_program nxhost-run)
+    set_tests_properties(t_host_program PROPERTIES TIMEOUT 300)
+endif()
+# The game profile of a run (game_rt.c; "The game profile" above). t_game_profile: every profile of dm/games read back from the file game.py runtime writes for it (all of them,
+# gen/profile/files/<id>.tsv beside the test) equals its row of the compiled-in table, field by field; the reader's refusals and dm_game_profile_select's options.
+# t_host_profile (a Python driver, so it can run game.py): this tree's nxhost-run runs t_host_program's synthetic module under the default, a profile of the table by --game and
+# a DM_GAMES_DIR profile's file by --profile and DM_GAME_PROFILE, each one's constants in its log, and refuses an unknown title ID and bad files with [RED] lines; without the
+# packs only the refusals run
+set(GAME_FILES)
+foreach(tsv IN LISTS GAME_TSVS)
+    cmake_path(GET tsv PARENT_PATH profile_dir)
+    cmake_path(GET profile_dir FILENAME profile_id)
+    list(APPEND GAME_FILES ${GEN}/files/${profile_id}.tsv)
+endforeach()
+add_custom_command(OUTPUT ${GAME_FILES}
+    COMMAND ${Python3_EXECUTABLE} ${REPO}/dm/games/game.py runtime --all ${GEN}/files
+    DEPENDS ${REPO}/dm/games/game.py ${GAME_TSVS} ${GAME_MAPS}
+    COMMENT "every game profile's file (game.py runtime --all), for t_game_profile" VERBATIM)
+add_custom_target(game_profile_files DEPENDS ${GAME_FILES})
+host_test(t_game_profile SOURCES t_game_profile.c PROFILE TMPDIR)
+add_dependencies(t_game_profile game_profile_files)
+if(NXHOST_PROGRAM)
+    host_script_test(t_host_profile INTERPRETER python3 SCRIPT ${TESTS}/t_host_profile.py ARGS --build ${CMAKE_BINARY_DIR} --packs "${NXAOT_PACKS}" READS NXAOT_PACKS
+                     WORKING_DIRECTORY ${CMAKE_BINARY_DIR} SKIP_RETURN_CODE 77 TIMEOUT 300 ENV "TMPDIR=${CMAKE_BINARY_DIR}/tmp")
+endif()
+# The memory SVCs' announcements to the graphics backend (hle_svc.c be_guest_map / be_guest_unmap; docs/design/vulkan-backend.md 4.2), recorded by a stub backend on
+# the small layout of t_svc_memory: which SVCs commit and decommit, the ranges, and that an unmapped range was still readable when announced
+host_test(t_guest_map SOURCES t_guest_map.c ../apple_null.c INCLUDES ${TESTS}/memory_profile)
+
+# ---- The launcher: nxlauncher (dm/launcher; docs/settings.md, "On Windows and Linux") ----
+# Dear ImGui (dm/third_party/imgui) over SDL3's 2D renderer, so it opens on a PC without Vulkan: the games packed on this PC, each game's settings, its pack mode, Play. This file
+# builds Linux and Windows only, never Apple (the Apple apps keep dm/mac/Launcher.swift and dm/ios/Sources/Launcher.swift). Its tests: t_launcher_model (the model over a games
+# folder the test writes: Add game's packer against a stand-in, the saves' backups and restore), t_launcher_window (the program, found beside the test: one frame on SDL's dummy
+# video driver, the starts without the window, --command, --list, and the window driven by --answer and --press: Add game with a stand-in packer, Stop, the saves) and
+# t_launcher_stop (Stop of a stand-in host that installs the host's own plat_on_terminate: SIGTERM on Linux, the named event on Windows; then Force stop of one that ignores it)
+option(NXHOST_LAUNCHER "build the launcher nxlauncher (dm/launcher: Dear ImGui over SDL3's renderer)" ON)
+if(NXHOST_LAUNCHER)
+    enable_language(CXX)
+    add_subdirectory(${REPO}/dm/launcher ${CMAKE_BINARY_DIR}/launcher)
+    foreach(t IN ITEMS t_launcher_model t_launcher_window t_launcher_stop)
+        host_test(${t} SOURCES ../../launcher/tests/${t}.cpp TMPDIR)
+        target_link_libraries(${t} PRIVATE nxlauncher_model)
+        set_target_properties(${t} PROPERTIES CXX_STANDARD 17 CXX_STANDARD_REQUIRED ON CXX_EXTENSIONS OFF)
+    endforeach()
+    add_dependencies(t_launcher_window nxlauncher)
+endif()
+# The player's second pack end to end (t_second_pack.py): nxlauncher --play starts this build's nxhost-run on the synthetic module packed by nxaot, the host writes the JIT misses,
+# --list says a better pack is possible, --repack runs a packer (tests/second_pack/packer.py: the real packer's pack stage and made rows) that packs with --misses, --list says it
+# no longer is, and the game runs again without the JIT fallback. It needs nxaot: this option, else NXAOT in the environment; without it, the packs build_packs.sh prebuilt for it
+# with nxaot (<NXAOT_PACKS>/second_pack: the option NXAOT_PACKS above, else NXAOT_PACKS in the environment; on Windows, where there is no nxaot, the win64-packs artifact); with
+# neither CTest reports it skipped (exit 77). A Python driver: host_scripts.tsv lists it for the runners, which pass NXAOT and NXAOT_PACKS from their environment. The game's
+# profile is a provisional one (this tree's default profile's game.tsv with the synthetic title ID and the module list "main"), whose file the packer writes and the launcher
+# passes to nxhost-run with --profile, as for any pack. On Windows it
+# runs nxhost-run.exe and nxlauncher.exe with launch-windows.tsv and main.aot.dll packs; a host without the JIT fallback (NXHOST_JIT off: the Windows
+# cross-build) stops the first session at the hidden function with status 3, its miss recorded, and the repack is what makes the second session run to its end
+set(NXAOT "" CACHE FILEPATH "nxaot (dm/tools/aot, the nxnative-aot image) for t_second_pack; empty: the environment variable NXAOT")
+if(NXHOST_PROGRAM AND NXHOST_LAUNCHER)
+    file(MAKE_DIRECTORY ${CMAKE_BINARY_DIR}/tmp)
+    host_script_test(t_second_pack INTERPRETER python3 SCRIPT ${TESTS}/t_second_pack.py ARGS --build ${CMAKE_BINARY_DIR} --nxaot "${NXAOT}" --packs "${NXAOT_PACKS}"
+                     READS NXAOT NXAOT_PACKS WORKING_DIRECTORY ${CMAKE_BINARY_DIR} SKIP_RETURN_CODE 77 TIMEOUT 120 ENV "TMPDIR=${CMAKE_BINARY_DIR}/tmp")
+else()
+    string(APPEND MANIFEST "# not registered: t_second_pack (it needs NXHOST_PROGRAM and NXHOST_LAUNCHER)\n")
+endif()
+
+# fork() death tests
+host_test(t_heap_size SOURCES t_heap_size.c PROFILE POSIX)   # its own stand-ins for hle_svc.c's exlaunch calls (upstream's, as on Apple)
+host_test(t_oe SOURCES t_oe.c PROFILE POSIX DEFS DM_TEST_GUEST_C)   # hle_oe.c's native form: its event object a plain static (no arena)
+host_test(t_fpslock SOURCES t_fpslock.c PROFILE POSIX)
+host_test(t_audren_layout SOURCES t_audren_layout.c PROFILE POSIX DEFS DM_TEST_GUEST_C)
+host_test(t_shared_font SOURCES t_shared_font.c PROFILE POSIX DEFS DM_TEST_GUEST_C)
+host_test(t_lifecycle SOURCES t_lifecycle.c ../apple_null.c PROFILE POSIX)   # the graceful exit writes the session's files in full before its suspend's bound (hle_lifecycle.c)
+host_test(t_system_event SOURCES t_system_event.c ../hle_misc.c PROFILE POSIX DEFS DM_TEST_GUEST_C INCLUDES ${REPO}/dm/tools/aot/include)   # hle_misc.c: the ec purchased-item take-overs it calls (as Apple's Makefile links it)
+host_test(t_symbols SOURCES t_symbols.c PROFILE POSIX)
+host_test(t_svc_memory SOURCES t_svc_memory.c POSIX INCLUDES ${TESTS}/memory_profile DEFS DM_TEST_GUEST_C)
+host_test(t_svc_memory_unlimited SOURCES t_svc_memory.c POSIX INCLUDES ${TESTS}/memory_profile DEFS DM_GAME_MEM_MAP_LIMIT=0 DM_TEST_GUEST_C)
+host_test(t_svc_memory_16k SOURCES t_svc_memory.c POSIX INCLUDES ${TESTS}/memory_profile DEFS TEST_PAGE_16K DM_TEST_GUEST_C)
+# Not portable yet (Apple only, dm/host/tests/Makefile): t_altstack (crash.c's signal stack: native execution), t_audio and t_audio_device (the Core Audio render callback,
+# device and AudioUnit watchdog; t_audio_sdl checks the SDL3 output here), t_motion_apple, t_motion_pro_mac and t_haptics_apple (Apple frontends: GameController, IOKit,
+# Core Haptics; t_front_sdl checks the SDL3 front end here), t_svc_memory_dirty (the dirty-page tracker, dm/gfx/nvn/nvn_dirty.c, under real faults: it needs host pages larger than the guest's 4 KB, as Apple's 16 KB)
+
+file(WRITE ${CMAKE_BINARY_DIR}/host_tests.tsv "${MANIFEST}")
+file(WRITE ${CMAKE_BINARY_DIR}/host_scripts.tsv "${SCRIPTS}")

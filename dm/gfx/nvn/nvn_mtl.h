@@ -14,6 +14,7 @@ void bf_want_note(const char *key);
 
 // Memory pool: [mem, mem+size) is expanded outward to page boundaries to build a zero-copy buffer; look up the buffer and offset by GPU address (= CPU address)
 void mtl_pool_add(const void *mem, uint64_t size);
+void mtl_pool_add_flags(const void *mem, uint64_t size, uint32_t nvn_flags);   // the same with the pool's NVN flags, kept in the shared pool table (be_pool_add; mtl_pool_add passes 0)
 void mtl_pool_addressed(const void *mem, uint64_t size);   // the game holds a GPU address in this range, so raw global memory may reach it
 void mtl_pool_del(const void *mem);
 void mtl_pool_replace(const void *const *del, int ndel, const void *const *add, const uint64_t *size, int nadd);   // in one step for every lookup (a sparse pool's runs, hle_nvn.c vrun_set)

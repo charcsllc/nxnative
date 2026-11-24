@@ -3,21 +3,20 @@
 #include "../hle_misc.c"
 void dm_applet_enter(const char *name) { (void)name; }   // hle_oe.c: the shop and error stand-ins hold the game out of focus
 void dm_applet_leave(void) {}
-#include <mach-o/getsect.h>
 
 static int unexpected, checks, fails;
 void *guest_sym(const char *name) { (void)name; unexpected++; return NULL; }
 module_t *module_of(const void *p) { (void)p; unexpected++; return NULL; }
 void hle_bind_system_event(void *g, int autoclear) { (void)g; (void)autoclear; unexpected++; }
+PLAT_TABLE_DEFINE(swforce)   // the real forced registrations (on Apple: getsectiondata of __DATA,swforce)
 // hle_codec_video.c: GameChat's camera images, recorded
 static int blanks_live, blank_w, blank_h; static uint32_t blank_next = 0x80000000u;
 uint32_t dm_native_image_blank(uint32_t w, uint32_t h) { blanks_live++; blank_w = (int)w; blank_h = (int)h; return ++blank_next; }
 void dm_native_image_blank_free(uint32_t handle) { if (handle >> 31) blanks_live--; }
-extern const struct mach_header_64 _mh_execute_header;
 #define CHECK(c, msg) do { checks++; if (!(c)) { fails++; fprintf(stderr, "FAIL: %s\n", msg); } } while (0)
 static void *hook(const char *name) {
-    unsigned long bytes = 0;
-    const hle_force_ent *e = (const hle_force_ent *)getsectiondata(&_mh_execute_header, "__DATA", "swforce", &bytes);
+    size_t bytes = 0;
+    const hle_force_ent *e = (const hle_force_ent *)plat_table_swforce(&bytes);
     void *fn = NULL; unsigned count = 0;
     for (size_t i = 0; e && i < bytes / sizeof *e; i++) {
         if (strcmp(e[i].name, name)) continue;

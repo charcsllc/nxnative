@@ -1,0 +1,561 @@
+// The x86-64 execution engine's run time in the host (docs/design/aot-recompiler.md): the guest's code, recompiled ahead of time into a pack's library by
+// `nxaot build` (dm/tools/aot), runs on host threads with the registers it does not keep in host registers in a state block per thread (design 2.1,
+// dm/tools/aot/include/nxaot/guest_state.h). It reaches the host through the SVC path and the host-function page (2.4), leaves for the JIT fallback where it has
+// no compiled code (2.5, 11), and stops at safepoint polls (6.2). Built by dm/host/CMakeLists.txt only, where DM_NATIVE_EXEC is 0 (plat/plat.h): the Apple ARM64
+// builds, which run the guest's code natively, never compile these files.
+//   aot_arena.c   the arena below 2^39 (5.2), guest memory the host allocates in it, module images mapped one to one (5.1, 5.3), packs loaded and looked up (9.4)
+//   aot_run.c     what a pack imports (include/nxaot/aot_module.h): the SVC path, the dispatcher's miss path, traps, the JIT fallback, safepoints, the counter;
+//                 dm_guest_call and the outermost level of a guest thread; process stop
+//   aot_thread.c  a state block per guest thread, its native and alternate signal stacks (6.1), the live threads
+//   aot_fault.c   faults (5.4): the dirty-tracking hooks first, then (with the JIT) dynarmic's fastmem handler, then the report through the line table (3.5)
+//   aot_fp.c      the floating-point and AES helpers lifted code calls (dm/tools/aot/src/lift/runtime.h), in C
+//   aot_profile.c the sampler (DM_AOT_PROFILE) and its profile and misses files; aot_targets.c beside them, the targets the inline caches were bound to (design 12)
+// The JIT fallback is dynarmic (dm/tools/aot/src/rt/jit.cpp), built in only with the CMake option NXHOST_JIT (it needs C++20 and Boost's headers)
+#pragma once
+#include "dm.h"
+#include "nxaot/aot_module.h"
+#include <setjmp.h>
+#include <stdatomic.h>
+
+#if DM_NATIVE_EXEC
+#error "aot.h belongs to the x86-64 execution engine: native ARM64 builds run the guest's code directly"
+#endif
+
+// What a pack's library resolves against the host executable (CMake ENABLE_EXPORTS)
+#if defined(_WIN32)
+#define DM_AOT_EXPORT __declspec(dllexport)
+#else
+#define DM_AOT_EXPORT __attribute__((visibility("default")))
+#endif
+
+// ---------- The arena (design 5.2) ----------
+// One reservation below 2^39, the Switch's 39-bit address space, taken at startup; everything the guest can see is in it (module images, the guest block of
+// hle_svc.c with its heap, alias and stack regions, TLS blocks and thread-local regions, the host-function page, the stacks the host makes for guest code, NVN's
+// virtual pool ranges, the guest Vulkan layer's mappings, Unreal's heap on the host allocator, and every host allocation handed to the guest: the garena below).
+// State blocks and native stacks stay outside it. 256 GiB of address space (nothing is charged until taken): a game's guest block (5 GB for Unreal games, 64 GB with a
+// Switch-sized DM_ALIAS_SIZE), an RE Engine virtual pool of 64 GB (hle_nvn.c vpool_reserve), the module images and the host's guest heaps fit with room, and its end
+// (320 GiB) stays below 2^39 (512 GiB)
+#define DM_AOT_ARENA_BASE 0x1000000000ull    // 64 GiB (2^36)
+#define DM_AOT_ARENA_SIZE 0x4000000000ull    // 256 GiB reserved, nothing accessible until taken
+#define DM_AOT_HOST_RETURN (DM_AOT_ARENA_BASE + 0x10)   // the x30 host code enters guest code with: an address no code lives at (the arena's first page stays inaccessible)
+void dm_aot_arena_init(void);              // reserve the arena and place the host-function page in it; once, later calls do nothing; dies when the range is taken
+int dm_aot_in_arena(uint64_t a, uint64_t n);
+void *dm_guest_reserve(size_t n);          // n bytes of arena (whole pages, a range given back first), inaccessible: the owner opens them with plat_vm_protect (hle_svc.c's guest block)
+void *dm_guest_alloc(size_t n);            // n bytes of arena, readable, writable and zero
+void dm_guest_free(void *p, size_t n);     // a dm_guest_alloc or dm_guest_reserve range back to the arena (inaccessible until taken again)
+
+// ---------- Host memory the guest sees: the one rule (design 5.2) ----------
+// Every byte of host memory the guest's code may read, write or keep the address of lies in the arena: on Apple the guest sees all host memory and these are the plain
+// malloc / stack array / string literal, here they are the arena's. A host file keeps Apple's text and picks the form with its own macros, as GUEST_CALL picks the call:
+// the plain C form where DM_NATIVE_EXEC (Apple) or DM_TEST_GUEST_C (a unit test that supplies the guest's functions as C functions), the dm_garena form here
+// (hle_audren.c, hle_codec.c, hle_movie.c, hle_swkbd.c, ...: GUEST_MALLOC, GUEST_FREE, GUEST_STR, GUEST_LOCAL, ...). The family:
+//   dm_garena_alloc(n, align)     n bytes, zero, aligned to align (a power of two; 0 means 16): a heap of size classes up to 16 KiB in 64 KiB slabs (each 64 KiB-aligned,
+//                                 one class per slab, kept readable and writable), whole pages above (a freed block up to 1 MiB kept for its size, at most 64 MiB of them;
+//                                 larger ones decommitted at once). Thread-safe; dies with a [RED] line when the arena is full, as the arena does
+//   dm_garena_malloc(n, align)    the same without the zeroing (a host allocator handed to the guest: hle_uemalloc.c's Unreal heap)
+//   dm_garena_realloc(p, n, align), dm_garena_free(p), dm_garena_size(p)   realloc, free (NULL: nothing) and the usable size (0: p is no garena block) of a garena block
+//   dm_garena_strdup(s)           a copy of the host string s, freed with dm_garena_free
+//   dm_garena_literal(s)          a copy of a string with static storage (a literal, a C library's zone name) made once and kept for good, found again by s's address:
+//                                 for a host string the guest only reads (a key handed to an SDK function, a name an entry returns)
+//   dm_garena_static(slot, init, n)   n bytes made once (a copy of init when given, else zero) and kept in *slot: a static the guest keeps the address of (an event
+//                                 object the host owns, a struct handed back on every call); thread-safe
+//   dm_gscope_mark / dm_gscope_alloc / dm_gscope_release   the scoped form, for the arrays Apple's text puts on the host stack and passes to guest code: a bump region of
+//                                 DM_GSCOPE_SIZE per host thread in the arena, made at the thread's first use and given back at its exit (a pthread key's destructor);
+//                                 an allocation is 16-byte aligned and zero, valid until the mark taken before it is released. One that does not fit is taken from the
+//                                 garena instead, with a [RED] line once per thread, and released with the mark as well. DM_GLOCAL(type, name, n) declares type *name over
+//                                 n zeroed elements and releases them when the enclosing block ends (GNU C's cleanup attribute, as hle_fs.c's PATH_LOCK), the scope of
+//                                 Apple's stack array; a non-local exit (longjmp) past it leaves the region's top where it was until an outer mark is released
+//   dm_garena_set_commit_hooks(map, unmap)   the graphics backend's view of the pages these functions commit and decommit (be_guest_map / be_guest_unmap, set by the
+//                                 host program, main_x86.c): a pool the game places in such memory (Unreal's heap) is imported by Vulkan like any committed guest memory
+// The guard: DM_AOT_ARENA_CHECK=1 (docs/env_switches.tsv) checks, at every host-call thunk (gen_hle_thunks.py: the pointer parameters and the pointer result of each entry,
+// opaque handle types left out) and at every pointer argument of DM_GUEST_CALL (below), that a non-null address above the first 64 KiB is in the arena, and logs a [RED]
+// line once per site for one that is not (dm_aot_arena_flag). dm_guest_call's own arguments are integers to it (their types are gone): its sites are listed in aot_arena.c
+#define DM_GSCOPE_SIZE 0x10000u              // the scoped region of a host thread: 64 KiB of arena
+void *dm_garena_alloc(size_t n, size_t align);
+void *dm_garena_malloc(size_t n, size_t align);
+void *dm_garena_realloc(void *p, size_t n, size_t align);
+void dm_garena_free(void *p);
+size_t dm_garena_size(const void *p);
+char *dm_garena_strdup(const char *s);
+const char *dm_garena_literal(const char *s);
+void *dm_garena_static(void *_Atomic *slot, const void *init, size_t n);
+void dm_garena_set_commit_hooks(void (*map)(void *mem, uint64_t size), void (*unmap)(void *mem, uint64_t size));
+typedef uint64_t dm_gscope_t;
+dm_gscope_t dm_gscope_mark(void);
+void *dm_gscope_alloc(size_t n);
+void dm_gscope_release(dm_gscope_t mark);
+static inline void dm_gscope_cleanup(dm_gscope_t *mark) { dm_gscope_release(*mark); }
+#define DM_GLOCAL(type, name, n)                                                                                                   \
+    dm_gscope_t DM_GC_CAT(name, _gscope_) __attribute__((cleanup(dm_gscope_cleanup), unused)) = dm_gscope_mark();                  \
+    type *name = (type *)dm_gscope_alloc(sizeof(type) * (size_t)(n))
+// A static the guest keeps the address of, of type type, made once in the arena (zero, or a copy of *init): DM_GSTATIC(type, slot, init) is a type * (slot: a
+// static void *_Atomic of the caller's)
+#define DM_GSTATIC(type, slot, init) ((type *)dm_garena_static(&(slot), (init), sizeof(type)))
+extern _Atomic int dm_aot_arena_check;     // DM_AOT_ARENA_CHECK: -1 until read (dm_aot_arena_init), then 0 or 1
+// An address outside the arena where a guest-visible one belongs: a [RED] line naming site (a file or entry name), line and pos (the argument, 0 for a result), once per
+// site and position
+void dm_aot_arena_flag(const char *site, unsigned line, int pos, uint64_t v, const char *what);
+// A module image at a fresh base in the arena, one to one (5.1): len bytes, then bss zero bytes; [0, ro_end) readable and never executable (3.2, 5.3: a host jump
+// into guest text faults at once), the rest readable and writable. *mapped gets the size taken (whole pages). Dies when the arena is full
+uint8_t *dm_aot_image_map(const uint8_t *bytes, size_t len, size_t bss, uint64_t ro_end, size_t *mapped);
+
+// ---------- Packs (design 9.4) ----------
+typedef struct dm_aot_pack dm_aot_pack;
+// The identity a pack's descriptor must match: the image it was compiled from
+typedef struct { uint8_t sha256[32]; uint64_t image_size, text_end, bss_size; } dm_aot_identity;
+// Load the pack's library for module m (mapped, relocated): dlopen (LoadLibrary on Windows, then the DLL's import slots bound against this executable's exports:
+// nxaot_imports, dm/tools/aot/README.md "Windows packs"; the DLL may lie anywhere, outside the arena), the descriptor of NXAOT_MODULE_ABI (3) checked against id, the module's base
+// written to *desc->base, the line table and function map indexed, the pack registered with the dispatcher. NULL with the reason in err when it does not load
+// or does not match
+dm_aot_pack *dm_aot_pack_load(const char *path, module_t *m, const dm_aot_identity *id, char *err, size_t errn);
+const nxaot_module_desc *dm_aot_pack_desc(const dm_aot_pack *p);
+uint32_t dm_aot_module_fpcr(void);        // the FPCR the loaded packs are specialised for (7.1): the first pack's, 0 before any
+const nxaot_lookup_entry *dm_aot_find(uint64_t guest, const dm_aot_pack **pack);   // the lookup slot of the function at a guest address, NULL when none
+const void *dm_aot_entry_of(const nxaot_lookup_entry *e);                            // its standard entry
+int dm_aot_is_return(uint64_t guest);     // the address after a call site of compiled code (desc->returns): where a native frame may wait
+const dm_aot_pack *dm_aot_pack_of_code(uint64_t host_pc);                            // the pack whose library holds host_pc (async-signal-safe)
+const void *dm_aot_pack_jit_entry(const dm_aot_pack *p);
+uint64_t dm_aot_pack_base(const dm_aot_pack *p);     // the guest address of its module's image
+// A guest address as "name+0x…" of the module (pack) that holds it; the address alone outside them (async-signal-safe: no allocation)
+void dm_aot_guest_name(uint64_t guest, char *out, size_t n);
+// A host pc in compiled code as the guest function and instruction the function map and line table give (3.5); 0 when host_pc is not in a pack (signal-safe)
+int dm_aot_where(uint64_t host_pc, char *out, size_t n);
+// The guest instruction dm_aot_where names for host_pc (the line table's entry at or before it in its function: exact for a memory access), as a guest address; 0 when none
+uint64_t dm_aot_line_of_code(uint64_t host_pc);
+// A game module's pack (loader.c, "The game-module path"): <dir>/<name>.aot.so (.aot.dll on Windows), beside the manifest <name>.aot.tsv and the behaviour image <name>.image.bin
+// it was built from (nxaot build <dir>/<name>.aot.tsv -o <object> --shared <dir>/<name>.aot.so). The game's input folder is <NSP folder>/<id>_build/aot_<version>/, beside the
+// rewritten modules of Apple's patched_<version>/
+#if defined(_WIN32)
+#define DM_AOT_PACK_SUFFIX ".aot.dll"
+#else
+#define DM_AOT_PACK_SUFFIX ".aot.so"
+#endif
+// Load module m's pack from dir with the identity of its image (the SHA-256 the loader computed over image.bin, its size, text and bss): 0, or 1 with the reason in err
+int dm_aot_load_module_pack(module_t *m, const char *dir, const uint8_t sha256[32], uint64_t image_size, uint64_t text_end, uint64_t bss, char *err, size_t errn);
+// The gates a module's manifest asks for (its obs and spin rows, design 1.1) against the gate sites its loaded pack's code calls (the descriptor's gates, ABI 3):
+// kind NXAOT_GATE_OBS (offset: the observed instruction; arg: the number | parameter << 8) or NXAOT_GATE_SPIN (offset: a back-edge; arg: its head). A site of
+// the pack's that no row names, or names otherwise, is a pack of another manifest: 1 with the reason in err. A row the pack does not serve (its code holds no
+// discovered function, nxaot build said so) is a [RED] line each, and *unserved their count: its observer or back-off does not run. 0 otherwise
+#ifndef DM_AOT_GATE_ROW
+#define DM_AOT_GATE_ROW   // loader.c declares the same (it is compiled into unit tests without the engine's headers)
+typedef struct dm_aot_gate_row { uint64_t offset, arg; uint32_t kind; } dm_aot_gate_row;
+#endif
+int dm_aot_pack_check_gates(const module_t *m, const dm_aot_gate_row *rows, int n, int *unserved, char *err, size_t errn);
+// The same rows for the JIT fallback (aot_run.c): its gate sites, served or not by the pack, at m's addresses. Called by load_modules before guest code runs
+void dm_aot_gate_rows(const module_t *m, const dm_aot_gate_row *rows, int n);
+
+// ---------- Imports of the modules the engine maps (design 2.4) ----------
+// loader.c bind_sym: what an import of module m (named name) binds to, from the address v Apple would bind: unchanged for a module outside the arena (a test's hand-made image),
+// 0 (an undefined weak import), a loaded module's definition and guest memory; a host function's slot in the host-function page (aot_hostfn.h dm_guest_fn); an
+// unimplemented import's named stub (hle.c resolve_import returns &unimpl_stubs[k]) its slot in the stub page. A host function with no host-call thunk stops the load with a red line
+uint64_t dm_aot_bind(const module_t *m, const char *name, uint64_t v);
+// The named stubs of unimplemented imports: Apple's entry.S assembles 4096 (hle.c MAX_STUB); here the array is only their identities, never executed, and each has a slot of
+// DM_AOT_HOSTFN_SLOT bytes in the stub page, in the arena after the host-function page (readable, brk words). A guest call to slot k runs hle.c unimpl_c(k, x): its UNIMPL line
+// once and 0 in x0, as Apple's stub does
+#define DM_AOT_STUBS 4096
+extern uint64_t unimpl_stubs[DM_AOT_STUBS];
+uint64_t dm_aot_stub_addr(unsigned k);     // the guest address of stub k's slot
+long dm_aot_stub_index(uint64_t guest);    // the stub whose slot starts at guest, -1 for any other address
+uint64_t dm_aot_hostfn_find(const void *host_fn);   // aot_hostfn.c: host_fn's slot in the host-function page, 0 when it is no entry's C function (dm_guest_fn dies there)
+
+// ---------- Host functions handed to the guest (design 2.4) ----------
+// A host function's address means nothing to recompiled code: whatever the host hands the guest as a function (a vtable slot it writes into guest memory, a thread
+// entry or callback it passes to a guest function, a get-proc-address result) must be the function's guest-visible address. The one rule, for every such place:
+//   dm_guest_fnptr(fn)               the slot of fn's host-call thunk in the host-function page. NULL stays NULL, and an address the guest can already reach (guest
+//                                    memory, a loaded module, a slot) is returned as it is, so a table that mixes the guest's functions and the host's goes through it
+//                                    whole. A host function with no thunk gets a [RED] line (once per function) and a stub slot named after it, which answers a call
+//                                    as an unimplemented import's does (hle.c unimpl_c: an UNIMPL line, 0). On Apple the address is the guest's: no form is needed there
+//                                    (the sites keep Apple's text under DM_NATIVE_EXEC)
+//   dm_guest_fnptr_named(fn, name)   the same for a lookup by name (vkGetInstanceProcAddr, eglGetProcAddress, nvnDeviceGetProcAddress: the thunk of every entry that
+//                                    returns a function pointer calls it, gen_hle_thunks.py), quietly: a result with no thunk (an NVN function the host does not
+//                                    implement, DM_GL_STUBS's stubs) becomes the stub named name, whose first call says UNIMPL <name>, as Apple's stubs report theirs
+// Which host functions have thunks: the entries of the import tables (HLE, HLE_FORCE, NVN, VK, GL, EGL, PASS) and every function defined with HLE_LINKAGE outside a
+// macro (hle.h: static on Apple, external here), the form for a host function the guest reaches only through a pointer (hle_uemalloc.c's FMalloc slots, hle_misc.c's
+// ProfanityFilter vtable, hle_guestthread.c's thread entry). Safe on any thread
+void *dm_guest_fnptr(const void *fn);
+void *dm_guest_fnptr_named(const void *fn, const char *name);
+
+// ---------- Guest threads (design 6.1) ----------
+// A guest thread's engine state: the state block (64-byte aligned, outside the arena, at offset 0 so that a block names its thread), the base its guest code
+// leaves through, its JIT instance. One per host thread that runs guest code, made at its first use
+#if defined(_WIN32)
+// The C runtime's _setjmp with no frame (as mingw-w64's __USE_MINGW_SETJMP_NON_SEH): its longjmp then restores the registers with no SEH unwind on the way out (guest frames
+// hold nothing to run, as siglongjmp skips them on POSIX). Not __builtin_setjmp: on x86-64 Windows clang stores the frame address in the buffer, which is the frame pointer
+// less its prologue's offset (rbp = rsp + 0x80 in guest_vcall), while the landing code addresses the frame through rbp unchanged, so a __builtin_longjmp landed with rbp
+// 0x80 bytes low and read the frame's saved values wrong (every leave of guest code: an exit, a stop, a fault)
+typedef jmp_buf dm_aot_jmp_buf;
+#define dm_aot_setjmp(b) _setjmp((b), NULL)
+#define dm_aot_longjmp(b) longjmp((b), 1)
+#else
+typedef sigjmp_buf dm_aot_jmp_buf;
+#define dm_aot_setjmp(b) sigsetjmp((b), 1)            // the signal mask too: the fault path leaves from a signal handler
+#define dm_aot_longjmp(b) siglongjmp((b), 1)
+#endif
+enum { DM_AOT_LEFT_NONE, DM_AOT_LEFT_EXIT, DM_AOT_LEFT_STOP, DM_AOT_LEFT_FAULT };   // why a thread's guest code left (dm_aot_thread.left)
+// A call the JIT fallback's driver makes into compiled code (aot_run.c jit_loop's native_call), while it runs: the guest frames the JIT had made when it stopped at the
+// compiled entry, which compiled code's native frames do not show. A fault in the compiled code it called names them between the compiled frames around them
+// (aot_fault.c dm_aot_fault_backtrace). On the native stack of the call, innermost first (dm_aot_thread.jit_calls); each guest call level puts back the list it began with
+typedef struct dm_aot_jitcall {
+    uint64_t ra;                       // the native return address into the driver after this call: the native frame where a walk outward meets it
+    uint64_t x29, x30;                 // the guest's x29 and x30 at the call (the JIT wrote them back when it stopped at the compiled entry)
+    uint64_t lr, sp;                   // the driver level's: the guest return address it runs until (the frame further out returns there), its SP when it began
+    int entered;                       // the level was entered from compiled code (nxaot_rt_jit), not a guest call's outermost level
+    struct dm_aot_jitcall *outer;
+} dm_aot_jitcall;
+#define DM_AOT_FAULT_JITCALLS 8
+// A running guest thread's registers for a state dump (hle_thread.c svc_thread_dump: DM_CTL threads, the stall watchdog's dumps), taken by the thread itself at its next
+// safepoint, where the block holds its whole register file and pc (design 6.2): a poll of compiled code (a function's entry, a loop's back-edge) or a block boundary of the
+// JIT fallback (dm_jit_halt). A signal cannot give them: at an arbitrary instruction compiled code's registers have no fixed home, and the JIT keeps its pc in its own
+// state at block ends only
+enum { DM_AOT_SAMPLE_POLL = 1, DM_AOT_SAMPLE_JIT = 2 };   // dm_aot_sample.where: compiled code's poll, the JIT fallback's block boundary
+typedef struct { uint64_t x[31], sp, pc; uint32_t nzcv, fpcr, where; } dm_aot_sample;
+typedef struct dm_aot_thread {
+    dm_guest_state st;                 // first: (dm_aot_thread *)st is its thread
+    dm_aot_jmp_buf base;               // the innermost dm_guest_call on this thread: each level keeps the one around it and puts it back when it returns
+    int depth;                         // dm_guest_call nesting: 0 while no guest code runs on the thread
+    volatile int left;                 // DM_AOT_LEFT_*: set before the jump to base
+    _Atomic int exiting;               // ExitThread was answered (hle_thread.c thread_exit): the thread leaves when the SVC returns
+    void *jit;                         // its dm_jit instance (NXHOST_JIT), made at its first use
+    uint64_t stack_lo, stack_size;     // a guest stack the host made for it (the main thread's: hle_svc.c QueryMemory reports it), 0 when none
+    // A fault in guest code (aot_fault.c): the facts, reported after the jump to base. fault_jit_regs: in a memory access of the JIT fallback (fault_jit_pc),
+    // the guest's registers at that access are in st (aot_run.c fault_report, rt/jit.h dm_jit_fault_state)
+    int fault_signal, fault_jit_regs;
+    uint64_t fault_address, fault_pc, fault_jit_pc;
+    struct dm_aot_thread *next;        // the live threads (process stop)
+    void *mem;                         // the allocation that holds this struct
+    int host;                          // a host thread that is no guest thread, given a guest context by dm_gcall (counted live only while it runs guest code)
+    // Where the sampler (aot_profile.c, DM_AOT_PROFILE) puts a sample taken outside compiled code: 0 for guest code or the run time, DM_AOT_PROF_JIT inside the JIT fallback,
+    // else the guest address whose host code runs (a host call's return address, an SVC's instruction). Written by aot_run.c on this thread, read by its signal handler
+    volatile uint64_t prof_at;
+    // A guest fault's native frames (aot_fault.c, Linux): the return addresses the unwinder found above the faulting instruction, taken in the signal handler before the jump
+    // to base (the frames are gone after it); fault_report names the compiled ones as guest call sites. fault_nbt 0: none taken (Windows, the JIT fallback, no unwinder).
+    // With them, the JIT driver's calls into compiled code then in progress (jit_calls, copied: they are on the frames the jump discards), innermost first
+    int fault_nbt, fault_njit;
+    uint64_t fault_bt[48];
+    dm_aot_jitcall fault_jit[DM_AOT_FAULT_JITCALLS];
+    dm_aot_jitcall *jit_calls;         // the JIT driver's calls into compiled code in progress on this thread, innermost first (NULL: none)
+    // A state dump's request for this thread's registers (dm_aot_thread_sample): set with the poke, answered at the next safepoint (dm_aot_thread_sampled) into
+    // sample, sample_seq counting the answers (both under aot_thread.c's list lock)
+    _Atomic int sample_req;
+    uint32_t sample_seq;
+    dm_aot_sample sample;
+} dm_aot_thread;
+dm_aot_thread *dm_aot_self(void);          // the calling thread's, NULL when it never ran guest code
+dm_guest_state *dm_aot_thread_begin(void); // the calling thread's state block, made at its first call (x30 the host-return address, FPCR the packs')
+dm_guest_state *dm_aot_self_state(void);   // NULL on a thread without one
+uint64_t dm_aot_threads_made(void);        // threads that ran guest code so far
+void dm_aot_thread_end(void);              // the calling thread runs no more guest code: its block goes (hle_thread.c, after the thread left)
+// A guest thread's body (hle_thread.c thread_main): its entry with x0 = arg on the guest stack sp until it leaves (ExitThread, a process stop, a fault).
+// Returns the DM_AOT_LEFT_* reason; an entry that returns is a red line and a process stop (Horizon requires svcExitThread)
+int dm_aot_thread_run(uint64_t entry, uint64_t arg, uint64_t sp);
+void dm_aot_thread_poke(dm_guest_state *st);   // a pause or stop request: the poll byte set and the thread's JIT instance halted (safe on any thread)
+// Another thread's registers at its next safepoint (above dm_aot_sample): asks st's thread with a poke and waits up to ms milliseconds. 1 with *out filled; 0 when the
+// thread reached no safepoint meanwhile (it runs host code: a host call, an SVC, a host wait), out->where 0 and out->pc its prof_at then; -1 when st is no live
+// thread's block or the caller's own. st need not be alive: it is only compared with the live threads' blocks before anything is read. The thread goes on at once
+// after it answered (no pause)
+int dm_aot_thread_sample(dm_guest_state *st, unsigned ms, dm_aot_sample *out);
+void dm_aot_thread_sampled(dm_aot_thread *t, uint32_t where);   // aot_run.c, at a safepoint (the block whole): answers a request, else nothing
+// The state dump's lines for a guest thread that runs (hle_thread.c svc_thread_dump, a thread in no wait and no SVC): a few samples (dm_aot_thread_sample) with their pcs,
+// the first one's registers and its frames from x29, or where it was when it reached no safepoint. Only in a dump crash_dump_now makes (DM_CTL threads, the stall
+// watchdog), on an ordinary thread; a crash report's dump runs in a signal handler, which may not wait, and prints nothing here (aot_fault.c)
+void dm_aot_thread_dump(dm_guest_state *st, uint32_t handle);
+void dm_aot_thread_exiting(void);              // ExitThread was answered on the calling thread: it leaves when the SVC returns
+void dm_aot_set_tls(uint64_t tpidr_el0, uint64_t tpidrro_el0);   // thread.c: the TLS registers' initial values, for the calling thread's block (now or when made)
+// loader.c: a module image as it is (an NRO), mapped one to one in the arena, parsed, relocated and bound as load_modules does, loaded (design 9.4)
+module_t *loader_add_image(const char *name, const uint8_t *bytes, size_t len, size_t bss, uint64_t text_end, uint64_t ro_off, uint64_t data_off);
+// loader.c: the NRO the game hands ro::LoadModule (hle_ro.c), n bytes with that SHA-256, at its first load: its row in load_modules' nro.tsv names it, its image is mapped
+// one to one in the arena and its pack <folder>/<name>.aot.so loaded with the image's identity; an NRO module then (m->nro), not yet loaded (nro_load relocates it). NULL
+// with the reason in err when it has no row, is no NRO, or its pack is missing or of another image. The caller serializes loads (hle_ro.c's lock)
+module_t *loader_nro_map(const uint8_t *image, uint32_t n, const uint8_t sha256[32], char *err, size_t errn);
+void dm_aot_thread_set_jit(void *jit);         // the calling thread's JIT instance, halted at once when a pause or stop was requested before it existed
+// Every live guest thread poked (process stop); returns how many other than the caller are live
+int dm_aot_threads_poke_all(void);
+int dm_aot_threads_live(void);                 // live guest threads other than the caller
+int dm_aot_threads_wait(unsigned ms);          // wait until the caller is the last live guest thread; 0 when it is, else how many are left
+int dm_aot_main_stack(uint64_t *lo, uint64_t *size);   // the guest stack the host made for the calling thread (QueryMemory); 0 when none
+
+// ---------- The run time (aot_run.c) ----------
+// Exit statuses of a run (the same numbers as dm/tools/aot's nxaot_host, rt::Status, up to 7). DM_AOT_REPACK, nxhost-run's own: a pack the host refuses at the
+// start, which packing the game again with this bundle cures (dm_aot_pack_refused); the launcher (dm/launcher launcher_model.h kRepackStatus) offers the repack for it
+// DM_AOT_NO_VULKAN, nxhost-run's own too: the game asked for a window (DM_WINDOW, not DM_VK_HEADLESS) and no Vulkan device meets the backend's baseline (no loader, no
+// driver, a device below design 9.1): it would run with nothing drawn, so it stops at the device's bring-up with one [RED] line (vk_backend.c, hvk_require_device).
+// DM_AOT_NO_FONT: the game asked for the shared font and the system has none of the fonts that stand in for it (hle_sdk16.c font_get): Horizon always has its
+// shared fonts, so a game only waits for them, for ever. The launcher explains both (dm/launcher launcher_model.h exit_problem)
+enum { DM_AOT_EXITED = 0, DM_AOT_TRAP = 1, DM_AOT_USAGE = 2, DM_AOT_JIT_NEEDED = 3, DM_AOT_FAULT = 4, DM_AOT_RETURNED = 6, DM_AOT_STUCK = 7, DM_AOT_REPACK = 8,
+       DM_AOT_NO_VULKAN = 9, DM_AOT_NO_FONT = 10 };
+// A pack of the game's module set refused at the start (loader.c load_modules: dm_aot_load_module_pack or dm_aot_pack_check_gates failed), for any of the reasons a repack
+// with this bundle cures: the pack file missing or not a library this program loads; no nxaot_module descriptor; its ABI not this host's (NXAOT_MODULE_ABI); compiled from
+// another image than the module's (another game version, a manifest rewritten since); the loader's bindings of its PLT slots not the ones it assumed (another host's
+// take-overs, nxaot_bindings); on Windows an import this program does not export (a pack of another nxaot); a gate site its manifest lacks (a pack of another manifest).
+// The reason as a [RED] line, then a [RED] line naming the repack and the status, and the process ends with DM_AOT_REPACK
+_Noreturn void dm_aot_pack_refused(const char *err);
+// Call guest code at addr from the host (design 2.4): x0..x7 from the arguments, the 9th to the 16th in the guest stack's 8-byte slots below SP (AAPCS64's stacked
+// arguments, each one 64 bits wide), x30 = the host-return address, the module's MXCSR, then the native entry, the host-function page or the JIT. The registers
+// it does not set (x8, v0..v7) go in as the block holds them, so a caller with an indirect result or floating-point arguments sets them first; x1 and v0 hold the
+// rest of a result after it. Returns x0 when the guest returns; the callee-saved registers, x30, SP and pc of the guest code around the call are kept.
+// Nested re-entry: a host function that guest code called (its host-call thunk on this thread's native stack) may call guest code again on the same block; the
+// guest goes on below the SP of the host call, the thunk gets its block back as it left it but for the argument registers, and every level is a base of its own.
+// When guest code leaves (ExitThread, a process stop, a trap, a fault), the innermost call returns 0 with dm_aot_self()->left saying why, so the host function
+// around it runs to its end (its locks released), and the host call that made it leaves in turn when it returns (aot_run.c host_call), level by level to the outermost
+// call; a further guest call before that returns 0 at once. A fault is reported at the level that catches it. Limits: a non-local transfer (longjmp, a C++ exception)
+// out of nested guest code past the host function that called it stops the process with a [RED] line (the host's frames between cannot be unwound); a nested call made
+// while the thread's JIT instance runs (an SVC answered inside the JIT fallback) cannot use the JIT and stops the same way
+uint64_t dm_guest_call(dm_guest_state *st, uint64_t addr, int nargs, ...);
+// The process's main guest thread: entry with x0, x1, on a guest stack the host makes (8 MiB in the arena), until the process stops (svcExitProcess, a trap,
+// the JIT fallback needed and not built in, a fault, guest code returning to the host); then every other guest thread is stopped (6.2's polls, SVCs, waits)
+// and waited for, at most 10 s. Returns the status; *seconds the guest time
+int dm_aot_run(uint64_t entry, uint64_t x0, uint64_t x1, double *seconds);
+// dm_aot_run in parts, for a start that makes several outermost calls on the main thread (the host program's SDK bootstrap, main_x86.c: nn::init::Start's steps, then nnMain):
+//   dm_aot_main_begin  the calling thread's block with the main guest stack and the packs' FPCR, left reset; every dm_guest_call on it then starts from that stack
+//   dm_aot_main_left   why the calling thread's guest code left (DM_AOT_LEFT_*): DM_AOT_LEFT_NONE after a call that returned, else the start goes no further
+//   dm_aot_main_end    the end of the main thread's guest code: a return to the host (left still DM_AOT_LEFT_NONE) is a process stop with DM_AOT_RETURNED and the [RED] line
+//                      `returned`, or with DM_AOT_EXITED when returned is NULL (nnMain returning ends the process as on Horizon); then as dm_aot_run, the status
+dm_guest_state *dm_aot_main_begin(void);
+int dm_aot_main_left(void);
+int dm_aot_main_end(const char *returned);
+// Stop the process's guest code: the first status wins; every guest thread leaves at its next poll, SVC, JIT block boundary or kernel wait. why: a [RED]
+// line, logged once (NULL for none)
+void dm_aot_stop(int status, const char *why);
+int dm_aot_stop_status(void);              // -1 while running
+_Noreturn void dm_aot_leave(int why);      // the calling guest thread leaves its guest code (to its innermost dm_guest_call, which returns 0)
+// ---------- Guest functions the host calls (design 2.4) ----------
+// Apple's host calls guest code through plain C function pointers: an SDK function from guest_sym (the original of a forced take-over, the audio renderer's and the
+// movie decoder's SDK functions, nn::os's system events), a callback the game registered (NVN's command-memory callback, the inline keyboard's), a module's DT_INIT.
+// Here each such call is a guest call:
+//   dm_gcall(fn, nargs, ...)      fn's guest address called with nargs integer or pointer arguments (each passed as uint64_t), on the calling thread's state block:
+//                                 nested inside the host call the thread is answering (the usual case: every such site runs on a guest thread, inside an HLE entry or
+//                                 the body of a host-created guest thread, hle_guestthread.c), or as an outermost call (the main thread between its start's steps).
+//                                 A host thread that is no guest thread gets a guest context of its own at its first call (aot_thread.c dm_aot_host_thread_begin: a state
+//                                 block, a 1 MiB guest stack in the arena and thread.c's TLS block and thread-local region, all freed when the thread ends), with a
+//                                 [RED] line once per thread: it has no SDK thread, so guest code that asks nn::os for its current thread or makes a thread SVC fails
+//                                 there (hle_thread.c dies: "thread SVC called from a non-guest thread"), as such a call has no meaning on Apple either
+//   DM_GUEST_CALL(f, args...)     the call site's form, where Apple writes f(args...): the arguments widened to 64 bits (pointers and integers; a float or double
+//                                 argument stops the link at dm_gcall_float_argument), at most 16, the result converted to the type f returns from x0 (an integer
+//                                 narrower than 64 bits keeps x0's low bits, which AAPCS64 defines; a float or double result stops the link at
+//                                 dm_gcall_float_result, and a struct result does not compile: such a site reads x1 / v0 or passes x8 itself, with dm_guest_call)
+// The host files keep Apple's text: each defines GUEST_CALL as the plain call where the guest's code is native (DM_NATIVE_EXEC) or where a unit test supplies the
+// guest's functions as C functions (DM_TEST_GUEST_C), and as DM_GUEST_CALL here
+uint64_t dm_gcall(const void *fn, int nargs, ...);
+dm_guest_state *dm_aot_host_thread_begin(uint64_t why_addr);   // aot_thread.c: the calling host thread's guest context (dm_gcall above); the block when it has one
+void dm_aot_host_thread_active(int on);   // aot_thread.c: a host thread's outermost guest call starts (1) or ends (0): it counts as a live guest thread meanwhile
+uint64_t dm_gcall_float_argument(void);   // never defined: a float or double argument of DM_GUEST_CALL fails the link
+uint64_t dm_gcall_float_result(void);     // never defined: DM_GUEST_CALL of a function returning float or double fails the link
+#define DM_GC_ISFP(x) (__builtin_types_compatible_p(__typeof__(x), float) || __builtin_types_compatible_p(__typeof__(x), double))
+// A pointer argument (an array or a string literal decays to one; the argument is not evaluated) goes through the arena guard (DM_AOT_ARENA_CHECK, above), pos counting from 1
+#define DM_GC_ISPTR(x) (__builtin_classify_type(x) == 5)
+static inline uint64_t dm_gc_arg(uint64_t v, int isptr, const char *file, unsigned line, int pos) {
+    if (isptr && v >= 0x10000 && v - DM_AOT_ARENA_BASE >= DM_AOT_ARENA_SIZE && atomic_load_explicit(&dm_aot_arena_check, memory_order_relaxed) > 0)
+        dm_aot_arena_flag(file, line, pos, v, "guest call argument");
+    return v;
+}
+#define DM_GC_A(x, pos) dm_gc_arg((uint64_t)__builtin_choose_expr(DM_GC_ISFP(x), dm_gcall_float_argument(), (uint64_t)(uintptr_t)(x)), DM_GC_ISPTR(x), __FILE__, __LINE__, (pos))
+#define DM_GC_N(...) DM_GC_N_(0, ##__VA_ARGS__, 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1, 0)
+#define DM_GC_N_(z, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16, n, ...) n
+#define DM_GC_CAT(a, b) DM_GC_CAT_(a, b)
+#define DM_GC_CAT_(a, b) a##b
+// DM_GC_Mk(n, args...): the last k of the n arguments, each widened; the first of them is argument n - k + 1
+#define DM_GC_M0(n, ...)
+#define DM_GC_M1(n, a) , DM_GC_A(a, (n))
+#define DM_GC_M2(n, a, ...) , DM_GC_A(a, (n) - 1) DM_GC_M1(n, __VA_ARGS__)
+#define DM_GC_M3(n, a, ...) , DM_GC_A(a, (n) - 2) DM_GC_M2(n, __VA_ARGS__)
+#define DM_GC_M4(n, a, ...) , DM_GC_A(a, (n) - 3) DM_GC_M3(n, __VA_ARGS__)
+#define DM_GC_M5(n, a, ...) , DM_GC_A(a, (n) - 4) DM_GC_M4(n, __VA_ARGS__)
+#define DM_GC_M6(n, a, ...) , DM_GC_A(a, (n) - 5) DM_GC_M5(n, __VA_ARGS__)
+#define DM_GC_M7(n, a, ...) , DM_GC_A(a, (n) - 6) DM_GC_M6(n, __VA_ARGS__)
+#define DM_GC_M8(n, a, ...) , DM_GC_A(a, (n) - 7) DM_GC_M7(n, __VA_ARGS__)
+#define DM_GC_M9(n, a, ...) , DM_GC_A(a, (n) - 8) DM_GC_M8(n, __VA_ARGS__)
+#define DM_GC_M10(n, a, ...) , DM_GC_A(a, (n) - 9) DM_GC_M9(n, __VA_ARGS__)
+#define DM_GC_M11(n, a, ...) , DM_GC_A(a, (n) - 10) DM_GC_M10(n, __VA_ARGS__)
+#define DM_GC_M12(n, a, ...) , DM_GC_A(a, (n) - 11) DM_GC_M11(n, __VA_ARGS__)
+#define DM_GC_M13(n, a, ...) , DM_GC_A(a, (n) - 12) DM_GC_M12(n, __VA_ARGS__)
+#define DM_GC_M14(n, a, ...) , DM_GC_A(a, (n) - 13) DM_GC_M13(n, __VA_ARGS__)
+#define DM_GC_M15(n, a, ...) , DM_GC_A(a, (n) - 14) DM_GC_M14(n, __VA_ARGS__)
+#define DM_GC_M16(n, a, ...) , DM_GC_A(a, (n) - 15) DM_GC_M15(n, __VA_ARGS__)
+#define DM_GUEST_CALL(f, ...)                                                                                                         \
+    ((void)__builtin_choose_expr(DM_GC_ISFP((f)(__VA_ARGS__)), dm_gcall_float_result(), 0),                                          \
+     (__typeof__((f)(__VA_ARGS__)))dm_gcall((const void *)(uintptr_t)(f), DM_GC_N(__VA_ARGS__)                                       \
+                                            DM_GC_CAT(DM_GC_M, DM_GC_N(__VA_ARGS__))(DM_GC_N(__VA_ARGS__), __VA_ARGS__)))
+
+// Counters (the engine's own; the tests read them)
+//   misses               dispatcher misses that bound an inline cache to a standard entry: of the calling pack's, or of another pack's (cross_pack)
+//   cross_pack           of those, the ones into another pack: the inline cache then calls that pack's standard entry directly (the same signature, ABI 3)
+//   cross_pack_handovers calls into another pack of another signature or mode, handed over through jit_entry and that pack's enter at every call
+//   obs_gates, spin_gates  calls of the packs' gates (nxaot_rt_gate, design 1.1): observation gates, spin waits' back-edges
+//   jit_ahead            JIT instances made ahead by the helper thread (dm_aot_jit_prepare: at the first pack's load), the decoder table with the first
+//   jit_taken            instances a thread's first JIT use took ready (made ahead, or given back by a thread that ended)
+//   jit_made_on_use      instances a thread's first JIT use made itself, on its own path (none was ready or being made, or another first use already waited for it)
+//   jit_waits            first uses that waited for the instance being made ahead (the miss came before the helper was done), jit_wait_ns in total
+//   jit_first_use_ns     the longest time a thread's first JIT use took to get its instance: taken ready, waited for, or made with dynarmic's decoder table
+typedef struct {
+    uint64_t svcs, host_calls, misses, cross_pack, safepoints, jit_runs, jit_addresses, threads;
+    uint64_t cross_pack_handovers, obs_gates, spin_gates;
+    uint64_t jit_ahead, jit_taken, jit_made_on_use, jit_waits, jit_wait_ns, jit_first_use_ns;
+} dm_aot_stats_t;
+void dm_aot_stats(dm_aot_stats_t *out);
+// The JIT fallback's instances made ahead of their threads' first use (aot_run.c; dm/tools/aot/src/rt/jit.h dm_jit_prepare): a helper thread builds dynarmic's decoder
+// table and makes one instance, so that the first thread to reach code no pack holds does not stop for them (about 100 ms optimised, 235 ms as dm/host builds the
+// JIT's glue, without optimisation). Once per process, at
+// the first pack's load (aot_arena.c dm_aot_pack_load calls it through dm_aot_pack_loaded, which aot_run.c sets when the program starts: some tests link aot_arena.c
+// alone); later calls do nothing. Without the JIT (NXHOST_JIT off) nothing
+void dm_aot_jit_prepare(void);
+extern void (*_Atomic dm_aot_pack_loaded)(void);
+uint32_t dm_aot_guest_mxcsr(uint32_t fpcr);   // the MXCSR guest code runs with (7.1): exceptions masked, RMode as rounding control, FZ as FTZ and DAZ
+
+// What a pack's library imports (include/nxaot/aot_module.h), defined by aot_run.c and aot_fp.c and exported from the executable
+DM_AOT_EXPORT void dm_aot_svc(dm_guest_state *st, uint32_t number);
+DM_AOT_EXPORT void *nxaot_rt_dispatch(dm_guest_state *st, uint64_t target, const nxaot_ic_desc **slot, uint64_t site);
+DM_AOT_EXPORT void nxaot_rt_trap(dm_guest_state *st, uint64_t offset, uint32_t reason);
+DM_AOT_EXPORT void nxaot_rt_jit(dm_guest_state *st, uint64_t lr, uint64_t sp);
+DM_AOT_EXPORT void nxaot_rt_safepoint(dm_guest_state *st);
+DM_AOT_EXPORT uint64_t dm_aot_cntpct(dm_guest_state *st);
+// An observation gate or a spin wait's back-edge at guest address pc (a manifest's obs and spin rows, registered by loader.c in hle.c's gate table): st holds the whole register
+// file, which an observer may change (OBS_STDALLOC_INIT writes x2), so the caller reloads x0..x29 after it; a spin wait's back-off runs as an SVC frame (hle.c gate_dispatch)
+DM_AOT_EXPORT void dm_aot_gate(dm_guest_state *st, uint64_t pc);
+// The lifter's call of design 1.1 (include/nxaot/aot_module.h): compiled code at the gate site at module offset site of its pack (an entry of the descriptor's gates)
+// with st holding the whole register file and st->pc; dm_aot_gate at the site's guest address, then a process stop leaves from here
+DM_AOT_EXPORT void nxaot_rt_gate(dm_guest_state *st, uint64_t site);
+// The JIT fallback's stop kind at guest address pc (rt/jit.h stop_at: DM_JIT_ENTRY or DM_JIT_RETURN, or'ed with DM_JIT_GATE_AT at a manifest's gate row; only the gate under
+// DM_AOT_JIT_ALL), as its code reader asks once per translated instruction; 0 without NXHOST_JIT. For tests and measurements (t_aot_module times it)
+int dm_aot_jit_stop_at(uint64_t pc);
+
+// ---------- The sampler (aot_profile.c; dm/tools/aot/README.md, "Tiers by profile" and "The sample profile at tier H") ----------
+// DM_AOT_PROFILE=<folder> (docs/env_switches.tsv): every thread that runs guest code is sampled DM_AOT_PROFILE_HZ times (1000 by default) per second of its own CPU time, and at process
+// exit (atexit, or dm_aot_profile_write before it) <folder>/<module>.tsv is written for every module with samples: the profile `nxaot build --profile` reads (one module per file), one
+// line `<module offset> <samples>` per sampled guest instruction (design 12), most samples first, under '#' lines naming the module, its build ID, its image's SHA-256 and its pack
+// (and beside it <module>.misses.tsv, the JIT fallback's misses: below).
+// A sample in a pack's code counts for the function the pack's function map gives (a split function's parts and a group's functions each map to their own entry), and at the guest
+// instruction the pack's positions give for the interrupted pc (include/nxaot/aot_module.h, "The sampler's positions": the instruction whose code holds it, in inlined code the call
+// the inlining replaced, never outside the function); one in a host call or an SVC for the guest function that made it (dm_aot_thread.prof_at), at no instruction; one in the JIT
+// fallback or elsewhere in the host only in the totals (aot_profile.c count_pc, the same on both systems). The file has a row per instruction with samples, and a row at its entry for
+// a function with samples at no instruction (only in host calls and SVCs, in code the positions name none for, or in a pack without positions), as the sampler wrote before positions:
+// what makes a function sampled for nxaot's tiers is a sample anywhere in it, what weighs its code at tier H the samples at its instructions. Linux: a CPU-time timer per thread
+// (timer_create, CLOCK_THREAD_CPUTIME_ID, SIGEV_THREAD_ID) and a SIGPROF handler on the thread's alternate stack that reads the interrupted rip. Windows: a sampler thread that, for
+// each registered guest thread whose CPU time (QueryThreadCycleTime) has grown by a period, suspends it, reads its Rip (GetThreadContext, CONTEXT_CONTROL) and resumes it. The counts
+// are per function and per guest instruction of a pack (relaxed atomic adds), the totals per thread, nothing allocated or locked while a sample is taken; the files are the same on both
+#define DM_AOT_PROF_JIT 1
+void dm_aot_profile_init(void);            // the switches read, the handler (Windows: the sampler thread) installed and the writer registered with atexit; once (the first thread to
+                                           // run guest code makes it too)
+int dm_aot_profile_on(void);               // DM_AOT_PROFILE is set and the sampler runs
+void dm_aot_profile_thread_begin(void);    // aot_thread.c: the calling thread made its state block (its timer starts; Windows: the sampler may suspend it from now on)
+void dm_aot_profile_thread_end(void);      // aot_thread.c: the calling thread's block goes (its timer stops, or the sampler lets it go; its totals are kept)
+// The JIT fallback's runs measured per thread (aot_run.c run_jit, with DM_AOT_PROFILE): the calling thread's CPU time, and a run that began at cpu0 under FPCR fpcr0 and ended
+// under fpcr1 (other0 / other1: another FPCR than the packs'). The writer logs each thread's runs, their CPU time and the part spent under another FPCR (design 7.1)
+uint64_t dm_aot_profile_cpu_ns(void);
+// A JIT run (aot_run.c run_jit): _begin, whether it is timed (0: no; else the weight its time counts with) and the thread's CPU clock then; _run after it
+unsigned dm_aot_profile_jit_begin(int other0, uint64_t *cpu0);
+void dm_aot_profile_jit_run(uint64_t cpu0, unsigned weight, uint32_t fpcr0, uint32_t fpcr1, int other0, int other1);
+// The miss (pc, reason) that begins this thread's JIT continuation (aot_run.c run_jit, a run with a reason): every later run of the thread counts for it until the
+// next miss, a run going on after compiled code the JIT called returned into it included. The writer logs the 80 heaviest as `aot: profile: JIT time from
+// <module>+<offset> (<miss word>, thread '<the first thread's name>'): <runs> runs, <s> s`, then a line for the rest: the JIT fallback's share by its cause
+// (dm/tools/aot/README.md, "Static cases of a br left to the dispatcher")
+void dm_aot_profile_jit_origin(uint64_t pc, uint32_t reason);
+int dm_aot_profile_write(void);            // the files now, sampling stopped (once: later calls and the atexit writer do nothing); 0 when written
+// The sampled threads' totals so far and, with DM_AOT_PROFILE_HOST=1, the host's samples by native pc (object file, offset, nearest exported symbol), written to path while
+// sampling goes on (DM_CTL `profmark <path>`): two marks around a stretch of play say where the game's threads spent their CPU time in it. 0 when written
+int dm_aot_profile_mark(const char *path);
+// The sampler's lookups (aot_arena.c): async-signal-safe (no lock, no allocation: a pack's tables are complete before it is published and never change)
+int dm_aot_pack_count(void);
+const dm_aot_pack *dm_aot_pack_at(int i);
+int dm_aot_is_case(uint64_t guest);   // a case of its function's br in its module's pack (nxaot_cases; aot_arena.c)
+// The function of compiled code at host_pc, as its index in pack *pack's functions by module offset (dm_aot_pack_fn): >= 0; -1 when host_pc is in no pack's code; -2 in a pack's code
+// but in none of its functions (the tables' object: enter, jit_entry, the slow-path wrappers)
+long dm_aot_fn_of_code(uint64_t host_pc, int *pack);
+// The guest instruction whose code holds host_pc, a pc in function fn of pack `pack` (what dm_aot_fn_of_code gave): its module offset (>= 0) by the pack's positions; -1 when the pack has
+// none or they name no instruction there; -2 when they name one outside [entry, entry + size) of fn (never counted: the sampler's totals keep how many, none expected)
+int64_t dm_aot_offset_of_code(uint64_t host_pc, int pack, long fn);
+long dm_aot_fn_of_guest(uint64_t guest, int *pack);   // the function whose guest code [entry, entry + size) holds guest, as above; -1 when none
+size_t dm_aot_pack_fn_count(const dm_aot_pack *p);
+uint64_t dm_aot_pack_fn(const dm_aot_pack *p, size_t i);       // the module offset of the entry of its i-th function by module offset
+uint64_t dm_aot_pack_fn_end(const dm_aot_pack *p, size_t i);   // and of the end of its guest code (entry + size)
+const nxaot_positions *dm_aot_pack_pos(const dm_aot_pack *p);  // its positions (aot_module.h), NULL when it has none the sampler can use
+_Atomic uint64_t *dm_aot_pack_samples(const dm_aot_pack *p);   // the sampler's count per function (index as dm_aot_pack_fn), made at the load when DM_AOT_PROFILE is set; else NULL
+// The sampler's count per guest instruction of the text (index: module offset / 4; *words entries), made at the load when DM_AOT_PROFILE is set and the pack has positions; else NULL
+_Atomic uint32_t *dm_aot_pack_pos_samples(const dm_aot_pack *p, uint64_t *words);
+const module_t *dm_aot_pack_module(const dm_aot_pack *p);
+const char *dm_aot_pack_path(const dm_aot_pack *p);
+
+// ---------- The hot indirect targets (aot_targets.c; design 12; dm/tools/aot/README.md, "Hot indirect targets") ----------
+// With DM_AOT_PROFILE=<folder>, nxaot_rt_dispatch notes every inline-cache miss of a pack's indirect calls and branches (dm_aot_target_note): the site's module offset, the target, what
+// the dispatcher did with it. At exit (atexit, or dm_aot_targets_write before it: hle_lifecycle.c's graceful exit calls it beside dm_aot_profile_write) <folder>/<module>.targets.tsv
+// is written per module whose caches were bound to its own functions: '#' lines naming the module, its build ID, its image's SHA-256 and its pack (as the profile's), then
+// `0x<site> 0x<target> <binds>` per site and target (module offsets: the blr or br, the function its cache was bound to; binds: how many times the dispatcher bound that cache to
+// it: once per cache for a site with one target, once per switch back to it for a site with several; the caches keep no count of hits). Merged with an earlier session's file of the
+// same image (a guarded pack's hits never reach the dispatcher), another image's replaced. `nxaot build --profile <folder>/<module>.tsv` reads it beside the profile: a site at tier
+// H whose target dominates calls that target directly behind a compare (a guarded call). The kinds of a miss: bound to a standard entry of the caller's pack (the rows), bound to
+// another pack's, handed to another pack of another signature, a host function (the host-function page, the stub page), no compiled entry (the JIT fallback): only the first
+// written, the others counted in the log
+enum { DM_AOT_TARGET_BOUND, DM_AOT_TARGET_OTHER_PACK, DM_AOT_TARGET_HANDOVER, DM_AOT_TARGET_HOST, DM_AOT_TARGET_NOCODE };
+void dm_aot_target_note(const dm_aot_pack *caller, uint64_t site, uint64_t target, int kind);   // a miss at module offset site of caller's code; nothing without DM_AOT_PROFILE
+int dm_aot_targets_write(void);   // the files now (once: later calls and the atexit writer do nothing); 0 when written or nothing to write; -1 without DM_AOT_PROFILE, or on an error
+
+// ---------- The JIT fallback's misses (aot_run.c counts them, aot_profile.c writes them; design 1.3 and 11, dm/tools/aot/README.md "JIT misses") ----------
+// Every entry into the JIT fallback is counted per guest address and reason (aot_run.c note_jit): why the pack had no compiled code there. With DM_AOT_PROFILE=<folder> the
+// profile's writer puts them, per module with a pack, in <folder>/<module>.misses.tsv beside its profile: '#' lines naming the module, its build ID, its image's SHA-256 and
+// its pack (as the profile's), then one line `<module offset> <reason> <entries>` per address and reason, by offset. An earlier session's file of the same image is merged
+// in (its entries added), so what one pack's misses taught stays for the next; another image's is replaced. `nxaot build --misses <file>` takes them as roots of discovery.
+// The reasons, and what nxaot makes of the address:
+//   indirect      an indirect branch (blr, br: the dispatcher's miss) to an address with no compiled entry        an entry with a standard entry and a lookup slot
+//   call          a direct branch or call (b, bl) to an address that is no compiled function's entry            an entry
+//   host          a call from the host (dm_guest_call) to an address with no compiled entry                     an entry with a standard entry and a lookup slot
+//   nocode        compiled code that ran on into an address that is no compiled function's entry               an entry
+//   nonlocal      a non-local transfer (longjmp, an exception, 3.3) to a continuation no native frame took       a resume point of the function holding it (else an entry)
+//   fpcr, refused, untranslated, other: msr fpcr left the module's FPCR, a function the lifter refused, an encoding it does not translate: misses no pack serves
+// A run of the JIT that goes on with code it was already running (after a compiled entry it called returned into it, a host call, a pause, a stop at the return of a call the
+// JIT made itself) is no miss (its address still counts in dm_aot_stats' jit_addresses), and no miss is recorded under DM_AOT_JIT_ALL. The [RED] line comes once per address
+// and reason. A host before the tail-call fix (dm/tools/aot/README.md, "Tail calls and the native frame's return") wrote every such stop as `nonlocal`: an earlier session's
+// rows merged into a file stay; such a file is best removed before the next pack, whose resume points they would only add
+typedef struct { uint64_t pc, count; uint32_t reason; } dm_aot_miss;
+// The (address, reason) pairs so far into out[0..max) (a copy, under the table's lock): their number (with out NULL, all of them); *dropped: entries the full tables did not keep
+size_t dm_aot_jit_misses(dm_aot_miss *out, size_t max, uint64_t *dropped);
+const char *dm_aot_miss_word(uint32_t reason);   // a reason's word in the misses file; NULL for none of a pack
+
+// ---------- The loader's bindings (loader.c finds them, aot_profile.c writes them, aot_arena.c checks a pack's; dm/tools/aot/README.md "PLT stubs bound to their own module") ----------
+// With DM_AOT_PROFILE=<folder> the profile's writer puts, per module with a pack (not an NRO's, which binds only when the game loads it), <folder>/<module>.bind.tsv beside its
+// profile: the '#' header lines of the misses file (module, build ID, image SHA-256, pack), then one line `<slot offset> <target offset> <symbol>` per PLT slot the loader bound to
+// a function of the module itself (the forced take-overs, an earlier module's definition of the name and the host's HLE decide: loader.c bind_sym). `nxaot build --bind <file>`
+// takes a stub of such a slot as a tail call of that function and records the bindings in the pack (nxaot_bindings); dm_aot_pack_load compares them with the slots once the
+// module is relocated and refuses the pack, naming the slot, when the loader bound one otherwise
+size_t loader_self_bindings(const module_t *m, void (*fn)(uint64_t slot, uint64_t target, const char *name, void *arg), void *arg);
+// A pack refused for its bindings writes its module's bindings file at once (with DM_AOT_PROFILE), as the session ends there: the next pack takes the current ones.
+// aot_arena.c calls it through dm_aot_bindings_refused, which aot_profile.c's constructor sets (null in the tests that link the arena without the sampler)
+void dm_aot_bindings_now(const module_t *m, const uint8_t sha256[32], const char *pack);
+// nxhost-run --bindings <folder> (main_x86.c, loader.c load_modules): the module set mapped and relocated as a start makes it, each module's bindings written to
+// <folder>/<module>.bind.tsv in the profile's form (none for a module with none), and the process ends before any pack is loaded or guest code runs: the packer's
+// bindings for a first pack (scripts/build_ipa_from_nsp.py), from the loader itself, so that the first pack's units are the second's (dm/tools/aot/README.md,
+// "PLT stubs bound to their own module"). 1 when a file could not be written
+int dm_aot_write_module_bindings(const char *dir, const module_t *m, const uint8_t sha256[32], const char *pack);
+extern void (*_Atomic dm_aot_bindings_refused)(const module_t *, const uint8_t *, const char *);
+
+// ---------- The calling guest's context, and backtraces (aot_fault.c) ----------
+// On Apple the guest's code calls the host natively, so a host function finds its guest caller in its own frames (__builtin_return_address, __builtin_frame_address, the
+// x29 chain from there). Here a host function runs on the native stack below the run time's x86 frames (2.4, 3.2), which name nothing of the guest's: the guest's context
+// is the calling thread's state block, which holds the whole register file during a host call (the hand-over before it, aot_run.c host_call) and an SVC (2.4):
+//   dm_aot_guest_lr()         the guest address whose host code runs on this thread: a host call's return address (x30, the call site + 4: what Apple's
+//                             __builtin_return_address(0) gives a host function the guest called) or an SVC's instruction (dm_aot_thread.prof_at); 0 when the thread is in
+//                             no host call (no guest code, compiled code, the JIT fallback, or nested guest code the host called)
+//   dm_aot_guest_backtrace()  "[dm] bt:" with dm_aot_guest_lr, then dm_backtrace's walk from the block's x29 (the frame record of the function that made the call):
+//                             the call site and the guest frames above it, as Apple's
+//                             dm_backtrace((uint64_t)__builtin_frame_address(1)) prints them from a host function the guest called; "[dm] bt: (no guest call)" outside one
+// dm_backtrace(fp) (dm.h) walks the guest's frame records from fp ([fp] the caller's fp, [fp + 8] the return address), each return address as module+offset: it stops at a
+// record outside the arena or not 8-byte aligned, a caller fp that does not grow (a corrupt or cyclic chain), a read that fails, and after 32 records; a record whose return
+// address is the host-return address (DM_AOT_HOST_RETURN: the outermost frame of a guest call the host made) prints "host" and goes on to the guest frames of the host call
+// around it when its fp leads there (that host call's own call site is in no frame record, only in the host's frames: the next entry is the frame above it), and ends
+// the line otherwise
+uint64_t dm_aot_guest_lr(void);
+void dm_aot_guest_backtrace(void);
+// A guest fault's "[dm] bt:" line (aot_run.c fault_report, after its [RED] line): the frames above the faulting instruction, from its native frames in compiled code
+// (Linux), from the guest's own x29 at the faulting access in the JIT fallback, or from the last x29 written back (aot_fault.c has the cases)
+void dm_aot_fault_backtrace(const dm_aot_thread *t);
+
+// ---------- Faults (aot_fault.c) ----------
+void crash_install(void);                  // the fault handlers (signals on POSIX, a vectored exception handler on Windows); once
+void crash_thread_init(void);              // the calling thread's alternate signal stack (POSIX) or stack guarantee (Windows)
+void dm_aot_fault_after_jit(void);         // after the first JIT instance, on its thread: the host's handler again in front of dynarmic's (5.4's order), and the thread's
+                                           // own alternate stack again in place of the one dynarmic installed and frees at exit (docs/reference/threads.md)
+                                           // (POSIX; on Windows nothing: dynarmic's handler there is frame-based, a function table over its code cache, and it
+                                           // takes no alternate stack: aot_fault.c)
+
+// ---------- The thread layer's side (hle_thread.c, x86-64 only) ----------
+int thr_safepoint(void);                   // a poll found the poll byte set: wait here while SetThreadActivity pauses this thread; 1 when it waited
+void thr_stop_all(void);                   // process stop: every kernel wait woken (cancelled), every pause released
+int thr_handles(uint32_t *out, int max, uint32_t except);   // the handles of the live (started, not exited) guest threads, but except's

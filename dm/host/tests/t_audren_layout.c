@@ -5,20 +5,37 @@
 #include "../hle.h"
 #include <assert.h>
 #include <errno.h>
+#if defined(__APPLE__)
 #include <mach/mach.h>
 #include <mach/thread_policy.h>
+#endif
 #include <sys/wait.h>
 #include <unistd.h>
 static int wait_for_render(pthread_cond_t *, pthread_mutex_t *, const struct timespec *);
-static kern_return_t render_policy_set(thread_t, thread_policy_flavor_t, thread_policy_t, mach_msg_type_number_t);
 #define pthread_cond_timedwait_relative_np wait_for_render
+// The render thread's real-time policy is Mach's (hle_audren.c render_rt): its checks run on Apple only; elsewhere render_rt is a declared null form (one [RED] line, no policy)
+#if defined(__APPLE__)
+static kern_return_t render_policy_set(thread_t, thread_policy_flavor_t, thread_policy_t, mach_msg_type_number_t);
 #define thread_policy_set render_policy_set
+#endif
 #include "../hle_audren.c"
+#if defined(__APPLE__)
 #undef thread_policy_set
+#endif
 #undef pthread_cond_timedwait_relative_np
+#if !defined(__APPLE__) && !defined(_WIN32)   // winpthreads has the function
+// Apple's relative condition wait, which wait_for_render falls back to: the same wait to an absolute real-time deadline (as hle_audren.c's own form)
+static int pthread_cond_timedwait_relative_np(pthread_cond_t *c, pthread_mutex_t *m, const struct timespec *rel) {
+    struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl);
+    dl.tv_sec += rel->tv_sec; dl.tv_nsec += rel->tv_nsec;
+    if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
+    return pthread_cond_timedwait(c, m, &dl);
+}
+#endif
 
 // Synthetic render loops must not promote the test runner. One short-lived pthread below exercises the real Mach boundary.
 static struct { int live, started, active, fail, sets, resets; } policy;
+#if defined(__APPLE__)
 static kern_return_t render_policy_set(thread_t thread, thread_policy_flavor_t flavor, thread_policy_t p, mach_msg_type_number_t n) {
     if (policy.live) return thread_policy_set(thread, flavor, p, n);
     assert(policy.started);
@@ -32,6 +49,7 @@ static kern_return_t render_policy_set(thread_t thread, thread_policy_flavor_t f
     }
     return KERN_SUCCESS;
 }
+#endif
 
 enum { SAMPLES = 240, NMIX = 8, NCMD = 6 };
 enum { PACE_BLOCKS = 2000 };
@@ -362,6 +380,7 @@ static void test_renderer_blocks(void) {
     memset(g_ar, 0, sizeof g_ar);
 }
 
+#if defined(__APPLE__)
 static void *policy_thread(void *unused) {
     (void)unused;
     assert(!pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE, 0));
@@ -395,6 +414,7 @@ static void test_render_policy(void) {
     assert(!pthread_join(thread, NULL)); policy.live = 0;
     puts("audren scheduling: real worker policy set/read/reset; setup/teardown outside real-time; PCM preserved on rejection and opt-out");
 }
+#endif
 
 // The update lock is read off Update, else off UpdateImpl; a miss keeps the caller's offset and is a red line. Built from prologues of the forms the SDKs have (`bl` into a PLT stub or straight to the function)
 enum { F_UPDATE, F_IMPL = 16, F_STUB = 32, F_TICK = 36, F_SDK_LOCK, F_OS_LOCK, F_CODE };
@@ -532,7 +552,9 @@ int main(int argc, char **argv) {
     }
     test_update_lock();
     test_two_renderers();
+#if defined(__APPLE__)
     test_render_policy();
+#endif
     if (argc == 2 && !strcmp(argv[1], "--histogram")) { test_histogram(); return 0; }
     if (argc == 2 && !strcmp(argv[1], "--malformed")) { test_malformed(16, 0); return 0; }
     test_headers();

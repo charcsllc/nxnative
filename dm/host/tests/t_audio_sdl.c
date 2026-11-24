@@ -1,0 +1,160 @@
+// SDL3 audio output of hle_audio.c (Linux and Windows) on SDL's dummy audio driver, whose device thread consumes in real time like a sound card (one callback per device buffer, about
+// 5 ms here): an output opened through OpenAudioOut gets an SDL stream in the guest's format, its device calls back while started, the game's buffers come back in order with their
+// release events and dm_audio_render_calls() advances; Stop and the background suspend stop the callbacks (the silent sink takes over while suspended), Close frees it, and a second
+// open / play / close cycle leaves no thread behind (Linux, where /proc counts them). Also a six-channel output (stereo to the device) and DM_AUDIO=0 (the silent sink, no device).
+// With the argument "bench" (not a CTest run; no device): the host's own work on the sound card callback, one second of a six-channel output pulled in 5 ms callbacks through
+// pull_device (the queue, the volume at 1.0 and at 0.5, the 6 -> 2 downmix), the fastest and the median of nine, with a checksum of the samples. The audio renderer's mixing
+// is the SDK's own code (hle_audren.c runs it as guest code), not the host's C
+#include "../hle_audio.c"
+__thread _Atomic int dm_host_work;   // defined by the graphics host in a full build
+#include <time.h>
+#if defined(__linux__)
+#include <dirent.h>
+#endif
+
+static int checks, fails;
+#define CHECK(c, msg) do { checks++; if (!(c)) { fails++; fprintf(stderr, "FAIL: %s (line %d)\n", msg, __LINE__); } } while (0)
+
+uint64_t now_ns(void) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); return (uint64_t)t.tv_sec * 1000000000ull + t.tv_nsec; }
+static struct { const void *k; void *v; } om[8];
+void *objmap_get(const void *k) { for (int i = 0; i < 8; i++) if (om[i].k == k) return om[i].v; return NULL; }
+void objmap_put(const void *k, void *v) { for (int i = 0; i < 8; i++) if (!om[i].k) { om[i].k = k; om[i].v = v; return; } }
+void *objmap_del(const void *k) { for (int i = 0; i < 8; i++) if (om[i].k == k) { om[i].k = 0; return om[i].v; } return NULL; }
+static _Atomic int g_events;
+void hle_signal_system_event(void *g) { (void)g; atomic_fetch_add(&g_events, 1); }
+void hle_bind_system_event(void *g, int autoclear) { (void)g; (void)autoclear; }
+module_t *module_of(const void *p) { (void)p; return NULL; }   // call sites in the log: no guest modules in the unit test
+void dm_host_helper_qos(plat_qos_t q) { (void)q; }
+
+// This process's threads: their count, and their thread IDs in ids (at most TMAX); -1 where they cannot be listed here (Linux only, from /proc/self/task)
+enum { TMAX = 64 };
+static int threads(int *ids) {
+#if defined(__linux__)
+    DIR *d = opendir("/proc/self/task"); if (!d) return -1;
+    int n = 0; struct dirent *e; while ((e = readdir(d))) if (e->d_name[0] != '.') { if (ids && n < TMAX) ids[n] = atoi(e->d_name); n++; }
+    closedir(d); return n;
+#else
+    (void)ids; return -1;
+#endif
+}
+// The threads in now[] that are not in before[]: their count, and their IDs and names (SDL names its device threads SDLAudioP<n>) in desc
+static int new_threads(const int *now, int n, const int *before, int nb, char *desc, size_t dn) {
+    int k = 0; size_t o = 0; desc[0] = 0;
+    for (int i = 0; i < n && i < TMAX; i++) {
+        int seen = 0; for (int j = 0; j < nb && j < TMAX; j++) seen |= now[i] == before[j];
+        if (seen) continue;
+        k++;
+        char path[64], name[32] = "?"; snprintf(path, sizeof path, "/proc/self/task/%d/comm", now[i]);
+        FILE *f = fopen(path, "r"); if (f) { if (fgets(name, sizeof name, f)) name[strcspn(name, "\n")] = 0; fclose(f); }
+        if (o < dn) o += (size_t)snprintf(desc + o, dn - o, "%s%d %s", k > 1 ? ", " : "", now[i], name);
+    }
+    return k;
+}
+static void sleep_ms(int ms) { plat_sleep_ns((uint64_t)ms * 1000000); }
+
+enum { NBUF = 40, FRAMES = 240 };   // 40 blocks of 5 ms: 200 ms of sound
+static int16_t pcm[NBUF][FRAMES * 6];
+// Open an output of ch channels, play NBUF blocks, stop and close it; real: an SDL device is expected (else the silent sink)
+static void cycle(int ch, int real, const char *what) {
+    uint8_t out[64] = {0}, ev[64], prm[16]; aout_buf bufs[NBUF];   // nn::audio::AudioOutBuffer in the SDK's layout (hle.h)
+    h_au_InitParam(prm); *(uint16_t *)(prm + 4) = (uint16_t)ch;
+    CHECK(h_au_Open(out, ev, NULL, prm) == RES_OK, what);
+    aout *a = ao(out);
+    if (real) {
+        CHECK(a->au != NULL, "the output has an SDL stream");
+        SDL_AudioSpec src = {0};
+        CHECK(a->au && SDL_GetAudioStreamFormat(a->au, &src, NULL) && src.format == SDL_AUDIO_S16 && src.freq == 48000 && src.channels == (ch == 6 ? 2 : ch),
+              "the stream takes S16 at 48 kHz in the device's channels (six are downmixed to two first)");
+    } else CHECK(a->au == NULL, "DM_AUDIO=0: no device, the silent sink");
+    for (int i = 0; i < NBUF; i++) {
+        for (int j = 0; j < FRAMES * ch; j++) pcm[i][j] = (int16_t)(i * 100 + j);
+        bufs[i] = (aout_buf){.ptr = pcm[i], .cap = (uint64_t)FRAMES * ch * 2, .size = (uint64_t)FRAMES * ch * 2};
+        h_au_Append(out, &bufs[i]);
+    }
+    uint64_t calls = dm_audio_render_calls(); int ev0 = g_events;
+    // Start plays on the silent sink at once and starts the device on a host thread; the watchdog hands the queue to the device at its first callback (hle_audio.c au_start_at,
+    // au_watchdog_output; a watchdog tick may already have done it), which the checks after the playback see
+    CHECK(h_au_Start(out) == RES_OK && (a->backend == BK_NULL || (real && a->backend == BK_AU)), real ? "Start: the silent sink plays until the SDL device calls back" : "Start runs the silent sink");
+    int got = 0, order = 1;
+    for (int t = 0; t < 3000 && got < NBUF; ) {
+        aout_buf *b = h_au_Released(out);
+        if (b) { order &= b == &bufs[got]; got++; continue; }
+        sleep_ms(2); t += 2;
+    }
+    CHECK(got == NBUF && order, "every buffer comes back, in order, at the device's pace");
+    CHECK(g_events > ev0, "and each release signals the game's event");
+    if (real) {
+        CHECK(dm_audio_render_calls() > calls && a->cb_n > 0, "the device called back: dm_audio_render_calls advanced");
+        CHECK(!a->stalled && a->backend == BK_AU, "the watchdog never took over");
+        dm_audio_suspend(1);
+        CHECK(a->backend == BK_NULL, "suspended (background): the silent sink takes over");
+        uint64_t n = a->cb_n; sleep_ms(60);
+        CHECK(a->cb_n == n, "and the device calls back no more");
+        dm_audio_suspend(0);
+        sleep_ms(60);
+        CHECK(a->backend == BK_AU && a->cb_n > n, "resumed: the device plays again");
+    }
+    h_au_Stop(out);
+    uint64_t n = a->cb_n; sleep_ms(60);
+    CHECK(a->cb_n == n && a->backend == BK_NONE, "after Stop nothing calls back");
+    h_au_Close(out);
+}
+
+static int cmp_dbl(const void *a, const void *b) { double x = *(const double *)a, y = *(const double *)b; return (x > y) - (x < y); }
+static int bench(void) {
+    enum { FR = RATE, CB = RATE / 200, REPS = 9 };
+    static int16_t in[FR * 6], out[FR * 2];
+    uint32_t r = 12345;
+    for (int i = 0; i < FR * 6; i++) { r = r * 1103515245u + 12345u; in[i] = (int16_t)(r >> 16); }
+    static const float vols[2] = {1.0f, 0.5f};
+    for (int v = 0; v < 2; v++) {
+        double ms[REPS]; uint64_t sum = 0;
+        for (int k = 0; k < REPS; k++) {
+            aout *a = calloc(1, sizeof *a);
+            if (!a) return 2;
+            aout_buf b = {.ptr = in, .cap = sizeof in, .size = sizeof in};
+            a->ch = 6; a->dev_ch = 2; atomic_store(&a->state, STATE_STARTED); uint32_t vb; memcpy(&vb, &vols[v], 4); atomic_store(&a->vol, vb);
+            a->q[0] = &b; atomic_store(&a->q_tail, 1);
+            uint64_t t0 = now_ns();
+            for (int f = 0; f < FR; f += CB) pull_device(a, (uint8_t *)(out + 2 * f), (uint64_t)CB * 4);
+            ms[k] = (double)(now_ns() - t0) / 1e6;
+            free(a);
+        }
+        for (int i = 0; i < FR * 2; i++) sum = sum * 31 + (uint16_t)out[i];
+        qsort(ms, REPS, sizeof *ms, cmp_dbl);
+        printf("bench audio: 1 s of six channels pulled in 5 ms callbacks, volume %.1f, downmixed to stereo: fastest %.3f ms, median %.3f ms, samples %016llx\n", vols[v], ms[0],
+               ms[REPS / 2], (unsigned long long)sum);
+    }
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    if (argc > 1 && !strcmp(argv[1], "bench")) return bench();
+    SDL_SetHint(SDL_HINT_AUDIO_DRIVER, "dummy");   // before hle_audio.c starts SDL's audio
+    setenv("DM_AUDIO", "1", 1); unsetenv("DM_DBG_AU_FRAMES"); unsetenv("DM_AUDIO_MUTE");
+    int t0 = threads(NULL);
+    cycle(2, 1, "a stereo output opens on the default device");
+    CHECK(g_sdl_audio && !strcmp(SDL_GetCurrentAudioDriver(), "dummy"), "SDL's audio runs on the dummy driver");
+    { SDL_AudioSpec dev; int fr = 0; SDL_AudioDeviceID id = SDL_OpenAudioDevice(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, NULL);
+      CHECK(id && SDL_GetAudioDeviceFormat(id, &dev, &fr) && fr == RATE / 200, "the device buffer is 5 ms of frames, not SDL's 1024-frame default");
+      if (id) SDL_CloseAudioDevice(id); }
+    // The leak check compares thread IDs, not counts. A joined thread is not gone yet: pthread_join (SDL_WaitThread) returns when the kernel clears the thread's ID, early in its exit,
+    // and its /proc/self/task entry stays until the exit ends a moment later, longer on a loaded machine. So a read right after a Close or the SDL_CloseAudioDevice above can list
+    // a thread on its way out. Under ctest -j6 load the baseline read here held SDL's device thread (SDLAudioP<n>) in about one run in four, 3 threads against the 2 the cycles
+    // settle to, and the count check failed although nothing leaked (25 of 100 runs). So the baseline may hold an exiting thread (it is just not seen again), and a thread the next
+    // two cycles start that is still listed after a second is a leak: the wait covers the exit of one they joined (CI run 8 on f8ac96d read one such thread right after the third Close)
+    int base[TMAX], t1 = threads(base); char before[256] = "";
+    if (t1 >= 0) new_threads(base, t1, base, 0, before, sizeof before);   // their names now, while an exiting one is still listed
+    cycle(6, 1, "a six-channel output opens");
+    cycle(2, 1, "and a stereo one again");
+    int now[TMAX], t2 = threads(now); char born[256];
+    int nb = t0 >= 0 ? new_threads(now, t2, base, t1, born, sizeof born) : 0;
+    for (int ms = 0; nb && ms < 1000; ms += 10) { sleep_ms(10); t2 = threads(now); nb = new_threads(now, t2, base, t1, born, sizeof born); }
+    if (t0 >= 0) { CHECK(nb == 0, "a second and third open / play / close cycle leave no thread behind"); if (nb) printf("threads left by the second and third cycle: %s\n", born); }
+    else printf("note: thread counting is Linux-only; the leak check did not run here\n");
+    printf("threads: %d at start, %d after the first output (%s), %d after two more\n", t0, t1, before, t2);
+    setenv("DM_AUDIO", "0", 1);
+    cycle(2, 0, "DM_AUDIO=0 opens an output too");
+    printf("== audio_sdl: %d checks, %d failed ==\n", checks, fails);
+    return fails != 0;
+}

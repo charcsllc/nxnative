@@ -1,5 +1,5 @@
 """The shader library ABI (dm/gfx/nvn/dmsh_abi.h): the one definition of the NVN driver segment layout and the binding kinds that the shader build (dmsh_build.py, through
-dm/gfx/tools/dmsh_abi.py) and the host (nvn_mtl.m, nvn_refl.m) share. The header parses, its tables fit together, the build takes its values from it, the host handles every kind
+dm/gfx/tools/dmsh_abi.py) and the host (nvn_mtl.m, nvn_refl.c: the port's C parser in place of nvn_refl.m) share. The header parses, its tables fit together, the build takes its values from it, the host handles every kind
 it names, the translator's own copy of the c2 layout (Program.cs) agrees, and a ratchet keeps the numbers and kind names from coming back as literals in the files that use them."""
 import ast
 import collections
@@ -22,7 +22,7 @@ import dmsh_abi as abi   # noqa: E402
 # A count may only go down; when it does, lower it here.
 BASELINE = {
     'dm/gfx/nvn/nvn_mtl.m': {"'geometry'": 3, '0x100': 2, '0x1000': 2},
-    'dm/gfx/nvn/nvn_refl.m': {"'c1'": 1},
+    'dm/gfx/nvn/nvn_refl.c': {"'c1'": 1},
     'dm/gfx/nvn/nvn_refl.h': {},
     'dm/gfx/nvn/nvn_obj.h': {},
     'dm/gfx/tools/dmsh_build.py': {"'c1'": 4, "'geometry'": 3, "'img'": 1, "'tex'": 1, '0x100': 2},
@@ -118,13 +118,13 @@ class Build(unittest.TestCase):
 class Host(unittest.TestCase):
     def test_host_includes_the_header(self):
         self.assertIn('#include "dmsh_abi.h"', (REPO / 'dm/gfx/nvn/nvn_mtl.m').read_text())
-        self.assertIn('#include "dmsh_abi.h"', (REPO / 'dm/gfx/nvn/nvn_refl.m').read_text())
+        self.assertIn('#include "dmsh_abi.h"', (REPO / 'dm/gfx/nvn/nvn_refl.c').read_text())
         self.assertRegex((REPO / 'dm/gfx/nvn/nvn_obj.h').read_text(), r'(?m)^#define NVN_SEPTEX_SLOT0 DMSH_SEPTEX_SLOT0$')
 
     def test_host_reads_every_kind(self):   # a kind the build may write that the host does not know fails the shader at load time
-        src = (REPO / 'dm/gfx/nvn/nvn_refl.m').read_text()
-        missing = [k for k in abi.VALUES if k.startswith('KIND_') and k != 'KIND_UNKNOWN' and f'@DMSH_{k}]' not in src]
-        self.assertEqual(missing, [], 'binding kinds nvn_refl.m does not convert')
+        src = (REPO / 'dm/gfx/nvn/nvn_refl.c').read_text()   # the C parser compares each kind's string: IS(DMSH_KIND_X)
+        missing = [k for k in abi.VALUES if k.startswith('KIND_') and k != 'KIND_UNKNOWN' and f'IS(DMSH_{k})' not in src]
+        self.assertEqual(missing, [], 'binding kinds nvn_refl.c does not convert')
 
     def test_translator_agrees(self):   # Program.cs keeps its own copy of the c2 layout (a C# file cannot include the header)
         m = re.search(r'const int TexBase = (\w+), ImgBase = (\w+), ImgSlots = (\w+), SepTexBase = (\w+), SepTexSlot0 = (\w+), SampBase = (\w+);',

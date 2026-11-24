@@ -1,0 +1,4781 @@
+# nxaot: the ahead-of-time ARM64 to x86-64 recompiler
+
+Phase 2 of the Windows and Linux port ([migration-status.md](../../../docs/design/migration-status.md)); the design is
+[aot-recompiler.md](../../../docs/design/aot-recompiler.md). This folder holds its foundation and its floating point: the build, the lifter of the
+integer, memory, branch, system-register, exclusive, floating-point, Advanced SIMD and cryptographic instruction classes (every IR opcode dynarmic's
+A64 frontend emits), the differential vector harness against dynarmic, a benchmark of the NaN chains, and the census of phase 0; and phase 1: the
+module loader (NROs and behaviour images with their manifests), function discovery over whole modules with jump tables recovered on the lifted IR,
+exclusive windows and interprocedural summaries, a corpus of self-checking homebrew NROs with no game files, whole functions lifted with the calling
+convention of design 2.3 (calls, returns checked against lr, real tail calls, non-local returns), the dispatcher of section 4 (jump tables as
+switches, inline caches, the lookup table), the pack stage (`nxaot build`: one object and one shared object per module, linked by lld as a
+library; for the Windows host a DLL, "Windows packs"), and a minimal native run time (`nxaot_host`); and phase 3: the JIT fallback of design section 11 on the vendored dynarmic, unmodified
+(what has no compiled entry runs in it and comes back to compiled code at the next compiled entry), non-local control flow through native frames
+and through the JIT (C++ exceptions entering LSDA landing pads, fibers, a return past the caller), guest threads on host threads with Horizon's
+thread and synchronization SVCs, and the safepoints of section 6.2. The eighteen corpus NROs run natively on x86-64, with everything in the JIT and
+with no JIT, and print what dynarmic prints. No game runs through it yet, and nothing here touches the Apple builds.
+
+## What exists
+
+| Piece | Where | What it does |
+|---|---|---|
+| State block | [include/nxaot/guest_state.h](include/nxaot/guest_state.h) | `dm_guest_state` of design section 2.1, C, 64-byte aligned, every offset asserted; host-only fields `cnt` (the counter `mrs cntpct_el0` / `cntvct_el0` read in a region; a pack calls the host instead) and `exit_reason` / `exit_arg` |
+| Pack descriptor | [include/nxaot/aot_module.h](include/nxaot/aot_module.h) | what a pack's library holds for a module (the descriptor of ABI 3, the lookup table, function map and line table, the gate sites, the standard entries' signature, the inline-cache descriptors) and what it imports from the host (the SVC path, the miss path, traps, the gates, the counter), C |
+| Decoder glue | [src/decode/translate.cpp](src/decode/translate.cpp) | dynarmic's A64 translation loop with nxaot's options (hints raise their exceptions, wall-clock counter) and the encodings dynarmic leaves to an interpreter that nxaot translates itself (`mrs xN, cntvct_el0`) |
+| Lifter | [src/lift/lifter.cpp](src/lift/lifter.cpp), [src/lift/opcodes.cpp](src/lift/opcodes.cpp) | dynarmic IR blocks of a region to one LLVM function `void f(dm_guest_state *st)`: registers (x0..x30, SP, v0..v31) in allocas that SROA / mem2reg promote, NZCV as four `i1` compared directly against the operands of the `subs` / logical operation that set them, stored only when written; guest memory as `inttoptr` volatile accesses (alignment 1, 16 bytes for `ldr q`), `ldar` acquire, `stlr` sequentially consistent, exclusives as `cmpxchg` against `st->excl_*`, `dc zva` zeroing the aligned 64 bytes; `svc`, `brk`, `udf` and undefined encodings leave with `st->pc` and `st->exit_reason`. A region holding an IR opcode the lowering does not cover is refused whole |
+| Floating point and SIMD | [src/lift/lower_fp.cpp](src/lift/lower_fp.cpp), [lower_vector.cpp](src/lift/lower_vector.cpp), [lower_crypto.cpp](src/lift/lower_crypto.cpp), [function_lifter.h](src/lift/function_lifter.h) | the lowering of section 7: FPCR as a compile-time specialisation, the NaN chains, Arm's NaN, min / max, rounding and conversion rules, saturation with FPSR.QC, the cumulative exception flags, AES-NI / SHA-NI / PCLMULQDQ with software forms ("Floating point and SIMD" below) |
+| Run-time helpers | [src/lift/runtime.cpp](src/lift/runtime.cpp) | the operations whose exact Arm semantics are no x86 sequence (the estimates' lanes the inline tables do not take, half-precision arithmetic, FZ fused multiply-add fix-ups, some conversions, software AES): wrappers of dynarmic's own `common/fp` and `common/crypto`, which its backend calls for the same cases |
+| ORC JIT | [src/lift/jit.cpp](src/lift/jit.cpp) | LLVM 18 ORC LLJIT, the default O2 pipeline, the host's CPU (`getHostCPUName` and its features) or a named level (`--cpu x86-64-v3`); the helpers as absolute symbols; the x86 assembly of a module (nxaot_bench) |
+| Vector harness | [src/vec/](src/vec/) (`nxaot_vec`) | every vector on dynarmic's own A64 JIT (the reference) and as lifted code, from one initial state; compares x0..x30, SP, NZCV, FPCR, FPSR (QC and the cumulative flags), TPIDR_EL0, v0..v31, the exit (pc, reason, svc number) and the 64 KiB memory image byte for byte. It runs lifted code as a host gate would: MXCSR from FPCR before, its flags into FPSR after, and a continuation lifted for the new pc and FPCR after a normal exit inside the code (`msr fpcr`) |
+| Vectors | [tests/vectors/](tests/vectors/), written by [tests/gen_vectors.py](tests/gen_vectors.py) and [tests/gen_fp_simd.py](tests/gen_fp_simd.py) | 183,452 vectors: 24,800 integer ones as `.tsv` (encodings written by hand from the Arm ARM), 158,652 floating-point and SIMD ones as `.tsv.gz` (every form of dynarmic's decoder table, fields swept, lanes of special values, 13 FPCR values: the variants of design section 12 and mixes) |
+| Benchmark | [src/bench/main.cpp](src/bench/main.cpp), [calls.cpp](src/bench/calls.cpp) (`nxaot_bench`) | the cost of the NaN-chain checks, the x86 instructions lifted code compiles to, the instructions per guest memory access; the two calling conventions on synthetic call chains and on the corpus (time per call, spills), the dispatcher per `blr` hit and miss, a jump table, int_ops natively against dynarmic, the pack stage's throughput per tier; the safepoint polls' cost, the JIT fallback's hand-over, round trip, cost per block and instance creation ("Measurements") |
+| Census | [src/analysis/census.cpp](src/analysis/census.cpp) (`nxaot census`) | phase 0's numbers over a raw code blob as `key<TAB>count` lines |
+| Reach | [src/analysis/reach.cpp](src/analysis/reach.cpp) (`nxaot opcodes --reach`) | every entry of dynarmic's A64 decoder table translated with random fields: the opcodes the A64 frontend can emit; `--check` fails when one is not lowered |
+| Module loader | [src/module/](src/module/) (`nxaot module`, `nxaot image`, `nxaot manifest`) | an NRO, or a behaviour image with its manifest (design 1.1, 1.2), as one image keyed by its SHA-256 (1.4): segments, MOD0, the dynamic section, symbols, init and fini arrays, RELA / JMPREL / RELR relocations, `.eh_frame_hdr`, FDEs, LSDAs, data blocks in text; the manifest parser and writer ("Module loader and discovery") |
+| Discovery | [src/analysis/discover.cpp](src/analysis/discover.cpp), [jumptable.cpp](src/analysis/jumptable.cpp), [summary.cpp](src/analysis/summary.cpp) (`nxaot discover`) | design 1.3 over a whole module: function entries from every source with their provenance, a CFG per function, jump tables on the lifted IR, exclusive windows, the summaries of 2.3, the coverage of the text; on a pool of threads ([parallel.h](src/analysis/parallel.h), `--threads`) with the one-thread result ("Phase 5c") |
+| Reference runner | [src/run/main.cpp](src/run/main.cpp) (`nxaot_run`) | a corpus NRO under dynarmic's A64 JIT with the corpus's SVCs (output, exit, the thread and synchronization SVCs, its guest threads as contexts switched round robin on one JIT: a deterministic interleaving): the corpus's reference output on x86; `--set` writes a symbol before the run, `--fastmem` gives dynarmic direct memory access (the throughput comparison) |
+| Corpus | [corpus/](corpus/) | nine self-checking programs (eight in C, one in C++) with a crt0 of their own, built with devkitA64 and with clang into eighteen committed NROs ("The corpus") |
+| Function mode | [src/lift/lower_calls.cpp](src/lift/lower_calls.cpp), [lifter.h](src/lift/lifter.h) (`FunctionPlan`, `Convention`) | one guest function as one LLVM function of the convention of design 2.3, swifttailcc or ghccc: calls, returns checked against lr, tail calls, the inline caches, svc as a host call, the stores and reloads the summaries allow ("Calls and returns") |
+| Pack stage | [src/build/](src/build/) (`nxaot build`) | the convention facts of a module (PASS, WRITES, LIVE_AFTER, RV, resume points: [plan.h](src/build/plan.h)); compile units of neighbouring functions (groups at tiers C and W, shards at H and H+; a function over the size limit split into parts joined through the state block), lifted, optimised and compiled on a pool of workers, one LLVM context each; the tables' object (the lookup table, the function map, the line table's bounds, the descriptor of [include/nxaot/aot_module.h](include/nxaot/aot_module.h), jit_entry and the slow-path wrappers); the tiers of design 9.3, by profile with `--profile`, whose samples' positions weigh the code at tiers H and H+ ("The sample profile at tier H"); a shared object (and a relocatable object) by lld as a library ("Pack throughput"); with `--target windows` a DLL (and a COFF object): the same code, joined, converted to COFF by [coff.cpp](src/build/coff.cpp) and linked by lld's COFF driver ("Windows packs") |
+| Caches | [src/cache/](src/cache/), [src/build/analysis_cache.cpp](src/build/analysis_cache.cpp) (`nxaot build --cache`) | design 13: each unit's object under the SHA-256 of everything its functions' code depends on, and the module's analysis (discovery's view and the plan) under the module's, its manifest's and the tool's; a warm repack neither analyses nor compiles ("Pack throughput") |
+| Game-shaped benchmark | [tests/gen_bench.py](tests/gen_bench.py) | a generated program of thousands of functions of the kinds and sizes game code has, built as an NRO with the corpus's run time: the pack stage's throughput measured where the corpus is too small ("Pack throughput"); `--direct` writes the words of a module of any size ("Memory at scale"), `--no-fde-percent` with a share of its functions without FDEs ("Gap code at tier C") |
+| Native run time | [src/rt/](src/rt/) (`nxaot_host`) | the arena below 2^39, the image at its one-to-one address, the library by `dlopen` with its identity checked, the state blocks, the SVC path, the dispatcher's miss path, traps and faults through the line table, the counter ("The native run time") |
+| JIT fallback | [src/rt/jit.h](src/rt/jit.h), [jit.cpp](src/rt/jit.cpp), the driver in [host.cpp](src/rt/host.cpp) | design 11: dynarmic's A64 JIT per guest thread behind `dm_jit_create` / `dm_jit_run` / `dm_jit_halt`, stopping at compiled entries and compiled call sites' returns with dynarmic unmodified, the hand-over of the register file both ways, the driver that takes compiled entries natively from it and propagates non-local transfers ("The JIT fallback") |
+| Threads and safepoints | [src/rt/host.cpp](src/rt/host.cpp), the polls in [lower_calls.cpp](src/lift/lower_calls.cpp) | design 6.1 to 6.5: guest threads on host threads with a state block and a native stack each, Horizon's thread and synchronization SVCs, the shared exclusive monitor; the polls of 6.2 and the pause protocol of dm/host's `SetThreadActivity`, with a pause test (`nxaot_host --pause-test`) ("Threads and safepoints") |
+| Per-function differential test | [src/rt/funcdiff.cpp](src/rt/funcdiff.cpp) (`nxaot_funcdiff`) | every function of a module from one register and memory snapshot under the recompiled code and under dynarmic, final registers and written memory compared (design 12, item 2) |
+| Runner | [tests/run_aot_tests.sh](tests/run_aot_tests.sh) | runs the tests and the benchmark and writes `logs/aot/` ([logs/README.md](../../../logs/README.md)) |
+| Against native | [tests/native_ratio.py](tests/native_ratio.py), [tests/native_rt.c](tests/native_rt.c) | the corpus programs and the game-shaped benchmark compiled natively for x86-64 from the same C, timed against their packs at each tier ("Against native") |
+| Host run time | [dm/host/aot.h](../../host/aot.h), `dm/host/aot_*.c`, CTest `t_aot_host` | what dm/host provides for packs: the arena below 2^39, packs loaded, the SVC path, the dispatcher, `dm_guest_call`, guest threads with safepoints on hle_thread.c, faults, the floating-point helpers in C; the corpus run through the host's loader, SVC dispatcher and thread layer ("Threads and safepoints") |
+| Game modules | `patch_nso.py --aot`, dm/host/loader.c `load_modules`, CTest `t_aot_module`, `t_guest_map` | the recompiler's input written by the rewriter (a behaviour image and its manifest) and read by the host: the image checked and mapped, gates registered, imports bound into the GOT, the pack loaded; guest memory announced to the graphics backend ("A game module in the host") |
+| CI | [.github/workflows/aot.yml](../../../.github/workflows/aot.yml) | the image, the build, CTest and the runner on every pull request and push to `main` and `multiplataforma`; then the corpus packed, `t_aot_host` in the host's image and with the JIT fallback here, and the floating-point differential test |
+
+Vendored: [dm/third_party/dynarmic](../../third_party/dynarmic/VENDOR.md), the fork `azahar-emu/dynarmic` at `a46601580d55` (A64 frontend, IR, x86-64
+backend and the externals its build needs; 19 MB).
+
+## Building and testing in Docker
+
+From the repository root. The image (about 1.9 GB) has Ubuntu 24.04 pinned by digest, LLVM 18.1.3 with its development packages, lld, CMake 3.28,
+Ninja, Python 3.12 and the Boost headers:
+
+```sh
+docker build -t nxnative-aot -f docker/Dockerfile.aot docker
+
+# configure, build, CTest (the vectors, the crypto vectors for x86-64-v3, the per-operation NaN mode, the reach check, the census, the vectors-current
+# check, discovery over the corpus, the manifest test, the corpus reference run, the fp cases current, the corpus run natively, the per-function
+# differential test, the JIT fallback's three modes, the threaded programs, the safepoint pause test, the pack caches, the indirect calls'
+# reloads and the standard entries' signature, the line tables, functions split for size, tiers by profile, Windows packs, the analysis on threads,
+# the differential test at tier C, the host's JIT misses as discovery's input, the workers bounded by memory, gap code at tier C, the tables'
+# object through MC, the sample profile at tier H, the hot indirect targets); --tmpfs
+# /src/build:exec,uid=$(id -u),gid=$(id -g) keeps the build tree in memory on a machine short of disk
+docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$(pwd):/src" -w /src nxnative-aot sh -c \
+  'cmake -S dm/tools/aot -B build/aot -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build/aot && ctest --test-dir build/aot --output-on-failure'
+
+# the same tests and the benchmark through the runner, which writes logs/aot/<test>.log and logs/aot/summary.txt
+docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$(pwd):/src" -w /src nxnative-aot sh dm/tools/aot/tests/run_aot_tests.sh build/aot
+```
+
+From Git Bash on Windows, the same with `MSYS_NO_PATHCONV=1`, `$(pwd -W)` and no `--user`, as [docker/README.md](../../../docker/README.md) says for
+the host. The image is built locally and on CI from [docker/Dockerfile.aot](../../../docker/Dockerfile.aot). A local build has no registry digest, and
+its local image ID changes with every rebuild (the build attaches a new attestation manifest), so pinning the image itself by digest needs a push to a
+registry first (`docker push`, then the digest it prints), as the llvm-mingw image of the host build is pinned. Its base image is pinned by digest
+already, and its packages are the Ubuntu 24.04 versions of the day it is built: `nxaot.lock` and the configure check keep LLVM at 18.1.3.
+
+Linking: `libLLVM-18.so` from the image (the Ubuntu package is built with `LLVM_LINK_LLVM_DYLIB`); `-DNXAOT_LLVM_STATIC=ON` links LLVM's and lld's
+static libraries instead, as the `nxaot` of the port's bundle is (design section 13; the CI's `nxaot-bundle` job). That mode replaces the shared
+LLVM that Ubuntu's lld targets name with LLVM's component archives (every target LLVM was built with: lld's ELF driver initializes them all for LTO),
+needs Polly's archives (the image's `libpolly-18-dev`: Ubuntu's LTO library calls into Polly) and links libxml2 with ICU from their archives, since
+their sonames change between distributions' releases (`libxml2.so.2` is `libxml2.so.16` on Ubuntu 26.04). The binary, about 163 MB, needs only
+`libc`, `libm`, `libstdc++` (GCC 13), `libgcc_s`, `libz`, `libzstd`, `libtinfo` and `liblzma`, and glibc 2.38; its packs are byte-identical to the
+shared build's (checked on an Ubuntu 26.04 without LLVM), and its CTest run passes as the shared build's does (27 tests, 940 s). Its own link
+takes about 4 s; configure a separate tree for it (`build/aot-static`). zlib (which LLVM itself links) reads the `.tsv.gz` vectors; lld's
+ELF driver (`liblldELF.a`, the image's `liblld-18-dev`) links the packs, and its COFF driver (`liblldCOFF.a`) the Windows packs' DLLs ("Windows
+packs"). The build tree takes about 74 MB, and the tests' objects and shared objects
+(corpus_native, corpus_funcdiff, corpus_jit, corpus_threads, safepoints, the benchmark) about 30 to 60 MB more. On this repository's development
+machine (8 vCPUs) the CTest run takes about 11 minutes (639 s with ABI 3, 18 tests): the vectors 4 of them, corpus_native 1.4 and corpus_funcdiff
+1.7, corpus_jit, corpus_threads and safepoints 33 s together, cache 20 s, plan 2 s and lines 25 s. Phase 5b's two (20 tests): split 43 s and
+profile 7 s; with `ctest -j2` the whole run took 342 s. Phase 5c's `analysis_threads` (21 tests): 42 s; the whole run 681 s on a machine other
+builds were loading (cache 16 s). Phase 5d's `corpus_funcdiff_c` (23 tests): 94 s; the whole run with `ctest -j2` 394 s. "Gap code at tier
+C"'s `gaps` (26 tests): 48 s with the tier rule alone, 84 s since it builds the module both ways (the default and `--gap-tier C`); the whole
+run 811 s, one test at a time, with another agent's builds loading the machine at times. "The tables' object through MC"'s `tables` (27
+tests): 33 s; the whole run 948 s, the machine loaded by other builds. "The sample profile at tier H"'s `profile_weights` (28 tests): 5 s;
+the whole run 888 s, one test at a time. "Hot indirect targets"'s `profile_targets` (29 tests): 4 s; the whole run 981 s, one test at a
+time, the machine loaded by another agent's builds and dm/host's CTest (vectors 277 s).
+
+## Building nxaot for Windows
+
+`nxaot.exe` is the recompiler of the Windows bundle (`scripts/package_port.py --platform windows --aot <tree>` puts it in `bin\`, where the packer,
+`build_ipa_from_nsp.py`, finds it). It is cross-built on Linux with llvm-mingw, as the Windows host is ([docker/README.md](../../../docker/README.md)),
+and linked statically: it imports only Windows' own DLLs, so a player installs nothing for it. There is no prebuilt LLVM for llvm-mingw, so LLVM's and
+lld's libraries are built first from the official source tarballs of the release `nxaot.lock` pins. From the repository root, both steps in the llvm-mingw
+image (`<work>` is any folder with room, outside the repository on a machine short of disk):
+
+```sh
+# LLVM 18.1.3 and lld for x86_64-w64-mingw32, static, into <work>/llvm-18.1.3-x86_64-w64-mingw32 (the last line printed); a finished prefix is reused
+docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$(pwd):/src:ro" -v <work>:/work mstorsjo/llvm-mingw:20261020 \
+  sh /src/dm/tools/aot/tools/build_llvm_win64.sh -j 4 /work
+
+# nxaot.exe against it, into build/aot-win64
+docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$(pwd):/src" -v <work>:/work -w /src mstorsjo/llvm-mingw:20261020 sh -c \
+  'cmake -S dm/tools/aot -B build/aot-win64 -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_TOOLCHAIN_FILE=/src/dm/host/cmake/x86_64-w64-mingw32.cmake \
+     -DLLVM_DIR=/work/llvm-18.1.3-x86_64-w64-mingw32/lib/cmake/llvm -DLLD_DIR=/work/llvm-18.1.3-x86_64-w64-mingw32/lib/cmake/lld &&
+   cmake --build build/aot-win64 --target nxaot'
+```
+
+- **The triple of the code** (`build/pack.cpp` `kCodegenTriple`): every pack is compiled for `x86_64-pc-linux-gnu` on every host, since a pack's
+  units are x86-64 ELF objects (a Windows pack converts them, `build/coff.cpp`). nxaot took the process's triple, which in `nxaot.exe` is
+  `x86_64-w64-windows-gnu`: LLVM then compiled for Win64, which has no guaranteed tail calls (`LLVM ERROR: Can't handle guaranteed tail call under
+  win64 yet`, fp-gcc) and no `!pcsections` sections (a crash in `AsmPrinter::emitPCSections`, fnptr-gcc), so `nxaot.exe` built no pack. Found by
+  running it under Wine 9.0; with the fixed triple its Windows packs of the corpus are the bytes the Linux nxaot writes (compared under Wine, not on
+  Windows).
+- **LLVM** ([tools/build_llvm_win64.sh](tools/build_llvm_win64.sh), whose header lists its steps): the `llvm`, `lld` and `cmake` tarballs of
+  `llvmorg-18.1.3` with their SHA-256 pinned in the script (the release's GPG signatures, by the LLVM release key `474E22316ABF4785A88C6E8EA2C794A986419D8A`,
+  were checked when they were written down); the image's gcc builds the native `llvm-tblgen` and `llvm-min-tblgen` the cross build runs; then LLVM with
+  lld in its tree, by llvm-mingw's clang through `dm/host/cmake/x86_64-w64-mingw32.cmake`: Release without assertions, the X86 target only, static libraries,
+  RTTI on (as in the Ubuntu LLVM the Linux nxaot links), no zlib, zstd, libxml2 or terminfo, and only what nxaot links: the components of
+  `NXAOT_LLVM_COMPONENTS`, lld's `lldCommon`, `lldELF` and `lldCOFF`, and the libraries they depend on (66 in all, `LLVM_DISTRIBUTION_COMPONENTS`;
+  no tool, test, example, benchmark, nor lld's MachO, wasm or MinGW driver). One line of lld's sources is changed: lld 18.1.3 gives a static library no
+  `install-<name>` target, which a distribution component needs. lld's headers have no install rule in 18.1.3 and are copied into the prefix. Measured on
+  2026-11-15 on the development machine (8 vCPUs, `-j 4`, another `-j 4` build beside it): the native tablegens 2 minutes, the cross build's 1,767
+  steps and its install 17 minutes; the work folder at its peak 0.85 GB (the cross build tree 394 MB, the sources 160 MB, the prefix 197 MB, the
+  downloads 61 MB), 0.26 GB after (the downloads and the prefix); the machine's available memory stayed above 6.5 GB. Then `nxaot.exe` (199 steps,
+  dynarmic among them) took 104 s.
+- **What the Windows build leaves out** ([CMakeLists.txt](CMakeLists.txt), the `WIN32` block after `nxaot`): everything but the `nxaot` executable and
+  the libraries it links. `nxaot_rt`, `nxaot_host` and `nxaot_funcdiff` run packs with POSIX threads, `dlopen` and signals (dm/host's `aot_*.c` is
+  the Windows run time of packs); `nxaot_vec`, `nxaot_run` and `nxaot_bench` are development tools whose results the Linux build gives; the tests run
+  those and the Linux nxaot (`pack_windows` checks the Windows packs there). Boost's headers come from
+  [dm/third_party/boost](../../third_party/boost/VENDOR.md) where CMake finds none, as dm/host's JIT fallback takes them; the Linux configure is unchanged.
+- **How it is linked**: `-static` (libc++, libunwind and winpthreads inside), an 8 MiB stack reserved for the main thread and every thread made
+  without a size (the compile workers, the analysis's pool: what Linux gives them; Windows' default is 1 MiB), and the host's UTF-8 code page manifest
+  (`dm/host/plat/win32_utf8.rc`), so the paths on nxaot's command line, the C++ streams that open them and LLVM's own file calls (UTF-8 on Windows) name the
+  same files when a folder's name is not ASCII. The result (2026-11-15): `PE32+ executable (console) x86-64, for MS Windows`, 66,293,248 bytes, 8 MiB
+  `SizeOfStackReserve`, the manifest as resource 1 of type 24; it imports `KERNEL32.dll`, `ADVAPI32.dll`, `SHELL32.dll`, `ole32.dll`, `WS2_32.dll` (LLVM's
+  Support library) and the UCRT's `api-ms-win-crt-*.dll`, all of them Windows' own, no `libc++.dll`, `libunwind.dll`, `libwinpthread-1.dll` or LLVM DLL
+  (`llvm-readobj --coff-imports build/aot-win64/nxaot.exe | grep 'Name: '` in the image).
+- **The sources' Windows branches** (`#if defined(_WIN32)`, the Linux preprocessed text unchanged): a module's name is its file name after the last `/`, `\`
+  or drive colon (src/module/image.cpp: the packer passes Windows paths, and the name is in the pack's descriptor); in src/build/pack.cpp the processors
+  available come from the process's affinity mask (`GetProcessAffinityMask` for `sched_getaffinity`), the analysis's CPU seconds from `GetProcessTimes`
+  and the peak resident set from `GetProcessMemoryInfo` (for `getrusage`), and the tool's identity in the analysis cache's key hashes the executable
+  `GetModuleFileNameA` names (for `/proc/self/exe`). `nxaot build --memory`'s resident-set lines read 0 on Windows (analysis/memory.h reads `/proc`).
+
+Nothing here runs a Windows program (no Windows or Wine on the development machine). The check on a Windows PC is
+[tests/run_win64_nxaot.ps1](tests/run_win64_nxaot.ps1) (logs in `logs\win64\nxaot\`, beside the host tests' `logs\win64\`): `nxaot.exe version`, then two
+corpus NROs (fnptr-gcc, fp-gcc) packed as Windows packs and each DLL's SHA-256 compared with the one the Linux nxaot made from the same NRO with the
+same options (`--target windows --cpu x86-64-v3 --workers 1`: a named CPU, since the default is the build machine's), which the reference file
+`nxaot_win64_ref.tsv` lists. The two programs use different C++ standard libraries (libstdc++ and libc++) and LLVM built by different compilers,
+so whether they make the same bytes is the question the run answers; a difference is reported with both hashes, the sizes and the first differing
+offset, and exit status 3. On 2026-11-15 the Linux nxaot made fnptr-gcc.dll `6209c445...b8b97d` (99,840 bytes) and fp-gcc.dll `06c0f080...bb4126`
+(103,936 bytes). The reference file for another commit, made with the Linux nxaot of `build/aot` (the CI's `nxaot-bundle` job makes it as the
+artifact `nxaot-win64-ref`):
+
+```sh
+docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$(pwd):/src" -w /src nxnative-aot sh -c '
+  ref=build/aot-win64; opts="--target windows --cpu x86-64-v3 --workers 1"; mkdir -p $ref; printf "# nxaot_win64_ref.tsv\n" > $ref/nxaot_win64_ref.tsv
+  for n in fnptr-gcc fp-gcc; do build/aot/nxaot build dm/tools/aot/corpus/nro/$n.nro $opts --shared $ref/$n.dll > $ref/$n.log 2>&1 &&
+    printf "%s\t%s\t%s\t%s\n" $n dm/tools/aot/corpus/nro/$n.nro "$(sha256sum $ref/$n.dll | cut -d" " -f1)" "$opts" >> $ref/nxaot_win64_ref.tsv; done'
+```
+
+then on the PC, from the repository root, with `nxaot.exe` and the reference file in `build\aot-win64` (the CI artifacts `nxaot-win64` and
+`nxaot-win64-ref` of the same commit unzipped there): `powershell -NoProfile -ExecutionPolicy Bypass -File dm\tools\aot\tests\run_win64_nxaot.ps1`. On CI
+([port.yml](../../../.github/workflows/port.yml), the Windows cross job) the prefix is cached on the script's hash, the toolchain file and the image,
+`nxaot.exe` is built after the Windows host, its imports are checked, and it goes into the Windows bundle.
+
+## Running the harness and the census
+
+```sh
+build/aot/nxaot_vec dm/tools/aot/tests/vectors            # every .tsv and .tsv.gz of the folder; or name files; - reads standard input
+build/aot/nxaot_vec --fz-only dm/tools/aot/tests/vectors            # the vectors under FZ (CTest vectors_fz)
+build/aot/nxaot_vec --fz-only --fz-off minmax dm/tools/aot/tests/vectors   # a family's run-time FZ test left out: its mismatches (a control)
+build/aot/nxaot_vec --cpu x86-64-v3 dm/tools/aot/tests/vectors/crypto.tsv.gz   # a named target: no AES-NI, SHA or PCLMULQDQ, their software forms
+build/aot/nxaot_vec --filter excl_seq --dump dm/tools/aot/tests/vectors/exclusive.tsv   # dynarmic IR and optimised LLVM IR of the matches
+build/aot/nxaot_vec --state --filter fp.00612 dm/tools/aot/tests/vectors/fp.tsv.gz      # a mismatch with the initial registers
+build/aot/nxaot_vec --nan-mode perop dm/tools/aot/tests/vectors/fp.tsv.gz       # every operation checks its own NaNs (chains: the default)
+build/aot/nxaot census <raw ARM64 code file> --base <hex address of its first byte>
+build/aot/nxaot opcodes                                    # every dynarmic IR opcode and whether the lifter lowers it
+build/aot/nxaot opcodes --reach --check                    # the opcodes the A64 frontend emits, the decoder entries that emit them; all lowered?
+build/aot/nxaot_bench                                      # the NaN-chain measurements, then phase 1's ("Measurements")
+build/aot/nxaot_bench --sections calls,dispatch,spills,int_ops,pack --work /tmp/x   # phase 1's only
+python3 dm/tools/aot/tests/gen_vectors.py                  # write the vectors again after changing a generator
+```
+
+`nxaot_vec` prints each mismatch with the vector's file and line, its words, its FPCR and every field that differs, then per class the vectors,
+mismatches, refusals, FPSR differences of known dynarmic issues and normal exits, the IR opcodes each refused class needed, the vectors per known
+issue, which lowered opcodes the passing vectors exercised, and last `== nxaot_vec: N vectors, M mismatches, U unsupported (listed), F FPSR
+differences of known dynarmic issues ==`; it exits with 1 on a mismatch. Options: `--no-fpsr-model` lifts without modelling the cumulative flags
+(and compares QC only), `--ignore-fpsr-flags` compares QC only, `--no-filters` compares the whole FPSR without the known-issue relaxations,
+FZ is a run-time state of the code, as in a pack; `--fz-only` runs the vectors whose FPCR has FZ, `--fz-specialised` lifts with FZ specialised as
+the other mode bits, and the negative controls `--fz-off <families>` (a family's run-time test left out) and `--lift-fpcr-clear <hex>` (every vector's
+code lifted as if those FPCR bits were clear and FZ specialised, while it runs under the vector's FPCR and its MXCSR) must show mismatches ([FZ as a
+run-time state](#fz-as-a-run-time-state)); `--batch`, `--max-report`, `-v`. The vectors' format (8 tab-separated fields: id, class, text, code, seed, FPCR, register overrides, memory
+overrides; `vk=` names the lane kind the seed fills v0..v31 with) and the memory layout (the image at `0x10000000`, code at `0x10008000`) are in
+[src/vec/vectors.h](src/vec/vectors.h); the image is mapped at that address in the harness process with guard pages around it, since lifted code uses
+guest addresses as host addresses.
+
+**The big sweep.** Phase 2's acceptance asks for 10^8 vectors per instruction class; CI runs the committed set. Any number of random vectors streams
+through the harness without files:
+
+```sh
+python3 dm/tools/aot/tests/gen_vectors.py --count 1000000 --seed 5 --classes simd_same --seeds-per-word 20 | build/aot/nxaot_vec --batch 1024 -
+```
+
+`--classes` takes the file names of the floating-point and SIMD generators (`fp`, `simd_same`, `simd_misc`, `simd_shift`, `simd_perm`, `crypto`,
+`simd_ldst`, `fp_seq`) or the class names of their vectors; each round of the generator takes new seeds; `--seeds-per-word` runs each encoding with
+that many value sets (and one FPCR), so that the lifter compiles it once. About 2,900 vectors a second per process on the development machine; the
+numbers of a sweep are in "Measurements".
+
+The census reads dynarmic's decoder (its matcher names), the Arm ARM's top-level encoding table, and Arm ARM masks for what dynarmic does not decode
+(LSE atomics, `ldapr`, `msr` immediate, `hvc` / `smc`, `udf`). Exclusive windows and SP writes are followed on dynarmic's IR of each instruction: a
+window is the straight line from an exclusive load to its store (conditional branches fall through, a second exclusive load or an unconditional
+branch ends it unpaired), ABA-sensitive when a load inside reads through the loaded value (design 6.5); `sp.from_memory` counts SP set, within a basic
+block, from a value a load produced. The `answer.*` keys answer phase 0's questions with 0 or 1.
+
+## Module loader and discovery
+
+```sh
+build/aot/nxaot module dm/tools/aot/corpus/nro/switch-gcc.nro          # what the loader read: layout, MOD0, symbols, relocations, FDEs, LSDAs, data blocks
+build/aot/nxaot image dm/tools/aot/corpus/nro/switch-gcc.nro /tmp/x    # the behaviour-image form: /tmp/x/switch-gcc.image.bin and switch-gcc.aot.tsv
+build/aot/nxaot manifest /tmp/x/switch-gcc.aot.tsv                     # parse a manifest, print it back in canonical form
+build/aot/nxaot discover dm/tools/aot/corpus/nro/switch-gcc.nro --tsv /tmp/x/switch.tsv            # discovery: a line per function, the summary
+build/aot/nxaot discover /tmp/x/switch-gcc.aot.tsv --symbols-as-oracle                               # no symbol as a source; compared with them
+```
+
+**The loader** ([src/module/image.h](src/module/image.h)) reads an NRO as the host's loader does (`dm/host/loader.c`: the header's segments, MOD0 at
+the offset in word +4, the dynamic section, `DT_SYMTAB` sized by `DT_HASH`, `DT_GNU_HASH` or the distance to `DT_STRTAB`, `DT_INIT` / `DT_FINI`,
+the init, preinit and fini arrays read through their relocations, RELA, JMPREL and RELR), and `.eh_frame_hdr`'s search table with each FDE's CIE
+augmentation (`zPLR`), LSDA pointer and the LSDA's call-site table and landing pads, as `dm/tools/nso_code.py` `fde_ranges` reads them. Data blocks
+in text: an NRO's header after its entry branch (+4..+0x80: word +4 is MOD0's offset, then the header) and MOD0 with libnx's `LNY` records when it
+lies in the text; for a behaviour image, the manifest's `data` rows. A manifest (`<name>.aot.tsv`, every row kind of design 1.2:
+[src/module/manifest.h](src/module/manifest.h)) names its image `<name>.image.bin` beside it; the image's SHA-256 must be the one in its header.
+`nxaot image` writes that form for an NRO (its bytes unchanged, so the key is the same SHA-256; a manifest with `layout` and `data` rows), so the
+tool reads one input form for NROs and game modules.
+
+**Game modules: `patch_nso.py --aot`** ([dm/tools/patch_nso.py](../patch_nso.py), "The recompiler's input"; [rewriter.md](../../../docs/reference/rewriter.md#the-recompilers-input---aot)).
+`patch_nso.py <NSO> <out dir> <name> --aot <aot dir>` rewrites the module as before, Apple's outputs byte for byte unchanged, and also writes
+`<aot dir>/<name>.image.bin` and `<name>.aot.tsv`. The image is the NSO's text, read-only data and data as the rewriter decompressed them (the LZ4 of
+the NSO is read there, as for Apple's `<name>.patched.bin`: neither the host nor nxaot decompresses anything), with the registered and matched cuts
+and the frame step's branches applied, before any of Apple's rewrites. The manifest has every row kind of design 1.2 in the canonical order of
+`WriteManifest`, so `nxaot manifest` prints it back unchanged. Where it, the design and [src/module/manifest.cpp](src/module/manifest.cpp) differ,
+`manifest.cpp` is the format:
+
+| Row | Design 1.2 | Written |
+|---|---|---|
+| the command | `patch_nso.py --aot <NSO> <out dir> <name>`, the image instead of `patched.bin` | `--aot <dir>` after the usual arguments, besides Apple's outputs: one rewrite gives both, and a test checks that Apple's outputs are unchanged |
+| `layout` | `bss` | the zero bytes after `image_size`; 0 when the image holds them (a module with FRAME_STEP, below) |
+| `aux` | the stubs "at the same offset" as in the patch area | the behaviour image has no patch area: the build's own FRAME_STEP function assembles its stubs again at the page after the state page (state page at `FPS_STATE_OFF`, as on Apple), and the image goes on to their end, bss and the key page's place as zeros. A module whose bss puts that past a `b`'s reach of the text (a FAR module) fails the rewrite at the `B()` assertion: the manifest's unsigned offsets cannot place the region before the base. nxaot lifts the region's code as part of the functions whose walks branch into it ("Calls and returns", The aux region) |
+| `data` | `nso_code.data_blocks` | those, the MOD0 offset word at +4, and MOD0 with its `LNY` records when the text holds it, as nxaot reads an NRO (`NroDataBlocks`) |
+| `obs` | `<number> <parameter>` | the OBS number's low 8 bits (decimal) and its bits 8 up (hex), as hle.c's gate table splits them |
+| `oracle-J` | `<base> <width>` | `sites.tsv`'s J rows hold the landing pads' count (256, or the halfword table's entries), not the width: the rewriter records the entries' width (1 or 2) for the manifest |
+| `oracle-W` | `<lo> <hi>` | `sites.tsv`'s W rows: `hi` is past the `cbz` / `cbnz` that follows the store when one does; nxaot's windows end past the store |
+
+Checked on a synthetic module, with no game files ([dm/tools/tests/aot_synth.py](../tests/aot_synth.py): an NSO of hand-assembled AArch64, every
+encoding checked with llvm-mc; its patch file has a cut, an observation gate and a frame step), by [test_aot_manifest.py](../tests/test_aot_manifest.py):
+every row against the image's and the NSO's bytes; where capstone and lz4 are installed (tests.yml's tool tests; neither Docker image has them),
+`patch_nso.py` with and without `--aot` (Apple's outputs identical) and the image and manifest equal to `aot_synth.py`'s; with `NXAOT=<nxaot>` (this
+image, aot.yml) the manifest's round trip, nxaot's discovery against the oracle rows (design 12, item 5: the byte table's base and width, the offset
+table's targets index by index, the window's start, its end four bytes short as said above, 0 words uncovered) and `nxaot build`. nxaot does not
+compare the oracle rows itself at pack time yet.
+
+**Discovery** ([src/analysis/discover.h](src/analysis/discover.h)) takes the entries of design 1.3 in its order and records each entry's provenance
+(`fn` rows: every source that named it; the first is its primary one): the module's entry, FDEs, `STT_FUNC` symbols (not with `--symbols-as-oracle`),
+`DT_INIT`, `DT_FINI`, the arrays, relocation targets in text; then, from the walks, `bl` targets, `b` / `b.cond` / `cbz` / `tbz` targets outside
+their function (tail calls), landing pads outside their function, jump-table targets that are other functions' entries, `adr` and `adrp` + `add`
+text addresses that no function's code reaches and no function's FDE or symbol range holds (inside one they are a root of it: a table base, a resume
+point), and last the gap sweep (the first word that is not padding of every stretch no function reached; inside a function's own range it is a
+root of that function, not an entry). A behaviour image's aux region (the frame step's stubs) is code of every function whose direct branches
+reach it, its blocks part of that function's walk, never an entry of its own. A walk follows a function's direct branches in `[entry, limit)`, the limit being the next entry or the FDE's
+end, by dynarmic's decoder table and the Arm ARM's fields ([src/analysis/insn.h](src/analysis/insn.h)); `br x30` is a return (design 3.3), a call to
+a function the summaries prove does not return does not fall through, and landing pads are reached from the calls their call-site range covers.
+Coverage: every text word outside data blocks is in a function, padding (`nop` or zero) or reported as uncovered; undefined words inside functions
+are counted.
+
+**Jump tables** ([src/analysis/jumptable.h](src/analysis/jumptable.h)), by data flow on the lifted IR as design 1.3 asks: for each `br`, the blocks
+from one of the br block's dominators (the br block itself, then up the dominator tree) that reach the br are lifted by the lifter into one LLVM
+function (`Region::follow`), SROA and EarlyCSE make it SSA, and the br's target (the operand of an `nxaot.indirect` marker the lifter emits,
+`Region::mark_indirect`) must be a function of one guest load whose address is a function of one index: a node of the address's expression
+that cuts it from every value it depends on (the address is constants and arithmetic of that node alone), whatever computed the node: a bit field
+of a product, the case offset of a sum, a mask of an exclusive or ("Jump tables whose index depends on several values" below). Of those nodes the
+one with the smallest range at the br is the index. It is bounded at the br by
+LLVM's LazyValueInfo and known bits, through casts, constant arithmetic and phis (each lifted instruction reads its registers anew, so `cmp w13`
+and the index `w13` are two `trunc x13`: an equal cast on each predecessor's straight line gives the edge's range); the entries are read from the
+image (through the relocation of a slot, for tables of pointers in data) and every target must be a decoded instruction of the function or another
+function's entry. A region is used only when it is closed: every block of it that reaches the br, but its first, is entered only from inside it.
+Regions continue past a call by the callee's summary (`Region::calls`: what it may change is opaque, the rest keeps its value; GCC keeps a table
+base in `x18` across a call to a function its interprocedural register allocation knows leaves `x18` alone) and through the function's known tables,
+which become LLVM `switch`es (`Region::tables`, the lowering of design section 4). A switch in a loop, whose cases branch back to it, is first
+bounded with the code no known edge reaches left out, then verified: with its cases walked, a closed region that includes them must give the same
+targets, or the table is dropped; one that does not verify without calls is tried once more past calls, since its cases may call what the
+code before the br does not. InstCombine is not run: it rewrites the index's `zext (trunc x)` as `and x, mask`, a value the compare does not
+name. Shapes covered by the corpus: byte, halfword and word entries, signed (GCC) and unsigned (clang), `adr` bases and table-relative bases (clang's
+uncompressed tables), bounds by `cmp` / `b.hi`, by `sub` then `cmp` (offset cases), bases set before calls, switches in loops (except-gcc's CFA
+interpreter, whose cases call memcpy); test_discover.py adds a module written word by word with each form over an index computed from several
+values, and the unsound look-alikes that must stay brs. A br left unbounded is
+a `br` row with its reason, for the dispatcher (design section 4): in the corpus only fnptr's `unops[i % 6](x)`, an indirect tail call whose index is
+a remainder computed with a multiply and shifts that no LLVM analysis bounds.
+
+**Exclusive windows** ([src/analysis/summary.cpp](src/analysis/summary.cpp)): from each `ld(a)x(r|p)` the straight line (conditional branches fall
+through) to its `st(l)x(r|p)`, never past a second exclusive load (the rewriter's rules); `cas` when no other load is inside (compare-and-swap
+semantics are equivalent, design 6.5), `aba` when a load reads through the loaded value, `load` for another load; the others are counted unpaired.
+The rewriter's `oracle-W` rows are a subset (its x18 windows), compared on the synthetic module by test_aot_manifest.py ("Game modules" above).
+
+**Summaries** (design 2.3, the facts only): per function the registers it may read before writing them (backward liveness, a call's reads and its
+must-writes), may change (everything written, callees included, minus what it restores), must write on every return path, and whether it is
+**preserving**: x19..x29, SP and the low halves of v8..v15 hold their entry values at every return, which an abstract interpretation of each
+instruction's dynarmic IR checks (registers as entry values plus offsets, SP-relative 8-byte slots, stores through other pointers taken not to reach
+the save slots; a `ret` whose `x30` is not the entry's, as longjmp's `br x30`, is a non-local transfer and makes the function open). A fixed point over
+the call graph: direct calls by their callee, `blr` and unbounded `br` by the union over the address-taken functions that return, `svc` as a call
+that keeps x19 and up. Classes: `preserving`, `open`, `noreturn` (no return path). The address-taken set: entries from relocations, `adr` /
+`adrp` pairs, the init and fini arrays and other functions' tables.
+
+`nxaot discover` prints a line per function (`offset size provenance blocks calls indirect windows has_lsda class name`; `indirect` counts `blr` and
+unbounded `br`) and `summary` lines; `--tsv` writes every row: `fn` (entry, size, limit, provenance, blocks, calls, unbounded brs, blrs, windows,
+has_lsda, reads, writes, must, class, address-taken, exported, name), `jt` (br, function, first entry, width, signed, base, scale, first index,
+count, region start, past calls, targets), `br`, `call`, `win`, `pad`, `gap` (uncovered words), `oracle` (with `--symbols-as-oracle`) and the
+summary. `NXAOT_DUMP_REGION=<br pc>` prints the optimised IR of every region tried for that br; `NXAOT_DEBUG_REGION=1` the outcome of each.
+
+What is not done: the census numbers of phase 0 over whole modules (FDE coverage, LSDA counts, setjmp imports, the address-taken set: all available
+from `nxaot discover` now, not folded into `nxaot census`), the `oracle-T` / `oracle-J` / `oracle-W` comparisons at pack time (the parser reads
+them; test_aot_manifest.py compares them on the synthetic module), the
+non-local control flow census beyond landing pads (setjmp by symbol, SP from memory) and functions split for size (design 9.3). Discovery's
+cost on game-shaped modules is in "Pack throughput".
+
+## The corpus
+
+Design section 12, item 3: self-checking programs built as NROs with no game files and no keys, the same programs with devkitA64's GCC and with
+upstream clang. [corpus/](corpus/):
+
+| Program | What it checks |
+|---|---|
+| `int_ops` | integer arithmetic and bit manipulation, compiler-torture style: volatile inputs, each operation against a reference written another way, the corners C leaves undefined (division by zero, `INT_MIN / -1`, shifts by the width or more) in inline assembly, CRC32 / CRC32C, a TLS counter; built without unwind tables, so discovery works without FDEs |
+| `switch` | switches lowered to jump tables of every entry size (byte, halfword, word: `switch_word.c`), offset cases, case ranges, fallthrough, a state machine, nested, sparse (a compare tree) and two clusters, checked against tables of function pointers and if chains |
+| `fnptr` | vtables and dispatch tables in relocated data, callbacks built with `adrp` + `add`, direct and indirect tail calls, mutual recursion, constructors and destructors (the init and fini arrays, `DT_INIT`), cleanup landing pads (built with `-fexceptions`) |
+| `fp` | the operations of design 7.2 over special values, single and double: 5,928 cases whose results [corpus/gen_fp.py](corpus/gen_fp.py) computes from the Arm ARM's pseudocode (`FPAdd`, `FPMulAdd`, `FPRecipEstimate`, `FPToFixed`, `FPRoundInt`, ...) with FPCR = 0 |
+| `simd` | NEON intrinsics lane by lane against scalar references, the floating-point vector forms against the scalar instructions |
+| `sjlj` | setjmp / longjmp of [corpus/rt/setjmp.S](corpus/rt/setjmp.S): second returns, deep recursion, a handler stack, callee-saved registers |
+| `excl` | the C11 atomics of every width as `ldaxr` / `stlxr` loops, compare-and-swap, 128-bit pairs, `clrex`, a spin lock, an ABA-sensitive lock-free pop; then with threads ([corpus/rt/thread.h](corpus/rt/thread.h)): two workers released together (`svcWaitForAddress` / `svcSignalToAddress`) increment shared counters through an `ldaxr` / `stlxr` loop, a compare-and-swap loop, an `ldaxp` / `stlxp` pair and a libnx-style mutex (`svcArbitrateLock` / `svcArbitrateUnlock` when contended), 100,000 times each, with the exact totals checked; a third thread runs the register-invariant loop of [corpus/rt/pause.S](corpus/rt/pause.S) (`excl_pause_iterations`, exported, 20 million by default) that the pause test checks; the main thread sleeps (`svcSleepThread`), releases and joins them (`svcWaitSynchronization`) |
+| `except` | C++ exceptions through the LSDA tables (design 3.4), [corpus/src/except.cpp](corpus/src/except.cpp) built as C++ with `-fexceptions` and no C++ library: objects whose destructors give every frame cleanup landing pads, thrown through deep recursion, a call through a pointer, a frame without cleanups, nested catchers and a rethrow, by the minimal personality-free unwinder of [corpus/rt/unwind.c](corpus/rt/unwind.c) (the FDE from `.eh_frame_hdr`, the CFA program, the LSDA's call-site table, the pad entered by a `ret` as libunwind and libgcc do it, `_Unwind_Resume`, a setjmp catcher); the destructors' count and order, callee-saved values across the unwind, the unwinder's frame and pad counts |
+| `fiber` | stack switching by hand ([corpus/rt/fiber.S](corpus/rt/fiber.S), two stacks besides the main one): a generator fiber, a ring of two fibers that switch from inside recursions, callee-saved registers across switches, and a callee that returns to its caller's caller; every switch returns to a call site that is not the caller's |
+
+The run time ([corpus/rt/](corpus/rt/)): `crt0.S` lays out an NRO's start as libnx's does (a branch over the header, MOD0's offset at +4, MOD0 in the
+text), sets SP to a stack of its own, relocates the module unless a loader did, points `tpidr_el0` at the TLS block, runs `DT_INIT` and the init
+array, calls `main` and leaves through `svcExitProcess`; `rt.c` prints one line per `svcOutputDebugString` (`dm/host/hle_svc.c` answers it) and
+ends with `PASS <checks>` or `FAIL <failed> of <checks>`; `mem.S` has `memcpy` and its kin, `nro.ld` the layout both linkers read. For single
+programs: `thread.S` (Horizon's thread and synchronization SVCs as libnx wraps them), `thread.c` (a thread with its stack and TLS block, a mutex),
+`pause.S` (the register-invariant loop), `unwind.c` / `unwind.S` (the unwinder; built with `RT_UNWINDER`, rt.c then leaves `_Unwind_Resume` to it),
+`fiber.S` (the context switch and the return past the caller).
+
+```sh
+sh dm/tools/aot/corpus/build_corpus.sh            # build both toolchains in Docker, write corpus/nro/ and corpus/corpus.tsv
+sh dm/tools/aot/corpus/build_corpus.sh --check    # build into build/corpus/check, compare byte for byte with the committed files
+python3 dm/tools/aot/corpus/fetch_devkita64.py /tmp/dkp && DKP_ROOT=/tmp/dkp/opt/devkitpro sh dm/tools/aot/corpus/build_corpus.sh --check
+build/aot/nxaot_run dm/tools/aot/corpus/nro/fp-gcc.nro                  # one NRO under dynarmic: its lines
+python3 dm/tools/aot/tests/test_corpus_run.py --nxaot-run build/aot/nxaot_run   # every NRO against corpus/expected/<program>.out
+python3 dm/tools/aot/corpus/gen_fp.py             # after a change to the fp cases (CTest corpus_fp_current checks fp_cases.h is current)
+```
+
+GCC is devkitA64 15.2.0 from `devkitpro/devkita64:20260219` pinned by digest in `build_corpus.sh` (pulled on first use: about 700 MB compressed);
+with `DKP_ROOT` the same binaries run in the `nxnative-aot` image from a devkitPro tree, which `fetch_devkita64.py` extracts from the pinned image's
+layer (every digest checked, 228 MB with the C++ compiler the except program needs) for a machine without the disk room for the image. clang is
+the image's clang-18 (`--target=aarch64-none-elf`). Common flags: `-O2 -mcpu=cortex-a57 -mno-outline-atomics -ffreestanding -fPIE
+-fno-stack-protector -ffp-contract=off -fno-math-errno` (C++: `-std=gnu++17 -fno-rtti -fno-threadsafe-statics` instead of `-std=gnu11`), PIE links with
+`--export-dynamic --hash-style=sysv --build-id=sha1` (GNU ld: RELA relocations; ld.lld: `-z pack-relative-relocs`, RELR); `corpus.tsv` lists
+every NRO with its compiler, flags and SHA-256. [tests/elf2nro.py](tests/elf2nro.py) writes the NROs (and the symbol tables `test_discover.py` compares
+with), byte for byte what devkitPro's `elf2nro` writes, which `build_corpus.sh` checks on every build. The builds are reproducible: no timestamps,
+paths relative to the corpus folder, build IDs over the content; `--check` rebuilds byte-identically.
+
+Run so far: under dynarmic (`nxaot_run`, CTest `corpus_ref`) and recompiled on x86-64 (`nxaot build` and `nxaot_host`, CTest `corpus_native`: both
+conventions, the correctness mode and the max mode; CTest `corpus_jit`: with everything in the JIT and with no JIT): all eighteen NROs print `PASS`,
+the GCC and clang builds of each program the same lines, recorded in [corpus/expected/](corpus/expected/), and the native runs exactly what dynarmic
+prints. Not run: natively on ARM64 hardware (an Apple-silicon Mac; nothing here can). `int_ops` reads an exported `int_ops_rounds` (1 in the committed output) that a runner may set before the run (`--set
+int_ops_rounds=N`): its operation loop then runs N times, which the throughput measurement uses.
+
+## Calls and returns
+
+```sh
+build/aot/nxaot build dm/tools/aot/corpus/nro/fnptr-gcc.nro --shared /tmp/x/fnptr.so   # balanced (tier W), swifttailcc, a worker per CPU
+build/aot/nxaot build ... --cc ghc --mode max --correctness --all-entries --cpu x86-64-v3 --spills --asm /tmp/x/fnptr.s
+build/aot/nxaot build ... -o /tmp/x/fnptr.o --workers 2 --cache /tmp/x/aot-cache   # also one relocatable object; 2 workers; the cache
+build/aot/nxaot build ... --target windows --shared /tmp/x/fnptr.dll               # the pack for the Windows host, a DLL ("Windows packs")
+```
+
+`nxaot build` ([src/build/pack.cpp](src/build/pack.cpp)) runs discovery, plans the convention ([src/build/plan.cpp](src/build/plan.cpp)) and lifts
+every function in **function mode** ([src/lift/lower_calls.cpp](src/lift/lower_calls.cpp)): one LLVM function per guest function, named
+`<module>+0x<offset>`, its blocks those its entry and its landing pads reach inside `[entry, limit)` (a block that runs to the limit continues in the
+next function by a tail call). Design 2.3, 3.3 and 4, as implemented:
+
+- **The convention's facts** (`FnFacts`): PASS = x0..x3 and the passable registers the function may read (its summary's `reads`); WRITES = the
+  summary's `writes`, plus v8..v15 when the function writes them at all (a `ldr d8` restore zeroes the high half, which callers must not keep);
+  LIVE_AFTER, a fixed point over every call site of the module (what is read before being written after the call; a tail call passes on its own
+  function's; an indirect site counts for every standard entry; the host and the JIT read x0, x1, v0..v3 and SP); RV, the v0..v3 returned in host registers: the
+  same over every chain of tail calls (a component of the tail-call graph; every standard entry is in one), the ones every returning member writes.
+- **Registers** live in allocas as in a region; at entry the passed ones come from the arguments, the rest from the block (unused loads go). A
+  forward data flow over the function's blocks gives the **dirty** registers (newer than their block copy) at every block end. A call stores
+  dirty - PASS(callee) - {sp, lr}, then takes x0, x1 and RV from the return value and reloads WRITES(callee); through the dispatcher it also stores
+  what it passes that the union of the possible callees may change (`CalleeView::exact`: the callee that runs stores only its own writes). The
+  indirect view's WRITES is that union and AAPCS64's result registers, x0..x8 and v0..v3 (`analysis::ForeignWrites`), since the callee may be no
+  function of the module: a host function through a GOT slot, another pack, code the JIT fallback runs (CTest `plan`,
+  [tests/test_plan.py](tests/test_plan.py)). A return stores dirty & LIVE_AFTER & WRITES (not the returned registers), and the registers it restores whose block copy it changed before an inner call
+  (design 2.3: "stores the restored value again"); a tail call stores dirty - PASS(callee) and what its callers reload that the callee passes back
+  unchanged; svc, traps and non-local returns store every dirty register, so the block then holds the whole register file. Preserving callees keep
+  x19..x29 and SP in SSA across the call. **The correctness mode** (`--correctness`) stores every register at every call, tail call and return,
+  reloads every register after every call and takes nothing from arguments or return values: the reference the tests compare with.
+- **Two conventions** (`--cc`): **swifttailcc** (the default) with `st` as `swiftself` (R13), sp, lr, x0..x3 in RDI, RSI, RDX, RCX, R8, R9, x4..x7
+  on the stack and v0..v7 in XMM0..7, each function's signature carrying only what it reads (the callee pops its argument area, so `musttail`
+  between different prototypes is allowed); **ghccc**, the stand-in for preserve_none: LLVM 18.1, which `nxaot.lock` pins, has no `preserve_nonecc`
+  (it came with LLVM 19), and ghccc is the convention preserve_none generalises (every general register carries arguments, none is callee-saved): one
+  uniform signature, st, sp, lr, x0..x6 in R13, RBP, R12, RBX, R14, RSI, RDI, R8, R9, R15, v0..v5 in XMM1..6 (x7, v6, v7 through the block), frame
+  pointers off. Both return `{x0, x1, v0..v3}` in RAX, RDX, XMM0..3. swifttailcc is the default from the numbers ("Measurements"): calls and returns
+  cost the same in both (2.2 ns, 5.4 TSC cycles, for a leaf), ghccc reloads 10 to 30 % more on the corpus (no callee-saved host registers across
+  calls), and one loop was twice as slow under it; ghccc is 14 % faster on a chain of frame-building calls and on an inline-cache hit.
+- **Returns** (3.3): `ret` (and `br x30`, `ret xN`) compares its target with the lr the function was entered with; equal, a native `ret` (the
+  compare folds away where x30 is never written); else the whole register file to the block, the target in `st->pending` and a native return.
+  After every call one compare and branch on `st->pending`: a resume point of the call site (the LSDA landing pad covering it; every setjmp
+  continuation of the function, setjmp found by symbol) entered with this frame's SP takes it, reloading every register; otherwise the frame
+  returns at once, and the host dispatches what reaches it as a new call (a target with no compiled entry, a continuation in the middle of a
+  function, runs in the JIT: "The JIT fallback"). The sjlj program's longjmps (deep recursion, through a function pointer, nested handlers,
+  callee-saved registers) and the except program's landing pads (entered by its unwinder's `ret`, past every frame between) all resume this way.
+- **Calls and tail calls**: `bl` is a call of the callee's body with `lr = base + pc + 4`; `b`, `b.cond`, `cbz`, `tbz` to another function and a
+  fall into the next one are `musttail` calls; a call the summaries say does not return traps if it returns.
+- **Indirect branches** (4): a recovered jump table is an LLVM `switch` over module offsets (the target minus the base), a native jump table, its
+  other values going to the dispatcher; `blr` and unbounded `br` (fnptr's `unops[i % 6](x)` among them) go through a per-site **inline cache**:
+  the slot points at an immutable `{guest, native}` descriptor; a hit is the slot's load, the guest address's load and a compare (and the native
+  entry's load beside it), a miss calls the host through a `preserve_all` wrapper (`nxaot.dispatch`), which looks the target up in the module's
+  **lookup table** and publishes a descriptor in the slot. Every host-callable function (address-taken, the module's entry, exported; every
+  function with `--all-entries`) has a **standard entry** with the module's one signature (x0..x3 and what some address-taken function reads), which
+  stores what its body does not take and tail-calls the body.
+- **Addresses built from the pc** (adr, adrp, literal loads, return addresses, the pcs of svc and exceptions) are base-relative: the module runs
+  wherever the host maps it (`*desc->base`, one invariant load per function). Each block is translated a second time 2^44 higher, and every 64-bit
+  immediate that moved by exactly that much is such an address, lowered as `base + offset`.
+- **Host calls**: `svc` stores the dirty registers and `st->pc`, calls `dm_aot_svc(st, n)` (the C convention) and reloads x0..x8 (2.4); `mrs
+  cntpct_el0` is a `preserve_most` call of `dm_aot_cntpct` (8); `brk`, `udf` and undefined words call `nxaot_rt_trap` with a reason
+  (`include/nxaot/aot_module.h`); branches into the middle of other functions go through `jit_entry`, and `msr fpcr` leaving the specialisation,
+  untranslated encodings and code that runs into no entry hand the rest of the function to `nxaot_rt_jit` ("The JIT fallback"). A function the
+  lifter refuses becomes a body that runs it in the JIT from its entry (none in the corpus). Safepoint polls: "Threads and safepoints".
+- **Gates** (design 1.1; the manifest's `obs` and `spin` rows): before an observed instruction (the translation stops there, so a block starts
+  at it) the code stores every register newer than the block, `pc` = the instruction, calls `nxaot_rt_gate(st, offset)` through a `preserve_all`
+  wrapper and reloads x0..x29 (an observer may change them: `OBS_STDALLOC_INIT` writes x2); where a spin wait's back-edge is taken to its head, the
+  same with `pc` = the head and no reload, then the edge's safepoint poll. The descriptor lists the sites (`gates`, sorted, kind and argument), the
+  unit checks that its code calls every site its function's blocks hold (a pack that would not serve one fails), and dm/host checks them against
+  the manifest's rows ("A game module in the host"). A module without such rows imports no `nxaot_rt_gate`.
+- **The aux region** (design 1.1; the manifest's `aux` row, the frame step's stubs): code of every function whose walk branches into it, never a
+  function of its own. Discovery follows a function's direct branches into the region and back (`Inside`), the lifter's region and reader take it
+  (`Region::extra`), so a stub and the code around its site are one LLVM function, as on Apple the patch area runs between two instructions of
+  the function: the stub's `b` back is a branch inside the function, wherever the site is (an entry, the middle of a loop), with no tail call that
+  would hand a stale x30 to the next part. The unit's cache key holds the region's words its function reaches.
+- **The standard entries' one signature** (design 2.3, ABI 3): x0..x3 and the convention's passable registers in host registers (swifttailcc:
+  x4..x7 and v0..v7; ghccc: x4..x6 and v0..v5), x0 and x1 returned in host registers and v0..v3 through the block (rv 0: the standard entries'
+  tail-call component returns no v register in host registers, its members store what they write of v0..v3 at their returns, where every
+  standard entry's LIVE_AFTER has them), whatever the module's address-taken functions read: the same in every pack of a convention and mode, so
+  the dispatcher binds an inline cache of one pack to another pack's standard entry (a call into an NRO, an NRO calling its loader back) and the
+  next call goes there directly. The descriptor records it (`std_x`, `std_v`, `rv`).
+- **Tables in the tables' object** ([include/nxaot/aot_module.h](include/nxaot/aot_module.h)): `.nxaot.lookup` (open addressing, module offset ->
+  standard entry, self-relative), `.nxaot.fnmap` (every function's body and size), `.nxaot.gates` and the exported descriptor `nxaot_module`;
+  **the line table** (3.5) is `lines.o`'s, made once every unit is compiled: `.nxaot.fnlines` (a run per function, parallel to the function map)
+  and `.nxaot.lines` ({native address - the body's, guest offset}, each run sorted). Each unit marks its guest memory accesses with
+  `!pcsections` into the section `.nxaot_pcs` of its object; LLVM writes, per metadata node, the addresses of every machine instruction that
+  carries it and then the guest offset once (`AsmPrinter::emitPCSections`), so the section is no array of pairs (ABI 2's readers took it for one:
+  246 of fnptr-gcc's 415 entries and 8,812 of switch-gcc's 24,293 were misread). `ReadLineMarks` (src/build/pack.cpp) tells the words apart by
+  the unit object's relocations (only addresses have one), files each address under the body symbol that holds it, and sets `SHF_EXCLUDE` on the
+  section, which lld then drops: the pack holds nxaot's table only, the same whatever order LLVM wrote the groups in. Call sites and the other
+  native addresses map through the DWARF line table (line = guest offset in a synthetic `<module>.s`; `--no-debug-info` drops it). The selection
+  DAG gives an access's mark to every machine instruction it lowers it to (a `cmpxchg`'s `lock cmpxchg` and the `setcc` of its success), all of
+  them the right guest instruction; in 8 of the 58,843 accesses of the 24 packs test_lines.py builds LLVM folded a load into its user and unfolded it again,
+  and the mark ended on a neighbouring instruction of the same lowering: a fault at that load is reported at the nearest entry before it, which
+  the report says. CTest `lines` (`nxaot lines <pack> <module>`) checks every entry of every corpus pack against the code and the module.
+- **Tiers** (9.3, `--tier`): C (SROA, instcombine, simplifycfg, DCE; FastISel), W (LLVM's O1 pipeline, codegen Less), H (O2), H+ (O3, codegen
+  Aggressive). Without a profile the pack modes are one tier for every function: `balanced` W, `max` H+. One tier per module for now. At C and W
+  every function is a compile unit of its own, at H and H+ a shard of neighbouring functions ("Pack throughput"): H and H+ inline within a shard
+  (design 9.3), not across shards (ThinLTO's import is phase 5b's).
+
+Found by the tests and fixed in the lowering: a guest call site that two lifted blocks hold (the block that runs into a loop's head holds the
+loop's first instructions, and the head's block holds them again) had an inline cache per copy, so the second copy missed again what the first had
+learnt (t_aot_hostfn's cross-pack loop: one dispatcher miss after the warm-up); a site now has one slot per function (`FnDispatch`). And: a preserving callee that stored its own x29 before an inner call left that copy in the block, which a
+later callee saved in its frame record (nxaot_funcdiff, summary mode: the missing "store the restored value again" rule); an indirect call reloaded
+x3 from the block after the call because some address-taken function writes x3, while the leaf that ran stored nothing (nxaot_bench's blr loop never
+ended: the `exact` rule above); an indirect call reloaded only what the module's own functions may write, so in a module where none writes v0 the
+call site kept its own v0 after a host function returned a float there (dm/host's t_aot_hostfn: `sqrtf(6.25f)` through the GOT gave back 6.25,
+0x40c80000 for 0x40200000, with aot_synth.py's v0-writing `hf_one` made a nop; the summaries' indirect callee and the plan's indirect view now
+include AAPCS64's result registers, and that run gives 2.5).
+
+## The native run time
+
+```sh
+build/aot/nxaot_host /tmp/x/fnptr.so dm/tools/aot/corpus/nro/fnptr-gcc.nro       # the lines, as nxaot_run prints them; exit status of the run
+build/aot/nxaot_host /tmp/x/int_ops.so dm/tools/aot/corpus/nro/int_ops-gcc.nro --set int_ops_rounds=200 --quiet --repeat 5
+build/aot/nxaot_host /tmp/x/fnptr.so dm/tools/aot/corpus/nro/fnptr-gcc.nro --relocate --set hidden_ptr=@0x1844   # a target with no entry: the JIT
+build/aot/nxaot_host /tmp/x/fnptr.so dm/tools/aot/corpus/nro/fnptr-gcc.nro --jit-all     # everything in the JIT fallback; --jit-none: no JIT
+build/aot/nxaot_host /tmp/x/excl.so dm/tools/aot/corpus/nro/excl-gcc.nro --pause-test 50 --set excl_pause_iterations=100000000000   # section 6.2; ends by count
+build/aot/nxaot_host /tmp/x/fnptr.so dm/tools/aot/corpus/nro/fnptr-gcc.nro --lookup     # the module offsets the lookup table holds
+build/aot/nxaot build dm/tools/aot/corpus/nro/fnptr-gcc.nro -o /tmp/x/all.o --shared /tmp/x/all.so --all-entries --correctness
+build/aot/nxaot_funcdiff /tmp/x/all.so dm/tools/aot/corpus/nro/fnptr-gcc.nro --seeds 3   # every function against dynarmic
+python3 dm/tools/aot/tests/test_corpus_native.py --nxaot build/aot/nxaot --nxaot-host build/aot/nxaot_host --nxaot-run build/aot/nxaot_run --work /tmp/x
+python3 dm/tools/aot/tests/test_funcdiff.py --nxaot build/aot/nxaot --nxaot-funcdiff build/aot/nxaot_funcdiff --work /tmp/x [--cc ghc]
+python3 dm/tools/aot/tests/test_corpus_jit.py --nxaot build/aot/nxaot --nxaot-host build/aot/nxaot_host --work /tmp/x     # mixed, jit-all, jit-none
+python3 dm/tools/aot/tests/test_threads.py --nxaot build/aot/nxaot --nxaot-host build/aot/nxaot_host --work /tmp/x [--runs N]
+python3 dm/tools/aot/tests/test_safepoints.py --nxaot build/aot/nxaot --nxaot-host build/aot/nxaot_host --work /tmp/x [--pauses N]
+```
+
+[src/rt/host.h](src/rt/host.h), the minimal form of what the host will do (design 2.4, 3.3, 4, 5, 6, 8, 9.4, 11), as a library (`nxaot_rt`) that
+nxaot_host, nxaot_funcdiff and nxaot_bench share. Decision against 9.4: the pack is a shared object linked by lld as a library inside `nxaot build`,
+and the host loads it with `dlopen`, as the design's host loads the pack's library (no LLVM in the host; the library's imports resolve against the
+executable, which exports them).
+
+- **The arena** (5.2): 256 GiB reserved at 2^36 (64 GiB to 320 GiB, below 2^39) with `MAP_FIXED_NOREPLACE`, nothing accessible until mapped: the host-return
+  address `arena + 0x10` (no code), the main thread's guest stack (1 MiB at +16 MiB), its TLS block, a scratch area for nxaot_funcdiff, and the
+  module's image at +256 MiB, its one-to-one guest address (5.1): text and read-only data readable and never executable (5.3: a jump into guest
+  text faults), data and bss writable. State blocks and native stacks are outside it.
+- **Loading** (9.4): the library's descriptor is checked against the image (ABI, SHA-256, sizes; a mismatch stops with a red line and status 2),
+  `*base` is written, the line table and the function map are read. `--relocate` applies the module's relocations as dm/host's loader does (the
+  corpus's crt0 then skips its own); `--set` writes a symbol.
+- **A run**: a state block (x0 = 0, x1 = -1 as nxaot_run, x30 = the host-return address, SP and `tpidr_el0` the host's stack and TLS block, the
+  monitor clear: 6.5, `st->excl_*` the thread's local monitor), MXCSR of the module's FPCR (7.1), then `enter(st, standard entry of _start)`; a
+  non-local transfer that reaches the thread's outermost level is dispatched as a new call, or run in the JIT when it has no compiled entry (3.3,
+  "The JIT fallback"). The run ends when a thread calls svcExitProcess or fails: every other thread stops at its next poll, SVC, JIT block
+  boundary or wait, and is joined ("Threads and safepoints").
+- **What the library imports**: `dm_aot_svc` (the SVCs of "Threads and safepoints"; others stop with status 5), `nxaot_rt_dispatch` (the miss
+  path: the lookup table, a descriptor per target published with a release store; no entry: `jit_entry` with the target in `st->pc`, so the JIT
+  runs it; with `--jit-none`, `[RED] aot: the indirect branch at module+0x... to 0x... (module+0x...) has no compiled entry, and the JIT fallback
+  is off (--jit-none)` and status 3), `nxaot_rt_trap` (brk, undefined words and an untranslatable encoding status 1, a no-return call that
+  returned status 6), `nxaot_rt_jit` (the JIT fallback, "The JIT fallback"), `nxaot_rt_safepoint` (a poll, "Threads and safepoints"),
+  `nxaot_rt_gate` (a gate of design 1.1, which only behaviour images with obs or spin rows have: here a pause point like a safepoint, no
+  observer; dm/host's runs them), `dm_aot_cntpct` (CLOCK_MONOTONIC as 19.2 MHz ticks, `guest_ns * 12 / 625` as `svcGetSystemTick`), and the floating-point helpers of
+  [src/lift/runtime.cpp](src/lift/runtime.cpp).
+- **Faults** (5.4 is the host's job): SIGSEGV, SIGBUS, SIGILL, SIGFPE and SIGTRAP in guest code, on an alternate stack, are reported with the
+  faulting address and the guest instruction the line table gives (`[RED] aot: SIGSEGV at address ... in guest code (host pc ..., in the function at
+  module+0x..., guest instruction module+0x...)`), status 4. Dirty tracking (write-protected pages resumed after the fault) is dm/host's.
+- **Exit statuses** (`rt::Status`): 0 svcExitProcess, 1 trap, 2 usage or a library that does not match, 3 the JIT fallback is needed and refused
+  (`--jit-none`, nxaot_funcdiff), 4 fault, 5 an SVC the corpus run time does not answer, 6 a return where none may be (the guest returned to the
+  host from _start or a thread's entry, a no-return callee came back), 7 timeout, 8 stopped at an svc (nxaot_funcdiff), 9 the pause test found a
+  state block inconsistent or made fewer pauses than asked.
+
+**The per-function differential test** (`nxaot_funcdiff`, CTest `corpus_funcdiff`, design 12 item 2 in its simple form): a pack built with
+`--all-entries`; after the host relocated the image, every function runs three times from one snapshot under the recompiled code and under dynarmic
+(whose memory callbacks allow exactly what the native mapping allows), with registers drawn from a seed (pointers into data, the scratch area and
+the stack, small integers, and non-canonical values that fault at once in both). Runs that end the same way are compared: in the correctness mode
+every register (x0..x30, SP, NZCV, v0..v31) and every written page, in the summary mode what the convention gives a caller (x0, x1, v0..v3 at a
+return, x0..x7 at an svc) and every written page. Runs that would leave for the JIT (a `blr` to a random value; it runs with `--jit-none`), fault
+in both, or time out are counted apart.
+
+What dm/host provides for the integration (dm/host/aot_*.c) is listed, item by item, at the end of "Threads and safepoints".
+
+## The JIT fallback
+
+Design section 11, on the vendored dynarmic with nothing changed in it ([src/rt/jit.h](src/rt/jit.h), [jit.cpp](src/rt/jit.cpp); the driver in
+[src/rt/host.cpp](src/rt/host.cpp), `Host::JitLoop`):
+
+```c
+dm_jit  *dm_jit_create(dm_guest_state *st);   // one instance per guest thread, bound at its first use to that thread's state block (made ahead: dm_jit_prepare)
+uint64_t dm_jit_run(dm_jit *j, uint64_t pc);  // st -> the JIT, run from pc until a stop, the JIT -> st; returns where the guest continues
+void     dm_jit_halt(dm_jit *j);              // from any thread: dm_jit_run returns at the next block boundary (pauses and stops)
+```
+
+(`dm_jit_reason` says which stop: a compiled entry, a compiled call site's return, a halt, no code, an SVC that ends the thread, a trap, a gate
+site; `dm_jit_init` gives once per process what the host knows: the code ranges, the module's FPCR, the stop addresses and gate sites, the SVC
+path, the counter. `dm_jit_run_past` goes on after a gate the host served, `dm_jit_set_code` gives the code ranges again when modules are loaded.)
+
+- **Configuration** (design 11): fastmem with pointer 0 and 39 address bits (the one-to-one arena; an access at or above 2^39 or a fault takes
+  the memory callbacks), `fastmem_exclusive_access` with one `ExclusiveMonitor` for every instance (64 processors), `tpidr_el0` and `tpidrro_el0`
+  pointing into the state block, `cntfrq_el0` = 19.2 MHz, `ctr_el0` = 0x40000, `dczid_el0` = 4 (with `hook_data_cache_operations`, so that `dc
+  zva` zeroes the aligned block: "Known issues", 2), `wall_clock_cntpct` with `GetCNTPCT` on the host clock, no cycle counting, `CallSVC` into the
+  host's SVC path on the whole register file, a 16 MB code cache, and `A64GetSetElimination` off ("Known issues", 1).
+- **Stopping at a compiled entry, unmodified.** The JIT must not run what has a compiled entry, and must stop where a native frame may wait for a
+  callee (the return address after every `bl` / `blr` of compiled code: the descriptor's `returns` table). dynarmic asks `MemoryReadCode` for
+  every instruction it translates, so the reader hands over no instruction at those addresses: the block that reaches one ends in dynarmic's own
+  NoExecuteFault exception, whose callback (`ExceptionRaised`) records the address and halts `Run()`. Translation caches the answer, so it costs
+  nothing in the blocks that run; it applies only while the JIT's FPCR has the mode bits compiled code was specialised for (the reader asks the
+  instance's FPCR, which dynarmic's block key also holds). To run such an address itself, `dm_jit_run` single-steps its instruction first
+  (dynarmic caches single-step blocks apart), then runs on. The alternatives the design names were measured against it: `HaltExecution` from a hook
+  is what the stop uses; running one block per `Run()` with cycle counting and checking the next pc in the host costs 35.6 ns more per block
+  (40.2 ns against the JIT's own 4.7 ns, "Measurements") and sees block boundaries only (a block that runs into the next function's entry without a
+  branch passes it). So no patch: [VENDOR.md](../../third_party/dynarmic/VENDOR.md) still describes an unchanged copy.
+- **Gates** (design 1.1 and 11). The JIT runs the guest's original code, so it stops where compiled code calls `nxaot_rt_gate`: the host's
+  `stop_at` marks every manifest's gate rows (`DM_JIT_GATE_AT`; `load_modules` hands them to `aot_run.c`), and the code reader hands over no instruction there either,
+  under any FPCR, unless compiled code takes the address itself (an entry or a return under its FPCR, whose code calls the gate). The run returns
+  `DM_JIT_GATE` with the gate's instruction not run and the whole register file in the block; the host serves the gate on the block (the
+  observer, which may change x0..x29, or the back-off as an SVC frame) and calls `dm_jit_run_past`, which runs that one instruction as a single-step
+  block without stopping there again, then goes on. A spin wait's back-edge is a branch: `dm_jit_run_past(..., 1)` returns after it, and the host
+  runs the back-off only when it went back to the head, as compiled code calls it on the taken edge only. `dm_jit_run` at a gate site returns at
+  once, before anything is copied, so a host call or a continuation that starts at an observed instruction serves its gate first. Both the block
+  that stops before the site and the step are translated once and cached (the step apart, as dynarmic keys single-step blocks), so the lookup costs
+  only at translation and code with no gate runs as before. The host's side is `dm/host/aot_run.c` (`jit_stop_at`, `run_jit`). A manifest row no
+  pack serves (no compiled code holds it: a `[RED] ` line at load) is a stop too, so its gate is served when the JIT reaches that code (t_aot_module's
+  hidden function). An encoding the lifter does not translate at an observed instruction hands that instruction over after its block called the gate
+  (`lifter.cpp`, the block's start; `lower_calls.cpp` `FnExit`): `nxaot_rt_jit` then runs it with `dm_jit_run_past`, so the gate is served once.
+  nxaot's own runner has no gates.
+- **Code ranges.** The JIT translates only inside the ranges the host gives (`dm_jit_range`): `nxaot_host` the module's text and its aux region
+  when the image has one; the host every loaded module's text and aux region (the frame-step stubs, design 1.1: the manifest's aux row, which
+  `module_t` keeps), and again with each NRO loaded
+  later (every instance drops its translations before its next run, as a block may end where there was no code before).
+- **The hand-over** (2.5, 11): `dm_jit_run` copies x0..x30, SP, PC, v0..v31, NZCV, FPCR and FPSR (with the cumulative flags compiled code left in
+  MXCSR, which it clears) into the instance, and back into the block when it stops: 102 to 109 ns both ways. The exclusive monitor is cleared both ways,
+  as an exception return clears it, except in a run that begins exactly where the instance's last run stopped at a gate site or after a step (`resume_pc`):
+  that run continues the same instruction stream, with no exception between, and keeps the monitor. Before, a spin wait whose back-edge lies between a
+  load-exclusive and its store-exclusive (a lock's `ldxr`, `cbnz` back, `stxr`, as the rewriter finds them) made the store fail at every pass, and the
+  loop never ended (Mario vs. Donkey Kong's start-up under `DM_AOT_JIT_ALL`: [docs/reference/threads.md](../../../docs/reference/threads.md#a-spin-wait-between-a-load-exclusive-and-its-store-exclusive-never-ends-in-the-jit-fallback);
+  dm/host `t_aot_host`'s `exclspin` rows). At an SVC the JIT copies its state to the block, calls the host's SVC path, and takes the general registers back.
+- **When it runs** (design 11, cases 1 to 4), and how compiled code hands over:
+  1. an indirect branch to an address with no compiled entry: the dispatcher's miss path writes the target to `st->pc` and returns `jit_entry`
+     (a function of the pack with the standard entries' signature) instead of a standard entry; `jit_entry` stores what it is passed and calls
+     `nxaot_rt_jit(st, lr, sp)`; the inline cache keeps its descriptor, so the next call misses again. A direct `bl` to such an address
+     (never made by discovery: every target is an entry) calls `jit_entry` the same way, a `b` hands the rest over as case 3 does, with the
+     function's own return as the stop. A `br` or `b` that leaves the function with x30 other than its entry lr is no tail call and goes to the
+     JIT the same way ("Tail calls and the native frame's return");
+  2. a non-local transfer to a continuation with no native frame (a fiber switch, a return past the caller, a longjmp nobody recorded): the frames
+     propagate it (`st->pending`, 3.3) to the thread's outermost level, which runs it in the JIT when it has no compiled entry;
+  3. `msr fpcr` leaving the specialisation, an encoding the lifter leaves untranslated, code that runs into no entry: the function stores every
+     dirty register and pc, calls `nxaot_rt_jit(st, its entry's lr, its entry's SP)` and returns natively what the JIT left in the block;
+  4. a function the lifter refused: its body stores what it is passed and does the same from its entry.
+- **The driver** (`JitLoop`): runs the JIT until the guest returns to the lr it was given (lr alone decides, as a compiled function's own
+  return does: design 3.3), taking every compiled entry natively on the way (`enter` with the block's registers; its normal return continues in the
+  JIT at the lr it was entered with, x30 is that lr, and SP is the call's unless the function may change it: the lookup slot's
+  `NXAOT_LOOKUP_SP_KEPT`). A return address of compiled code reached with an SP above the one the JIT was entered with may be a native frame's
+  further out: nested, it is propagated to them (`st->pending`); at the outermost level nothing can own it and the JIT runs it. Back where the native
+  frame waits but under another FPCR than it was compiled for, the JIT runs on past it (the caller cannot go on under it) and never returns to that
+  frame afterwards; the frame a later compiled return above belongs to takes it as its own return ("A return no native frame took"). A halt is a
+  safepoint ("Threads and safepoints"); an SVC that ends the thread or the run leaves through the thread's base, outside dynarmic's `Run()`.
+- **Logging and counting**: a JIT entry that is a discovery gap or a continuation without a native frame is logged once per address on standard
+  error as `[RED] aot: <why> at 0x... (module+0x...) runs in the JIT fallback (design section 11)`; every run is counted (`nxaot_host`'s second
+  summary line: runs, distinct addresses, `Run()` calls, stepped stops, native calls, seconds), a run that goes on with code the JIT was running (a
+  compiled entry it called returned into it, it stopped at an entry or at the return of a call it made itself) only there.
+  `NXAOT_JIT_TRACE=1` prints every JIT run and native call.
+- **Modes** (`nxaot_host`; in the host `DM_AOT_JIT_ALL=1` is `--jit-all`): mixed (the default), `--jit-all` (everything in the JIT: no stop at compiled entries, the dispatcher and the entries
+  never used), `--jit-none` (every case above stops the run with a [RED] line and status 3: phase 1's behaviour; nxaot_funcdiff runs so),
+  `--jit-one-block` (the measurement of the alternative above).
+- **Faults**: the host's handler is installed before dynarmic's (which comes with the first instance and hands every fault outside its code cache
+  to the previous handler): a fastmem fault in JIT code takes dynarmic's fallback to the memory callbacks. With `check_halt_on_memory_access` a
+  callback does not touch memory but halts with `MemoryAbort`, so dynarmic leaves at the exact instruction (it checks that halt only after a
+  callback: fastmem accesses cost nothing more); `dm_jit_run` steps that instruction again with its callback accesses made, and a fault there is
+  reported as a guest fault at that instruction (`nxaot_host`: "in a memory access of the JIT fallback near guest 0x...", now exact; the host:
+  "a memory access of the JIT fallback, in the function at main+0x..., guest instruction main+0x...", the function being the pack's whose guest
+  range holds the instruction, when one does; `dc zva`, whose hook has no such check, keeps "near"). The host's `[dm] bt:` after it walks the guest's
+  frames from the JIT's own registers at the access (`dm_jit_fault_state`): during a run dynarmic keeps them in its state, not in the block, and
+  that state is current at every callback (each A64 register write is a store to it; dynarmic leaves out `A64GetSetElimination` when
+  `check_halt_on_memory_access` is on), so the copy is made only when a fault is reported and costs a run that does not fault nothing. Before,
+  the walk started from the x29 the block held when the run began (`(JIT from main+0x...)`, none of the frames made since). A fault in compiled
+  code the JIT called names the JIT's frames too: the driver keeps the JIT's x29 and x30 for each such call while it runs (dm/host `aot.h`
+  `dm_aot_jitcall`). Checked by `t_aot_host`'s `guestbt` rows (dm/host/tests), with frames in each engine.
+- **The first use** ([docs/reference/threads.md](../../../docs/reference/threads.md#a-thread-stops-for-100-to-250-ms-the-first-time-it-reaches-code-no-pack-holds)).
+  A thread's first JIT run cost two one-time steps on that thread: its instance (33 to 37 ms, 5,192 page faults: dynarmic's emitter writes a 16 MiB
+  fast-dispatch table whose entries have member initializers, `a64_emit_x64.h` `FastDispatchEntry`, and emits its prelude) and, the process's first,
+  dynarmic's decoder table in the first translation (`frontend/A64/decoder/a64.h` `GetDecodeTable`: 181 to 197 ms in dm/host, 63 to 70 ms optimised).
+  dm/host's figure is three times `nxaot_host`'s because `nxhost_jit` is compiled without optimisation (dm/host/CMakeLists.txt gives the tree no build
+  type; dynarmic's directory gets `-O3`) and `decode/translate.cpp` instantiates `Decode<TranslatorVisitor>`, whose unoptimised copy the linker keeps
+  (`nm` shows its out-of-line iterator predicates). Now `dm_jit_prepare` makes both ahead on a helper thread: the decoder table, then one instance bound
+  to no thread (it keeps its own `tpidr_el0` / `tpidrro_el0`, which the hand-over moves), which `dm_jit_create` binds; a take starts the next one,
+  and `dm_jit_destroy` keeps an instance as the next thread's (with its translations) when there is no spare. A first use that comes before the
+  helper is done waits for it; a second meanwhile makes its own. dm/host starts it at the first pack's load (`aot_run.c` `dm_aot_jit_prepare`, from
+  `aot_arena.c` `dm_aot_pack_load`; the made hook calls `dm_aot_fault_after_jit` on the thread that made each instance); `dm_aot_stats` counts the
+  instances made ahead, taken, made on first use and the waits, and the longest time a first use took to get its instance; `nxaot_host` does not call
+  it (its first use now builds the decoder table in `dm_jit_create`, outside its JIT seconds). Measured in the images (one-minute load 3 to 4,
+  another agent's build), `t_aot_host --run`, three runs each:
+
+  | Case (dm/host as built by CMake, no optimisation of `nxhost_jit`) | before | after |
+  |---|---:|---:|
+  | fp-gcc, first use (instance, then first run with the decoder table), pinned to one CPU | 19 + 181, 35 + 196, 37 + 197 ms | 0.034, 0.046, 0.072 ms once the instance is ready (`--jit-ready`) |
+  | fp-gcc's whole run (8 JIT runs) | 0.201, 0.233, 0.237 s | 0.0013, 0.0013, 0.0015 s (ready); 0.197, 0.227, 0.225 s when it misses 1 ms after the load and waits |
+  | the same with `-DCMAKE_CXX_FLAGS=-O2` (measurement only) | 35 + 64, 35 + 69, 36 + 63 ms | 0.13 to 0.29 ms ready (first run included); 96 to 101 ms waited |
+  | excl-gcc under `DM_AOT_JIT_ALL`, 4 threads that start at once, 2 CPUs: each thread's instance | 36 to 123 ms each (and the first thread's decoder table) | the first ready; longest 86, 97, 106 ms (one waits for the next spare, two make their own) |
+  | int_ops-gcc (no miss), 2000 rounds, 2 CPUs: run / resident at 0.5 s / virtual | 0.70 s / 5.6 MiB / base | 0.70 s / 28.8 MiB / +106 MiB (the instance's code cache and table, the helper's malloc arena) |
+  | the same pinned to one CPU (the helper's CPU time taken from the guest) | 0.704, 0.705, 0.709 s | 0.936, 0.945, 0.950 s |
+  | the pack's load (the helper started) | | 0.055 to 0.081 ms |
+
+  A game reaches its first miss well after its packs load (its SDK start, its loading screens), so its first use finds the instance ready; a
+  program that misses at once waits for the rest of the helper's work, as long as it took before. Threads that miss in a burst pay about what they
+  paid before (the pool holds one spare: about 20 MiB resident each; more would cost that per spare for programs that never use them). Not measured:
+  a game (none runs on the x86-64 engine yet), Windows (the helper is a `std::thread`; `dm_aot_fault_after_jit` is a no-op there).
+
+The corpus in the three modes (CTest `corpus_jit`, [tests/test_corpus_jit.py](tests/test_corpus_jit.py)): every NRO prints its expected lines
+mixed, with `--jit-all` and, where the mixed run needed no JIT, with `--jit-none`; fnptr's `hidden_ptr` pointed at the second instruction of
+`hidden_target` (a `blr` to an address with no entry) enters the JIT once, comes back to compiled code and prints what `--jit-all` prints. JIT
+entries in the mixed runs, all expected: `fiber` (its continuations after every switch, 29 and 54 addresses), `fp` (the FPCR checks: the rest
+of `div_rz` after its `msr fpcr`, case 3, back to compiled code at its return; and the rest of `fpcr_set`, which returns to its caller under RM:
+the JIT stops nowhere under another FPCR, so it runs `main` on under RM, then, FPCR restored, until `main` returns, taking compiled entries
+natively again; 8 and 9 addresses). `except-gcc` entered it at 5 targets of the opcode switch of rt/unwind.c's `run_program` (GCC's
+halfword table, whose base register is set in the function's prologue outside the loop that dispatches on it, whose cases call memcpy) until
+discovery bounded that switch ("Jump tables whose index depends on several values"): it needs no JIT now.
+
+Found by these tests and fixed: after the JIT called a compiled entry natively, the block's SP and x30 were the copies some inner frame stored
+(they travel in host registers at every call, design 2.3), so the JIT continued with SP 32 bytes low and the next native call overwrote its
+caller's frame record (fiber's last check looped through `rt_finish`); the driver now takes x30 as the return address and SP as the call's when the
+function keeps SP, and `kHostReads` (what the host and the JIT read after a call) includes SP, so that a function that may change it stores it. The
+return check compared SP too, which a `br` through `jit_entry` from the middle of a function (an unbounded br, SP of the body) never matched at its
+return (SP of the entry); lr alone decides now.
+
+## JIT misses
+
+Design 1.3 names "the census and the JIT feedback" as a source of discovery and section 11 says each miss "is recorded per build for the next
+pack". The x86-64 host counts every entry into its JIT fallback per guest address and reason (`dm/host/aot_run.c` `note_jit`; `dm/host/aot.h`,
+"The JIT fallback's misses") and, with `DM_AOT_PROFILE=<folder>`, writes them at exit beside the sample profile as `<folder>/<module>.misses.tsv`
+(`dm/host/aot_profile.c` `write_misses`), in the profile's form:
+
+```
+# nxaot misses: guest addresses the x86-64 engine's JIT fallback ran because the pack had no compiled code there (dm/host/aot_run.c, DM_AOT_PROFILE); nxaot build --misses <this file>
+# module main, build ID aa07aa07aa07aa07aa07aa07aa07aa07, image SHA-256 9528170af64ad4b9bbc935825b1fcff8b02e227cf3b9d9bca6a87ce222ba2d7b
+# pack t_aot_module.tmp/... /main.aot.so
+# 1 addresses, 1 entries into the JIT fallback; 1 of the addresses this session, the rest from earlier sessions of this image
+# <module offset> <reason> <entries>: indirect, call, host, nocode (an entry of the next pack), nonlocal (a resume point), fpcr, refused, untranslated, noreturn, other (no pack serves them)
+0x208 indirect 1
+```
+
+One row per address and reason, by offset. A file an earlier session of the same image wrote is merged in (its entries added up), so what one
+pack's misses taught stays for the next pack (which no longer misses there); a file of another image is replaced. The reasons are the
+hand-overs of section 11: `indirect` (the dispatcher's miss: `blr` / `br` to an address with no compiled entry), `call` (a `b` or `bl` to
+an address that is no compiled function's entry), `host` (`dm_guest_call` to an address with no compiled entry), `nocode` (compiled code ran
+on into no entry), `nonlocal` (a non-local transfer no native frame took, 3.3), and `fpcr`, `refused`, `untranslated`. A run of the JIT that
+goes on with code it was already running (after a compiled entry it called returned into it, a host call, a pause, a stop at the return of a
+call the JIT made itself) is no miss: the host labelled those "a non-local transfer" before, and logged a `[RED]` line for each such return
+address; it now records and logs only the cause (the last of them since the fix of "Tail calls and the native frame's return": a misses file
+an older host wrote holds such `nonlocal` rows, which a session merges and keeps; remove it before the next pack). Nothing is recorded under
+`DM_AOT_JIT_ALL`.
+
+`nxaot build --misses <file>` (and `nxaot discover --misses <file>`) takes them as roots of discovery:
+
+- The file must name this module's image (its header's SHA-256): another image's, or one that names none, is a `[RED]` line and the file is
+  ignored. A line that does not parse stops the build, naming it.
+- **Cases**: an `indirect` or `nocode` miss in the range of a function that has a `br` left to the dispatcher is a root of that function and a
+  case of those `br`s, not an entry ("A miss as a case of its function's br", below); `indirect-case` (the host's: the dispatcher was asked for an
+  address its pack held as a case) is an entry, with a `[RED] discover:` line.
+- **Entries**: `indirect`, `call`, `host` and `nocode` make the address a function entry (provenance `miss`); `indirect` and `host` (and a
+  `nonlocal` at a function's entry or in no function) also give it a standard entry and a lookup slot, as an address-taken function has, since
+  the dispatcher or the host enters it by its address. A known function the dispatcher missed for want of a standard entry gets one.
+- **Resume points**: `nonlocal` inside a function's range becomes a root of that function (its walk reaches it as a block) and a resume point
+  of each of its call sites, as a setjmp's continuation is (`FnFacts::continuations`: the pending check after each call resumes there with every
+  register from the block when the SP is the frame's).
+- **Unserved**: `fpcr`, `refused`, `untranslated` and words this nxaot does not know stay misses, each reported as a `[RED] discover:` line.
+- **Code in data blocks**: an address of an entry or resume point that lies in a data block (a stretch the manifest or the loader took for data,
+  as `nso_code.data_blocks` takes one where more than a quarter of the words decode as nothing) is code the game ran: the words its control
+  flow reaches there (falling through, both ways of a conditional branch, `b` and `bl` targets) up to a `ret`, `br`, trap or undefined word
+  leave the data blocks before discovery (`analysis::CarveMisses`), so that discovery, the lifter and the cache keys all see them as code.
+- The log: `aot: misses: N addresses, M new entries, C cases, K resume points, J still unserved (<reason> <count>, ... | none)`; a new entry is an
+  address discovery's own sources do not make an entry, or a known function that gets a standard entry; addresses the pack serves without the
+  file (an earlier pack's misses) are counted in N only. `nxaot discover --tsv` writes a `miss` row per address (`entry`, `std`, `resume`,
+  `known`, `unserved` and why).
+- **Caches**: the analysis cache's key takes the misses' addresses and reasons (not their counts, which every session changes), so a new
+  misses file misses the analysis cache, as a changed manifest does, and only the units whose functions change are compiled again (their code,
+  bounds and facts are in their keys); a later session's file with the same addresses hits both. Without `--misses` every key is what it was,
+  and the packs are the same bytes (fnptr-gcc, switch-clang and the synthetic module, checked against the base commit's nxaot).
+- `--no-root <hex>` (tests): none of discovery's own sources may make that address an entry; a miss still does.
+
+The NSP script passes `<NSP folder>/<id>-work/profile/<module>.misses.tsv` beside `--profile` when it parses and names the module's image
+(`--no-profile` leaves the misses in use: they are a discovery input, not a tier choice); their addresses and reasons are in the pack's key.
+The launcher (dm/launcher) records them on every Play and offers "Repack with profile" (docs/settings.md, "On Windows and Linux").
+
+CTest `misses` ([tests/test_misses.py](tests/test_misses.py)): the synthetic game module's hidden function (two words in its data block, no
+symbol, no FDE, reached at run time through a pointer, with an observation gate in the manifest) packed with a misses file in the host's exact
+form naming it `indirect`: `aot: misses: 1 addresses, 1 new entries, 0 cases, 0 resume points, 0 still unserved (none)`, its two words taken out of
+the data block, its gate served (gate sites 2 -> 3, the build's "is in no discovered function's code" line gone), the analysis cache missed
+and 1 of 3 units compiled again, the same addresses with other counts hitting both caches and giving the same pack; another image's file
+ignored with a `[RED]` line; a malformed line stopping the build; a `nonlocal` at the return address of the call of the hidden function and an
+`untranslated` beside it (1 new entry, 1 resume point, the pack's resume points 0 -> 1, 1 unserved with its `[RED]` line). Then fnptr-gcc with
+`rt_check` held from discovery's roots (`--no-root`): its pack runs `rt_check` in the JIT fallback (48 runs from 3 addresses in `nxaot_host`'s
+mixed run, the expected output), and with a misses file naming it (`call`) it is discovered again (provenance `call,miss`), compiled, and the
+run needs no JIT at all. The host side: `t_aot_module`'s step 7 runs the module with `DM_AOT_PROFILE` and reads back `main.misses.tsv` (the
+hidden function's row, `indirect`, 1 entry; 2 after a second run; another image's file replaced).
+
+Not verified: a game (no game files here), the Windows host's writer (written, not run), and a JIT miss of the kinds the test modules do not
+have (`nocode`, `fpcr`, `refused`, `untranslated` from a real run, a `nonlocal` from a real longjmp the analysis missed).
+
+## Tail calls and the native frame's return
+
+The 4,000-function benchmark (`gen_bench.py --functions 4000`, seed 1, tier W) ran almost all of its time in the JIT fallback: through dm/host's
+runners 1.87 s, 1,819 of its 1,908 samples in the JIT fallback and none in compiled code (one run; pinned ones below), its misses file 5,124 `nonlocal` rows and 131
+`indirect` ones, although the program is plain C with no longjmp and no exception; repacked with `--misses` from that file, it ran as much in
+the JIT. The cause, in its `f9` (module offsets):
+
+```
+79e80  stp x29, x30, [sp, #-0x40]!        the entry: lr 0x1834, drive0's return after its bl f9 at 0x1830
+7a044  bl f3982                           x30 = 0x7a048
+7a0ac  ubfx x10, x8, #37, #5; cmp x10, #0x13; b.hi ...; adrp x11; add x11; adr x12, 7a0d0; ldrb w13, [x11, x10]; add x12, x12, x13, lsl #2
+7a0cc  br x12                             a switch whose index discovery cannot bound (it depends on more than one value): left to the dispatcher
+7a17c  (a case)                           no compiled entry: the dispatcher hands it to the JIT fallback
+7b800  ldp x29, x30, [sp], #0x40; ret     back to 0x1834
+```
+
+The `br` ends the function's compiled code, so the lifter lowered it as a tail call through the inline cache (`FnTailIndirect`), and a tail call
+passed the guest's x30 (0x7a048) as the callee's lr, the return its native frame waits for. The dispatcher returned `jit_entry`, which ran the
+JIT with 0x7a048 as its stop; the JIT ran the case and the rest of `f9`, whose return to 0x1834 was not that stop but a compiled call site's
+return above the JIT's SP: a non-local transfer (`st->pending`, design 3.3). `drive0`'s frame waits at 0x1834 for a normal return, and a frame
+resumes from `st->pending` only at its own resume points, so the transfer went up to the thread's outermost level (`run_guest`), which had no
+compiled entry at 0x1834 and ran the rest of the thread in the JIT: every driver, every statement function, calling natively only the 508
+functions with a standard entry. Each return of a call the JIT made stopped at a compiled call site's return address, which `run_jit` labelled
+a non-local transfer: the 5,124 `nonlocal` misses, each a resume point of the next pack that nothing enters. With the misses the case labels
+became entries of their own, the same tail calls (and the falls into them) still passed x30, and the result was the same.
+
+The fix:
+
+- **A tail call is native only when x30 is the function's entry lr** (`lower_calls.cpp` `FnTailLr`, before every direct and indirect tail
+  call): the callee's return to its lr is the native return the function's caller receives, and that caller waits for the function's entry lr.
+  The two are equal in every real tail call (the epilogue restored x30, or nothing wrote it: LLVM folds the compare). With another x30 the
+  transfer is no tail call (a `br` like the one above; a branch into a function discovery split off), and the JIT runs it from the target with
+  x30 in the block and the function's own return as its stop (`JitContinue`, as for code after `msr fpcr`), calling a compiled entry at the
+  target natively; its miss there is `indirect` (a standard entry for the next pack). A branch into the middle of a function goes the same way
+  (`FnJitTail`, which tail-called `jit_entry` with x30 too, and returned `jit_entry`'s v0..v3 where the function's callers take its RV).
+- **A stop at the return of a call the JIT made is no miss** (`dm/host/aot_run.c` `run_jit`, `jit_loop`; `src/rt/host.cpp` `Host::JitLoop`):
+  `jit_loop` runs on there only when no native frame can wait for it, so the JIT goes on with the code it was running; a host call or a
+  compiled entry's normal return likewise. The `nonlocal` rows and their `[RED]` lines are now only non-local transfers no native frame took.
+
+**Measured** in the images, build trees on tmpfs, the machine's one-minute load 3 to 6 (other agents' builds). The benchmark through dm/host's
+runners, each run pinned to CPU 3 (`taskset -c 3`), three runs of each: `t_aot_host --run` for the guest time and the JIT's counts,
+`t_aot_targets --run ... --write` under `DM_AOT_PROFILE` for the samples and the misses file; "before" is 2088f48's nxaot and host, each
+`--misses` pack built from the misses file of the pack above it (the second from both sessions' merged file):
+
+| Pack | time (s) | samples: compiled / JIT / elsewhere in the host | JIT runs, addresses | misses file |
+|---|---:|---:|---:|---|
+| before | 2.02, 2.07, 2.03 | 0 / 1,903 / 151; 0 / 1,921 / 136; 1 / 1,886 / 119 | (not printed), 6,690 | 5,124 `nonlocal`, 131 `indirect` |
+| before, `--misses` (5,124 resume points) | 1.93, 1.91, 1.77 | 2 / 1,740 / 138; 1 / 1,749 / 141; 4 / 1,738 / 125 | (not printed), 6,170 | 4,788 `nonlocal`, 36 `indirect` |
+| after | 0.455, 0.427, 0.414 | 5 / 377 / 63; 6 / 387 / 60; 2 / 384 / 61 | 800, 703 | 339 `indirect` |
+| after, `--misses` once | 0.282, 0.282, 0.320 | 5 / 239 / 57; 2 / 250 / 54; 3 / 245 / 57 | 206, 158 | 63 `indirect` |
+| after, `--misses` twice | 0.244, 0.254, 0.250 | 2 / 206 / 56; 4 / 206 / 61; 4 / 201 / 58 | 31, 28 | 12 `indirect` |
+
+About 200 of the JIT's samples are a fixed cost of its first use in the host, whatever runs: fp-gcc's 8 JIT runs give 204 of its 240 samples
+and 0.227 s, fiber-gcc's 442 runs 200 of 234 (nxaot_host's first use costs about 60 ms; both are now paid ahead on a helper thread: "The JIT
+fallback", the first use). So the guest code the JIT ran went from about 1,700
+samples to about 180, 45 and 5; the rest of the benchmark is compiled code, too short to draw more than a few samples (`int_ops`-style
+rounds would be needed). The repack before the fix: `.text` 5.9 to 12.4 MB, the pack 16 to 131 s and 120 to 1,082 MiB at its peak, for 5,124
+resume points nothing enters. nxaot_host, one run each: 1.59 s (7,818 JIT runs from 6,690 addresses, 1.52 s of them) before, 0.28 s (800 runs
+from 703 addresses, 0.24 s) after, 0.137 s and 0.104 s after one and two repacks (31 runs from 28 addresses, 0.067 s, mostly the first use's
+cost). [tests/measure_packs.py](tests/measure_packs.py), A 2088f48's nxaot, B this one, no misses file:
+
+| Program | A | B | change | layout spread A / B | rounds spread | .text A -> B | pack time A -> B | verdict |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| benchmark, 4,000 functions (fastest of 3; 3 rounds, 2 layouts) | 1.529 s | 189.8 ms | -87.59 % | 0.06 / 3.91 % | 4.36 % | 5,946,016 -> 6,019,056 | 14.79 -> 14.97 s | faster |
+| int_ops-gcc, `int_ops_rounds = 200` (10; 6 rounds, 4 layouts) | 69.489 ms | 63.506 ms | -8.61 % | 2.37 / 12.68 % | 28.78 % | 64,508 -> 64,860 | 0.33 -> 0.34 s | within noise |
+| except-gcc (10) | 25.723 ms | 22.494 ms | -12.55 % | 14.89 / 46.19 % | 58.80 % | 82,396 -> 82,492 | 0.29 -> 0.26 s | within noise |
+| switch-gcc (200) | 152.8 µs | 151.3 µs | -0.98 % | 0.33 / 25.12 % | 51.23 % | 365,260 -> 365,692 | 0.74 -> 0.69 s | within noise |
+| fnptr-gcc (200) | 6.0 µs | 6.0 µs | 0 % | 0 / 0 % | 8.33 % | 58,092 -> 58,188 | 0.23 -> 0.23 s | within noise |
+
+The same guest output in every pair (measure_packs.py checks it). The corpus programs make no such `br`: their JIT runs are the same before and
+after (nxaot_host: except-gcc 1,618 runs from 5 addresses, fiber-gcc 442 from 29, fp-gcc 8 from 8); what changes is their misses files, which
+lose the returns of calls the JIT made (dm/host, `t_aot_targets --run ... --write`): except-gcc `0x1d34 nonlocal 692` gone, its two `indirect`
+rows (232 entries each) kept; fiber-gcc 17 `nonlocal` rows to 9 (its stack switches' continuations), fp-gcc 3 to 1 (and its 2 `fpcr`).
+
+**The packs change**: the compare and its cold path at every tail call where x30 may differ from the entry lr, and `FnJitTail`'s new form. Every
+pack of `build_packs.sh` differs from 2088f48's; their `.text` is 1,538,240 bytes against 1,542,140 (+0.25 %, from -1.02 % for sjlj-gcc to
++1.38 % for switch-clang), the benchmark's +1.23 %. CTest: 29 of 29; dm/host's 100 of 100 with `NXAOT`, with and without
+`DM_AOT_ARENA_CHECK=1`. Its check is `t_aot_host`'s `lrtail` row (`dm/host/tests/t_aot_host.c`): a module the test writes word by word, packed by
+`NXAOT`, whose function calls and then jumps through such a `br` into code with no compiled entry, 63 times: 126 JIT runs from 5 addresses,
+4 misses, none `nonlocal`, and 2088f48's nxaot's pack of it fails the row (189 runs, 4 addresses, 2 misses, 1 `nonlocal`).
+
+Open: the JIT calls natively only functions with a standard entry (the lookup table), so a missed stretch also runs in the JIT whatever other
+functions it calls: with every function given one (`--all-entries`), nxaot_host's first session of the benchmark ran 0.169 s in the JIT
+against 0.223 s (pinned, one run each), and after two repacks 0.065 against 0.067 s. A JIT-only entry for every function (its own table, so
+that inline caches do not bind to it) would make a miss cost only its own stretch; it is not done. Not verified: a game (none runs on the
+x86-64 engine yet) and Windows (the lifter's change is the same code for a Windows pack; not run there).
+
+The switch at `7a0cc` above and every other `br` of the benchmark are jump tables since "Jump tables whose index depends on several values"
+(below): its first pack runs no JIT at all, and its misses file has no row.
+
+## A callee's SP left in the block
+
+The first game started on the x86-64 engine, Mario vs. Donkey Kong ([its note](../../games/0100B99019412000/README.md#on-linux-the-x86-64-engine)),
+stopped in `nnosInitialize`, its SDK's first function, with `[RED] aot: a non-local transfer to a continuation with no native frame at
+sdk+0x13154c runs in the JIT fallback (design section 11)` and then a fault at address 0 in the code the JIT ran. `DM_AOT_JIT_ALL=1` ran the same
+code past it to `nnMain` and the NVN device, so the engine's model of the code was wrong, not the code. In `sdk` (module offsets; names from its
+symbols):
+
+```
+131420  OsResourceManager::OsResourceManager      bl 5c4e30 (PLT) -> 131530 at 131440
+131530  AslrSpaceManagerTemplate<...>::ctor       sub sp, sp, #0x40; stp x29, x30, [sp, #0x10]; ...; bl 5c4e80 (PLT) at 131548; ...;
+                                                  str w0, [sp, #8]; ...; ldp x29, x30, [sp, #0x10]; add sp, sp, #0x40; ret
+5c4e80  PLT stub                                  adrp x16; ldr x17, [x16, #0x9c0]; add x16, x16, #0x9c0; br x17   (GOT slot -> 1315f4)
+1315f4  AslrSpaceManagerImplByHorizon::ctor       sub sp, sp, #0x30; stp x29, x30, [sp, #0x10]; 4 x bl 1584ac; ldp x29, x30; add sp; ret
+1584ac  svcGetInfo's wrapper                      str x0, [sp, #-0x10]!; svc #0x29; ldr x2, [sp]; str x1, [x2]; add sp, sp, #0x10; ret
+```
+
+- The stub's `br x17` is a `br` discovery leaves to the dispatcher, so its summary is the union over the standard entries, and that union holds
+  SP (some address-taken function may return with another SP; in this `sdk` nearly every function that calls through a PLT stub is `open`, its
+  WRITES everything): `131530` reloads SP from the block after `bl 5c4e80` (design 2.3).
+- `1315f4` keeps SP (it is `preserving`) but moves it, and calls `1584ac` with its own SP in a host register. `1584ac`'s svc stores that SP less
+  16, and its return stores its restored SP again (the design 2.3 rule: a function that keeps a register but stored a changed value of it before
+  an svc stores the restored value at its return): the block's SP is then `1315f4`'s own, 0x30 below its caller's. `1315f4` returned without
+  storing SP, since it keeps SP and had stored none itself (`restore_block` counted what the function stores before a call, and a call stores
+  no SP: SP and lr travel as arguments).
+- `131530` went on with that SP: its `str w0, [sp, #8]` wrote into the dead frame and its epilogue loaded x29, x30 and x19, x20 from
+  `1315f4`'s frame record and saved registers. Its `ret` went to `1315f4`'s return address, `13154c`, not its own entry lr: a non-local transfer
+  that no frame takes (3.3), which the thread's outermost level ran in the JIT with x19 from the wrong slot, until
+  `AddressSpaceAllocatorBase`'s constructor stored through `x19 + 0x20` = 0.
+
+**The fix** (`lower_calls.cpp` `FnDataflow`): SP counts as stored at every call. A callee may store the SP it is passed (its own svc, its
+own return's store of a restored SP, a tail call through the dispatcher, a poll, a gate, a JIT continuation), so after a call the block may hold the
+function's moved SP as though the function had stored it before the call; a function that keeps SP and moves it stores its SP again at its
+returns and tail calls (`restore_block`), as it already did for one with an svc of its own. A function split for size (`pack.cpp`, the parts'
+`restore`) stores SP at its returns when it keeps SP. The host's JIT driver needs nothing: it takes the call's SP after a function that keeps SP
+(`NXAOT_LOOKUP_SP_KEPT`).
+
+**Checked** by dm/host's `t_aot_host` `spkeep` row: a module the test writes word by word in the shape above (a call through a PLT stub's `br`, an
+address-taken function that moves SP so that the union holds it, a callee that keeps SP and calls a leaf with an svc in a frame of its own), 16
+calls: the right sum and no JIT run; the base nxaot's pack prints `spkeep FAIL` with 32 JIT runs, 1 `nonlocal` miss and the same `[RED]` line at
+its call's return. The game went on from `nnosInitialize` to `nnMain` and, with the two host changes its note lists, to its frame loop. **The packs
+change** only where a function that keeps SP and moves it calls something: a store of SP at its returns. The unit key's format is
+`nxaot-unit 7`, so no unit cached by an earlier nxaot is taken for these functions. `.text` of the game's packs (balanced, tier
+W): `main` 166,333,492 to 166,354,612 bytes (+0.013 %), `sdk` 57,366,020 to 57,369,620 (+0.006 %), `subsdk0` 28,000,892 to 28,002,380 (+0.005 %);
+the pack of the three took 7:37 at 6 workers with a cold cache. The 18 corpus packs of `build_packs.sh`: 1,405,192 to 1,407,160 bytes (+0.14 %,
+from -0.10 % for except-clang to +0.30 % for except-gcc). CTest 29 of 29 (`== nxaot_vec: 179296 vectors, 0 mismatches ...`); dm/host's 103 of 103
+with `NXAOT`, with and without `DM_AOT_ARENA_CHECK=1` (`t_pipe` given `DM_REPO`, as a build folder outside the repository needs). Not run:
+Windows (the lifter's change is the same code for a Windows pack) and a performance measurement (the store is one per return of such a function).
+
+A safepoint poll or a gate stores registers in its cold path too: fixed since, "Polls and gates in restore_block" below.
+
+## Polls and gates in restore_block
+
+A safepoint poll's cold path (design 6.2) and a gate's (design 1.1) store the registers newer than the block, with the values of the moment, so
+that the block holds the whole register file there. A function that keeps x19 (outside its WRITES) but changes it in a loop stored its own x19
+there when the poll fired, then restored x19 in SSA and returned without storing it again: `restore_block` (`FnDataflow`, design 2.3: what a
+function stores again before it returns because it stored a value of its own of a register it keeps) counted the stores before calls, svcs and
+loop heads, not those of polls and gates. A caller that keeps x19 in SSA across the call is unaffected, but one that reloads it from the block
+afterwards (after an indirect call, whose WRITES are the union over the standard entries, or the JIT fallback, which reads the block) took the
+callee's x19 of the moment.
+
+**The fix** (`lower_calls.cpp` `FnDataflow`): a backward branch's poll and a jump table's poll (a case at or before its block), a spin wait's gate
+(its back-edge) and an observation gate (before its block) count as stores of the registers they store: the block's end state, the state
+before the block for an observation gate. The entry's poll stores the entry values, which are the callers' own, and is not counted. A poll
+FnElidePolls removes later still counts (the stores at the returns are then more than needed, never fewer). A function split for size stores
+every register it keeps at its returns already (`FunctionPlan::restore`).
+
+**Checked** by dm/host's `t_aot_host` `pollkeep` row: a module the test writes word by word whose `start` sets x19 and calls `q` through `blr`
+(an address-taken function that changes x19 makes the union's WRITES hold it), `q` calls a host function that sets its thread's poll byte (as
+SetThreadActivity's pause request does from another thread), then a leaf `p` that saves x19, counts it up in a loop of 8 and restores it:
+`start` finds its own x19 after the call, with no JIT run. The base nxaot's pack prints `pollkeep FAIL` (x19 read back as 1, `p`'s value at the
+poll). **The packs change** where a function that keeps a register writes it in a loop or before a gate: one store per such register at its
+returns and tail calls. With this round's other changes ("Resume points and the FPCR", "Unbounded brs by form"), the 18 corpus packs of
+`build_packs.sh`: `.text` 1,407,160 → 1,410,184 bytes (+0.21 %; sjlj-clang +1,968 the most, whose functions with a setjmp continuation have a
+resume check at every call site, the others +16 to +320), and their Windows packs the same way; the synthetic modules' and t_second_pack's packs are the same
+bytes. The game's: "Unbounded brs by form".
+
+## Resume points and the FPCR
+
+A resume point (a landing pad, a setjmp continuation, a `nonlocal` miss's address: design 3.3) took a pending transfer when `st->pending` was its
+address and SP the frame's. Compiled code is specialised for one FPCR (design 7.1), and the transfer may come under another: the host
+propagates a return the JIT fallback makes under another FPCR to the frame that waits for it (`aot_run.c` `jit_loop`, "A return under another
+FPCR" in docs/reference/threads.md) with `st->pending` at that return address, and a call site whose return address is a resume point of its own
+(a setjmp's continuation) then resumed natively, under the wrong FPCR; so did a frame that takes a longjmp or an exception thrown under
+another FPCR.
+
+**The fix** (`lower_calls.cpp` `FnCall`): the resume check also compares st->fpcr's mode bits (`kFpcrModeMask`, dynarmic's location descriptor's)
+with the FPCR the code is specialised for; under another the transfer goes on past the frame, as one for no frame of compiled code does, and the
+host runs it in the JIT fallback (its miss `fpcr`, as a return under another FPCR). One load, an and and a compare more in each pending path,
+which runs only on a non-local transfer.
+
+**Checked** by dm/host's `t_aot_host` `fpresume` row: `fpret`'s module (a function sets round towards zero and jumps to a host function that
+returns to its caller under it) packed with a misses file the test writes, which makes the caller's call site a resume point
+(`<offset> nonlocal 1` under the image's SHA-256): the caller's rest rounds 2.75 with `frinti` under the current mode and checks 2; 2 misses, both
+`fpcr`, none `nonlocal`. The base nxaot's pack resumes natively there, and the rest of `start` runs as compiled code (`fpresume FAIL`, 1 miss, no JIT run after the call).
+
+## Jump tables whose index depends on several values
+
+After "Tail calls and the native frame's return", the 4,000-function benchmark's first pack still ran 800 JIT runs from 703 addresses
+(`nxaot_host`, one run), and its misses file held 339 `indirect` rows: every one of them a case of a switch whose `br` discovery left to the
+dispatcher (339 cases of 218 of those switches; no function pointer among them). `nxaot discover --tsv`'s `br` rows, by reason, before and after:
+
+| Program | jump tables before → after | brs left before → after | reason before (count) | after |
+|---|---:|---:|---|---|
+| benchmark, 4,000 functions (seed 1) | 353 → 736 | 383 → 0 | "the entry address depends on more than one value" (383) | none |
+| `gen_bench.py --direct`, 16,000 (seed 2) | 632 → 1,311 | 679 → 0 | the same (679) | none |
+| except-gcc | 0 → 1 | 1 → 0 | the same (1: rt/unwind.c's CFA interpreter) | none |
+| fnptr-gcc, fnptr-clang | 0 → 0 | 1 → 1 | "the index range has more than 4096 values" (`unops[i % 6](x)`) | the same |
+| the other 15 corpus NROs | the same (switch-gcc and switch-clang 12 each, fp-gcc and fp-clang 2, except-clang 1) | 0 | | |
+
+One example per group (module offsets):
+
+```
+benchmark 77c14..77c6c  ror / mov / add / eor ... madd x8, x8, x10, x11    x8: arithmetic of x0 and x1, live into the function
+          77c70  ubfx x10, x8, #16, #5; cmp x10, #0xd; b.hi 77e0c       the index, bounded on every path to the br
+          77c7c  adrp x11; add x11, x11, #0x600; adr x12, 77c94; ldrb w13, [x11, x10]; add x12, x12, x13, lsl #2; br x12
+except-gcc 1ce4  adrp x28, 0x3000; add x28, x28, #0xc04                 the table's base, in the prologue, before the loop at 1cf0
+          1d00   ldrb w0, [x21], #1 ... 1d20 cmp w0, #0x2e; b.ls 1d9c   the opcode, a byte read in the loop
+          1d9c   ldrh w0, [x28, w0, uxtw #1]; adr x1, 1dac; add x0, x1, w0, sxth #2; br x0
+          1ddc   bl memcpy; b 1d48                                        a case that calls, then branches back into the loop
+```
+
+**What the analysis could not see.** The benchmark's form is the one GCC and clang emit for a dense switch: a byte (or halfword, sign- or
+zero-extended) entry scaled by 4 and added to an `adr` label, or clang's word entry added to the table's own address. Discovery modelled it:
+the target is a function of one guest load, the `adr` base and the `adrp` + `add` table are constants after SSA, and LazyValueInfo bounds
+`x10` by the `cmp` / `b.hi` that dominates the br. It refused it before computing any range: `AnalyseTarget` took the address's leaves (the
+values of its expression that are no arithmetic: registers live into the region, loads, phis) and demanded exactly one, the index. Here the
+index `x10` is a bit field of `x8`, the product of a sum of `x0` and `x1`: two leaves. Not the base, not a copy of the index, not the shared
+default block. The rule asked for an index of one value where it needs an index of which the address is a function alone.
+
+**The rule** ([src/analysis/jumptable.cpp](src/analysis/jumptable.cpp), `FunctionOf` and `AnalyseTarget`): the candidates are the nodes of the
+address's expression of which the address is a function alone: the node itself, constants, and arithmetic whose operands are each such a
+function (every path of the expression to a variable passes through the node: it cuts the address from what computed the index). Of those,
+the one with the smallest range at the br (LazyValueInfo at the br, through casts, constant arithmetic and phis, intersected with its known
+bits) is the index; ties go to the node nearest the variables. With one variable this is the node the old rule took whenever it succeeded
+(it took the smallest range over every node and failed when that node did not cut the address), so every table bounded before has the same
+targets (the benchmark's 353: their rows the same but for 70 found from a nearer region, 20 of them now without crossing a call).
+
+**The proof obligation**, checked for each table: (1) the region is closed (every block of it that reaches the br but its first is entered
+only from inside it), so its IR has every path into the br; (2) the entry's address is the index's value through constants and arithmetic
+only (`FunctionOf`), so one value of the index gives one address; (3) the index's range is LazyValueInfo's at the br, from the conditions on
+every path into it, intersected with its known bits, each an over-approximation; the index's definition dominates the load and the load
+dominates the br, so the value the index has at the br is the one the load used; (4) every entry of the range is read from the image (an entry
+outside it refuses the table) and every target must be a decoded instruction of the function or another function's entry. Then every target
+the br can take is in the table. Refused, and left to the dispatcher with its reason: an index changed by another value after its compare or
+its mask (`idx + y`: the address takes several values for one value of the node), a compare of another register, a compare a path to the
+load goes around, a compare of the low half (`cmp w8`) of a 64-bit index, a signed compare (a negative index passes it: the range has 2^63
+values). [tests/test_discover.py](tests/test_discover.py) writes a module word by word with each form bounded (a byte table over a bit field
+of a product, a signed halfword table over the case offset of a sum with a case before the base, clang's table-relative word table over a mask
+of an exclusive or, an unsigned byte table over the zero-extended low half of a shifted sum, `b.hs`), checked index by index, and each
+look-alike above, which must stay a br; the base nxaot bounds none of the four.
+
+**The switch in a loop** (except-gcc): inside the loop the base `x28` is a value live into the region, so the address had two variables
+there; a region from the prologue, where `x28` is a constant, is closed only while the cases (which branch back into the loop) are left out.
+The optimistic try ("Module loader and discovery") bounded it so, without calls, and its verification with the cases walked failed: the
+cases call memcpy, and without calls the region is entered from outside at `1d48` from memcpy's return. The br was then never tried that way
+again, not even past calls. Now a tentative table that did not verify without calls is tried once more past calls, and verified past calls
+(`discover.cpp` `UnverifiedKey`: the tries that failed are kept per mode): a halfword table of 47 entries, and `run_program` becomes a
+preserving function (its unbounded br was a call of every address-taken function to the summaries). `NXAOT_DEBUG_REGION` now names the block
+a region is entered at from outside, and from where (`(0x1d48 from 0x1de0)`).
+
+**Measured** in the images, build trees on tmpfs, the machine's one-minute load 5 to 10 (another agent's builds); A is the base commit's nxaot
+(`git archive` of it), B this one. The benchmark's discovery: 56 rounds to 4, 3,376 regions lifted to 1,472, the summaries 240 rounds to 10, its
+analysis 2.4 to 0.5 s (`--workers 4`). Its first pack through `nxaot_host`, one run pinned to CPU 3: 0.320 s with 800 JIT runs from 703
+addresses and 339 `[RED]` indirect misses before, 0.0022 s with no JIT run after; except-gcc 0.099 s with 1,618 JIT runs from 5 addresses
+before, 0.00077 s with none after; the same output. [tests/measure_packs.py](tests/measure_packs.py):
+
+| Program | A | B | change | layout spread A / B | rounds spread | .text A -> B | pack time A -> B | verdict |
+|---|---:|---:|---:|---:|---:|---:|---:|---|
+| benchmark, 4,000 functions (fastest of 3; 3 rounds, 2 layouts) | 181.862 ms | 1.097 ms | -99.40 % | 2.53 / 6.29 % | 5.65 % | 6,019,056 -> 6,339,712 | 15.46 -> 13.47 s | faster |
+| except-gcc (fastest of 10; 6 rounds, 4 layouts) | 26.136 ms | 635.5 µs | -97.57 % | 0.41 / 0.87 % | 2.04 % | 82,492 -> 90,748 | 0.36 -> 0.38 s | faster |
+| switch-gcc, switch-clang, int_ops-gcc (`int_ops_rounds = 200`), fnptr-gcc | | | identical packs | | | 365,692; 85,864; 64,860; 58,188 | the same | not run |
+
+The benchmark's `.text` grows 5.3 % (its cases now compiled inside their functions: 36,859 blocks to 44,653), its pack's peak 188 to 217 MiB.
+**The packs**: of `build_packs.sh`'s 46 (the corpus for Linux and Windows, the synthetic modules, t_second_pack's), only except-gcc's `.so`
+and `.dll` change (its table); every other pack is the same bytes as A's, and every corpus NRO's `nxaot discover --tsv` is the same but
+except-gcc's. CTest: 29 of 29 (852 s); dm/host's 100 of 100 with these packs and `NXAOT`, with and without `DM_AOT_ARENA_CHECK=1`
+(`t_aot_host`'s `lrtail` row, whose `br` computes its target from x30 and must stay unbounded, as before: 126 JIT runs from 5 addresses, 4
+misses, none `nonlocal`). `t_aot_host` still lists except-gcc among the programs that need the JIT (`JIT_NEEDED`, read only by a host built
+without the JIT, whose row would now note "listed as needing the JIT, ran without it: update JIT_NEEDED"). Not verified: a game (none runs
+on the x86-64 engine yet) and a Windows run (the packs change the same way; not run there).
+
+What stays unbounded: fnptr's `unops[i % 6](x)`, a remainder by 6 computed with a multiply-high that no LLVM analysis bounds, through a table
+of function pointers in data (a call, which the dispatcher's inline cache serves), and `gen_bench.py --unbounded-switches`'s remainders but
+by 16 (a mask).
+
+## Unbounded brs by form
+
+Mario vs. Donkey Kong's modules (`sdk`, `subsdk0`, `main`; [its note](../../games/0100B99019412000/README.md#on-linux-the-x86-64-engine)) left
+thousands of `br` rows "the index is not bounded at the br" in `nxaot discover --tsv`, and the misses of its routes came back at other cases of
+the same tables. A census of every `br` row that is no PLT stub, by the machine code that computes its target (a classifier outside the
+repository: the function's CFG rebuilt from its extent and the known tables, the target register's definition and the index's found along the
+dominator chain), showed that the reason named another thing than tables almost everywhere:
+
+| `br` rows "the index is not bounded" (base) | `sdk` | `subsdk0` | `main` |
+|---|---:|---:|---:|
+| a pointer loaded from a register plus a constant (`ldr x3, [x8, #0x28]; br x3`: a function pointer or vtable slot; `ldp` pairs, an array at a constant index) | 1,746 | 184 | 3,185 |
+| a call's result or an argument moved (`mov`) | 0 | 0 | 4 |
+| a jump table (a narrow entry from a table by an index, added to an `adr` base) | 9 | 1 | 4 |
+
+And the tables are spread over three reasons, "not bounded", "depends on more than one value" and "more than 4096 values": 69, 16 and 86 of
+them in the three modules (main's "depends on more than one value" rows are 216 C++ member function pointer calls and 41 tables). By the
+form of their bound:
+
+| form | what bounds the index | what the analysis missed | fix |
+|---|---|---|---|
+| the compare and its `b.hi` in different blocks (a `tbnz` between them) | `cmp w10, #0x32` ... `b.hi` | the Z flag reaches `b.hi` as `icmp eq (sub x, 50), 0` (the lifter keeps N, Z, C, V apart across blocks), and LazyValueInfo bounds a value by conditions on that value only: on the false edge of C & !Z it knew nothing | `CompareOperands`: `(x - C) == 0` rewritten as `x == C` before LazyValueInfo (sound: the same predicate in modular arithmetic) |
+| the index is `and x, 0xffffffff` or `and x, 0xff`, the compare on `w` or on `and w, 0xff` | `cmp w20, #0x10; b.hi`, then `and x8, x20, #0xffffffff` | the compare is on another value (a trunc, or a narrower and) of the same register | `RangeOf`: `and x, 2^n - 1` takes the range of a trunc of x to n bits, or of `and (trunc x), M`, on the straight line to the br (the same function of the same x) |
+| bounded on every path, one path past a `blr` | `cmp w9, #6` before the table on both paths, one after `blr x8` | a call with no summary (a `blr`, a `bl` to no known function) ended the region | `EffectOf`: such a call changes every register, SP and NZCV (`lift::CallEffect`'s default): the region goes on past it with all of them opaque, which models any callee that returns there |
+| the table's base in a callee-saved register set before a loop that calls through a PLT stub or `blr` | `adrp x28; add x28` before the loop | the call's union (every address-taken function) changes x28 | the PLT part: "PLT stubs bound to their own module" below; a `blr` stays (sdk's `nn::util::VFormatString`) |
+| a 32-bit compare of a 64-bit index loaded from a stack slot | `ldr x10, [sp]; cmp w10, #3` | the upper half is what an earlier `str` left: memory is not followed | none: refused, as before |
+| a bound only algebra gives | nlib's `memchr` variants: `end - (end & ~3)` | no LLVM analysis of the region bounds it | none (below) |
+| none in the code (a contract of the caller) | | | none (below) |
+
+The pointer loads now say so (`AnalyseTarget`: "a pointer loaded from a register plus a constant (a function pointer or vtable slot, no table)",
+and "a pointer loaded from a sum of registers (a member function pointer's vtable slot, no table)"), given only when no node of the address is
+bounded: a 64-bit entry that is the target itself, read at the sum of the leaves (each with coefficient 1) and a constant, where a table's index
+is scaled by its entries' size. The census then counts tables. `nxaot discover --tsv` of the three modules, the tip's nxaot against this one
+(without `--bind`; the table rows "a pointer ..." are the relabelled ones):
+
+| | `sdk` | `subsdk0` | `main` |
+|---|---:|---:|---:|
+| jump tables | 637 → 663 | 324 → 325 | 621 → 647 |
+| `br` rows "the index is not bounded" | 1,755 → 6 | 185 → 1 | 3,193 → 3 |
+| "a pointer loaded from a register plus a constant" / "from a sum of registers" | 0 → 1,764 / 1 | 0 → 190 / 2 | 0 → 3,193 / 214 |
+| "depends on more than one value" | 27 → 25 | 16 → 13 | 257 → 41 |
+| "the index range has more than 4096 values" | 42 → 10 | 8 → 2 | 30 → 5 |
+| "a target is not a decoded instruction of the function" | 10 → 3 | 1 → 1 | 6 → 5 |
+| tables left unbounded (the classifier's count, every reason) | 69 → 43 | 16 → 15 | 75 → 47 |
+| preserving / open functions | 8,098 / 31,754 → 8,100 / 31,752 | 2,417 / 11,238 → the same | 23,352 / 47,202 → 23,361 / 47,193 |
+| discovery, s (one run each, a shared machine) | 14.4 → 15.1 | 3.9 → 3.2 | 160.7 → 165.8 |
+
+The tables left are mostly a base in a callee-saved register that a call in the loop makes unknown (24, 14 and 24 "cmp-here" forms, the
+compare right before the table), a call through a PLT stub (below) or a `blr`.
+
+**Over-approximated tables** (no compare, mask or byte load bounds the index, the base a constant): not done; the argument is beside
+`AnalyseTarget`'s failure ([src/analysis/jumptable.cpp](src/analysis/jumptable.cpp)). Lowered as a switch over the targets of the table's
+prefix whose entries land on decoded instructions of the function, with the dispatcher as its default, the br would still run right (the switch
+compares the computed address). But the targets become the CFG's edges and the function closed, its summary covering the blocks they reach, so
+it holds only if every real entry is in the scanned prefix: the index never negative nor past the scan, no real target outside the extent or off
+the decoded code (a case that is another function's entry, or a `.cold` part placed after the next function, stops the scan before the entries
+after it). That is exactly what the code does not show for such an index, and of the 1,627 tables bounded in these modules none has a target
+outside its function, so nothing tells the two apart. The data left no case to take the risk for: after the forms above, the tables whose index no compare, mask or byte load
+bounds are 14 brs of `sdk` (6 in nlib's `memchr` variants), 1 of `subsdk0` and 12 of `main`, in about as many of 125,032 functions; a wrong
+closure is a silent miscompilation, a dispatcher miss costs one lookup. Those tables stay with the dispatcher, their functions open. (Round 7
+scans them for guarded cases instead, which close nothing: "Static cases of a br left to the dispatcher".)
+
+**Checked** by CTest `discover`'s hand-written module ([tests/test_discover.py](tests/test_discover.py)): four more forms, each a table with
+exactly its cases, index by index (a compare whose `b.hi` follows a `tbnz`, an index `and x8, x0, #0xff` compared as `and w9, w0, #0xff`, an
+index `and x8, x0, #0xffffffff` compared as `w0`, an index bounded on two paths into the table, one past a `blr` whose result it compares), and
+one more look-alike that must stay a br (a `blr` between the compare and the load); the base nxaot bounds none of the four, and every earlier
+form and look-alike is as before.
+
+**Measured**, the packs of the three modules (balanced, tier W, 6 workers, no cache, one run each on a machine shared with another agent's
+container, load 6 to 14), the tip's nxaot against this one (this section, "Polls and gates in restore_block" and "Resume points and the FPCR";
+no `--bind`): `.text` `sdk` 57,369,620 → 57,513,908 (+0.25 %), `subsdk0` 28,002,380 → 28,055,180 (+0.19 %), `main` 166,354,612 → 166,662,132
+(+0.18 %); pack time 85.8 → 86.6 s, 39.3 → 46.0 s, 333.6 → 355.2 s (the load moved under them: no claim either way). The benchmark and the
+corpus ([tests/measure_packs.py](tests/measure_packs.py), 3 rounds, 2 layouts, fastest of 3, pinned to one CPU, the load 16 to 20 from
+another agent's builds): every verdict "within noise".
+
+| Program | A | B | change | noise | .text A -> B | pack time A -> B |
+|---|---:|---:|---:|---:|---:|---:|
+| benchmark, 4,000 functions (seed 1) | 1.089 ms | 1.130 ms | +3.76 % | 6.54 % | 6,268,608 -> 6,268,624 | 6.52 -> 6.50 s |
+| int_ops-gcc (`int_ops_rounds = 200`) | 61.352 ms | 60.823 ms | -0.86 % | 5.34 % | 53,964 -> 54,012 | 0.34 -> 0.41 s |
+| except-gcc | 659.0 µs | 641.0 µs | -2.73 % | 8.69 % | 79,708 -> 79,804 | 0.43 -> 0.38 s |
+| switch-gcc | 170.0 µs | 173.5 µs | +2.06 % | 10.95 % | 353,852 -> 353,900 | 0.84 -> 0.72 s |
+| fnptr-gcc | 9.0 µs | 8.5 µs | -5.56 % | 22.22 % | 49,324 -> 49,404 | 0.26 -> 0.29 s |
+| sjlj-gcc | 6.0 µs | 5.5 µs | -8.33 % | 18.33 % | 48,988 -> 49,068 | 0.36 -> 0.41 s |
+
+## PLT stubs bound to their own module
+
+A call through a PLT stub (`adrp x16; ldr x17, [x16, #o]; add x16, x16, #o; br x17`) took the stub's summary, and the stub's `br` is one the
+dispatcher serves: the union over the module's address-taken functions, which in Mario vs. Donkey Kong's `sdk` (80 % of its functions `open`)
+changes every register. The census of the three modules' PLT stubs, each resolved as the host loader binds it (`loader.c` `bind_sym`: the
+forced take-overs first, a local or hidden definition to the module itself, then the loaded modules in load order, main, `subsdk0`, `sdk`,
+then the host's HLE), with their `bl` and `b` sites:
+
+| module | bound to itself | to another module of the set | to the host (forced take-over) |
+|---|---:|---:|---:|
+| `main` | 0 | 474 stubs (459 `sdk`, 15 `subsdk0`), 59,484 sites | 115 stubs, 174 sites |
+| `subsdk0` | 3,394 stubs, 23,094 sites | 505 (496 `sdk`, 9 `main`), 24,678 sites | 25, 65 |
+| `sdk` | 8,756 stubs, 62,417 sites | 27 (22 `main`, 5 `subsdk0`), 3,591 sites | 148, 6,039 |
+
+`sdk`'s stubs bound to `main` are names both define (`operator new` and `delete`, `malloc`, `free`, `realloc`: main's definitions win, as on
+Horizon). So the binding is a fact of the pack set and of the host, not of the module: nxaot takes it from the host.
+
+**The host writes the bindings** (`dm/host/aot.h`, "The loader's bindings"): with `DM_AOT_PROFILE=<folder>`, beside the profile and the misses,
+`<folder>/<module>.bind.tsv` for every module with a pack (not an NRO, which binds only when the game loads it): the misses' header (module,
+build ID, image SHA-256, pack) and one line `0x<slot> 0x<target> <symbol>` per JUMP_SLOT relocation of a symbol the module defines whose slot
+holds the module's own definition after relocation (`loader.c` `loader_self_bindings`).
+
+**nxaot build --bind <file>** (and `nxaot discover --bind`), taken when its header names the image's SHA-256: a PLT stub whose slot is in the
+file is a tail call of that function, as `b` makes it, in discovery (the block must run the stub's `ldr` first: a branch into the stub's last
+words starts a block there and stays a `br`), the summaries, the plan and the lowering (`FnLowerTerminal`: the stub's `br` lowered as `b` to the
+function). The analysis cache's key and each unit's key hold the bindings (a unit's: its bound stubs and their functions' facts); a pack
+without `--bind` is as before. The pack records every binding it assumed in an exported table, `nxaot_bindings` (include/nxaot/aot_module.h:
+`{slot, target}` module offsets, then a row of all ones; on Windows exported by the DLL), and the host compares each slot with base + target
+once the module is relocated (`aot_arena.c` `bindings_check`): a slot bound otherwise refuses the pack with a `[RED]` line naming the slot and
+what the loader bound it to (another pack set, a host that takes the name over now), which stops the start as a pack of another image does;
+with `DM_AOT_PROFILE` that session's bindings file is written first, so the next pack takes the current ones. An NRO's pack with bindings is
+refused. A first pack has bindings too: before its packs the packer runs `<host> --profile <game profile> --bindings <NSP folder>/<id>-work/profile <aot folder>`
+when the host runs on this system (the condition of `--takeovers`), and the host maps and relocates the module set as a start does, writes each module's
+bindings file there in the form above (`aot.h` `dm_aot_write_module_bindings`; `# pack none`) and ends before any pack loads (`scripts/build_ipa_from_nsp.py`
+`loader_bindings`): one implementation of the loader's rule, and the first pack's units then carry the bindings the second pack's do, so that the second
+pack's cached-units rule works with them. Measured on Mario vs. Donkey Kong (the dry run's rows are the profiled run's, row for row; 0.3 s): the first
+pack with them, `sdk` 82 s and `.text` 57,561,604 -> 55,035,792 (-4.4 %), `subsdk0` 39 s, 28,066,380 -> 27,344,608 (-2.6 %), `main` none to bind; the
+second pack (`--profile --misses --bind`, the same run's files) then keeps 35,930 of `sdk`'s functions at W (2,632 of 2,648 units from the cache; 3,554
+when the first pack had no bindings) and 9,537 of `subsdk0`'s (1,175 of 1,217; 3,947): `.text` 140,861,088 -> 59,969,360 and 62,035,148 -> 31,534,076,
+26.5 s and 5.5 s instead of 40.4 s and 14.0 s; the three modules' second pack 483.8 -> 372.4 MB of `.text`. The packer passes `<NSP folder>/<id>-work/profile/<module>.bind.tsv` when there is one for the image (`--bind`, the pairs in the pack's
+key), less the rows whose name the host it packs for takes over (`nxhost-run --takeovers`, asked when that host runs on the packing system:
+a file recorded by an older host binds them, and a pack that assumed them would be refused), and copies what it passed beside the pack
+(`aot_v<version>/<module>.bind.tsv`). A refused pack ends the run with status 8 (`DM_AOT_REPACK`, as every
+pack-load refusal a repack cures: `aot.h` `dm_aot_pack_refused`); the launcher explains that status after Play and offers the repack, and it
+names such a pack before the start without loading a module: the bound names in the file beside the pack against the names its host takes over
+(`nxhost-run --takeovers`; dm/launcher `launcher_model.h` `bindings_problem`).
+
+**Measured** on the three modules, the bindings the host's rule gives (written for the census by a script that applies `bind_sym`'s order to
+the three modules' symbol tables and the host's forced names, the names of `HLE_FORCE` and `HLE_FORCE_BIG` in dm/host and dm/gfx; a game
+session writes the same file): 8,756 slots of `sdk`, 3,394 of `subsdk0`, none of `main`. Discovery with them against without:
+
+| | `sdk` | `subsdk0` |
+|---|---:|---:|
+| preserving / open / noreturn functions | 8,100 / 31,752 / 444 → 17,482 / 22,324 / 490 | 2,417 / 11,238 / 348 → 3,806 / 9,849 / 348 |
+| jump tables | 663 → 673 (`sdk+0x1cfb44` and `sdk+0x4a4004` among them) | 325 → 327 |
+| `br` rows of PLT stubs ("a constant entry address") | 8,971 → 215 | 3,931 → 537 |
+| regions lifted | 27,823 → 9,488 | 10,210 → 3,318 |
+| discovery, s | 15.1 → 14.9 | 3.2 → 4.0 |
+| `.text` of the pack (tier W) | 57,513,908 → 54,831,152 (−4.7 %) | 28,055,180 → 27,334,768 (−2.6 %) |
+| pack time, s (one run, no cache) | 86.6 → 100.5 | 46.0 → 46.6 |
+
+The code shrinks as callers keep callee-saved registers in SSA across the calls instead of storing and reloading them, and the stubs become
+direct tail calls. Not run: the game with such packs (its build folder was another agent's this round), so no run time is claimed.
+
+**Checked** by dm/host's `t_aot_host` `bindstub` rows: a module the test writes word by word with a dynamic section (one global symbol and one
+JUMP_SLOT relocation of it) whose `start` calls a PLT stub 64 times: a run under `DM_AOT_PROFILE` writes the bindings file with the slot's row
+(and the pack without `--bind` misses once in the dispatcher at the stub's `br`); the pack built with it runs with no dispatcher miss and the
+right sum; a pack built with a file that binds the slot to the function + 4 is refused at load (`it assumes the GOT slot bindstub+0x2000 binds
+to bindstub+0xe0, and the loader bound it to bindstub+0xdc ...`).
+
+**Calls into another module or the host: not done** (data for a decision). Every stub bound elsewhere keeps the union. A per-export fact,
+"preserves the callee-saved registers and SP and returns", recorded in each pack for its exports and in the importing pack for every import it
+assumed it of, checked by the host at load (a mismatch refusing the pack), would give those calls their callee's class. What it would reach,
+by the class the target has in its own module (the `sdk` and `subsdk0` classes with their own bindings):
+
+| importer | to `sdk` | to `subsdk0` | to `main` |
+|---|---|---|---|
+| `main` | preserving 404 stubs, 58,035 sites; noreturn 4, 1,140; open 51, 252 | preserving 5, 16; open 10, 41 | |
+| `subsdk0` | preserving 245, 11,105; open 249, 11,661; noreturn 2, 44 | | open 8, 1,867; preserving 1, 1 |
+| `sdk` | | preserving 1, 1,008; open 4, 71 | open 19, 2,497; preserving 3, 15 |
+
+`main`'s are nearly all calls of preserving `sdk` functions (`__cxa_guard_acquire` and `__cxa_guard_release` alone 45,845 sites, then `memcpy`,
+`sqrtf`, `memset`); `sdk`'s calls into `main` are of `main`'s allocator (`operator delete`, `realloc`, `malloc`, `free`, `operator new`), which
+is open in `main` (its own calls into `sdk` are). Its costs: the
+facts of a module depend on the modules it imports from (sdk calls main's `malloc` and `operator delete`, main calls sdk), so the packs of a
+set are no longer independent: either one analysis over the set (each module's discovery is already a fixed point; the set's would iterate
+across them) or each module's facts computed with its imports taken as open (then sdk's functions that call main's allocator stay open, as
+they are now) and the importers built after the exporters; a host function (the forced take-overs, the HLE) preserves the guest's callee-saved
+registers by construction (its thunk writes only the return registers), so those imports could take the fact without a check; and a host or
+pack change that alters one export's class refuses every pack that imported it.
+
+## A call into the next function
+
+Discovery keeps functions apart: a function's walk stops where another entry starts, and a branch into another function is a tail call. A branch's target
+that other functions reach (a tail target: the natural pieces, 1,969 of `sdk`'s first-pack functions, 312 of `subsdk0`'s, 64 of `main`'s), an `adr`
+whose target lies outside its function and, until round 6, a miss's entry cut a function in the middle (a miss inside a function with a `br` left to the
+dispatcher is a case now: "A miss as a case of its function's br", below), and the instruction before the cut may run into the next function: a plain fall-through had its edge (`Term::Out`, a tail transfer), but a call that returns, an svc and a conditional
+branch's fall-through had none, and the summaries ignored a jump table's cases in another function.
+
+Found on Mario vs. Donkey Kong's second pack: the miss at `main+0x2ee9c8`, a case of a jump table discovery cannot bound (`adr x9, #0x2ee9c8; ldrb w10,
+[x28, x8]; add x9, x9, x10, lsl #2; br x9`, its base set before a loop that calls), made that case an entry, which cut `main+0x2ee8a0` (one function of
+0x368 bytes) into nine. One of them, `main+0x2ee9b4` (the other table's base, an `adr` target), is `ldr; mov; ldr; bl 0x24397c`, and the call's return is
+`main+0x2ee9c4`, the next fragment's entry. With no edge after the call the fragment had no return path (summarised `noreturn`), and its call site gave
+`0x24397c`'s LIVE_AFTER nothing: the callee, open, returned without storing the x19 and x27 it restored (they were not in LIVE_AFTER), the fragment
+reloaded them from the block, where the callee had stored its own values at an inner call, and the JIT ran `main+0x2ee9c4` from there (the lowering is a tail
+call only when x30 is the entry lr, and after a call it is the return address: `FnTailLr`'s JIT path, the miss at `0x2ee9c4`): `ldr x1, [x27 + x19 * 8 +
+0x98]` read 0x100000000, which `sdk+0x3a9324` faulted on at the title.
+
+**The rule** ([src/analysis/discover.cpp](src/analysis/discover.cpp) `Finish`): when a call to a function that returns (`bl`; `blr`), an svc or a conditional
+branch has its next address outside the function, in the text, discovery records it, `Function::out` (block start -> address), as the block's
+continuation: a tail transfer to what starts there, after the call's or the svc's effect. Not when the instruction is the last of the FDE that holds it
+(`CallGoesOn`): the compiler put nothing after it, so it knew the callee does not return (longjmp, a throw, `exit`, whose summaries may show a return
+path), and the next function is no continuation of it; with that rule the 18 corpus programs' discovery is row for row round 3's (`nxaot discover
+--tsv`), where without it six functions of `except-clang` and `sjlj-gcc` ending in such a call became open. The summaries take it as an exit
+([src/analysis/summary.cpp](src/analysis/summary.cpp) `OutTargets`, with the cases of a table that are no block of the function): its reads are live after
+the call, its writes and must-writes count, and the path returns when the function there does, restoring what it preserves. LIVE_AFTER gets what the
+continuation reads and passes this function's own on to it, the tail-call components (RV) join it ([src/build/plan.cpp](src/build/plan.cpp)), and the
+lifter makes it a real tail call with the entry's lr when the function there does not read x30 (`FnAfterCall`: x30 holds the call's return address, which
+it would read first otherwise; then the JIT from there, as before). The kinds of cut, from the code: a plain fall-through (`Term::Out`, unchanged), a
+conditional branch's fall-through, a call's return (this defect), an svc's return, a table case outside the function; a call's landing pad outside its
+function stays a non-local transfer. The unit key's format is 9 (a callee's reads of x30 in it).
+
+**A call the analysis says does not return** (the second line, [src/lift/lower_calls.cpp](src/lift/lower_calls.cpp) `FnCallDirect`): such a call stores
+every register newer than the block first (cold: the analysis says it never comes back), the callee stores all it holds at a return (its LIVE_AFTER is
+every register: `plan.cpp`), and a return goes on in the JIT from the return address with the whole register file, reason `NXAOT_TRAP_JIT_NORETURN`: a
+`[RED] aot: a call returned that the analysis says does not return: its return address at ...` line and a misses row `noreturn`, which nxaot leaves
+unserved (its analysis is what is wrong there). Before, such a return was a trap (status 6).
+
+**Checked** by `t_aot_host`'s `cutcall` row: a module it writes word by word, a loop over an unbounded jump table whose case 0 calls g and whose case 1 is
+that call's return address; g is open (a call through a PLT stub's shape whose union moves SP) and stores its own x19 in the block at an svc. Packed without
+misses, the run prints `cutcall PASS` with the cases in the JIT (10 runs) and the host's misses file names case 1 and the loop's head; packed with it, the
+base nxaot's pack faulted (`SIGSEGV at address 0x2 in guest code`, the loop's `ldrb w10, [x28, x19]` with the block's stale x28), this one prints
+`cutcall PASS` with no JIT run. `noret`: a call of a function that returns through `br x16` (the summaries say it does not: the only address-taken
+function traps) goes on in the JIT and prints `noret PASS` with its `noreturn` row; the base pack trapped (status 6). `test_misses.py`'s cut-call checks
+read the same module (word for word, in Python): the fragment's summary `open` (base: `noreturn`), g's LIVE_AFTER with x19 (`nxaot plan --misses`), and a
+`noreturn` miss unserved with its `[RED]` line.
+
+**The corpus packs** (`build_packs.sh`, 46 packs against round 3's): the synthetic modules' 10 (`hostfn`, `module`, `second_pack`, Linux and Windows)
+are the same bytes; the 36 of the corpus programs differ, each at its calls of a function the summaries say does not return (4 to 24 per program: `exit`,
+`abort`, the runtime's error paths), whose return was a trap and is now a store of every register before the call and a JIT continuation after it
+(`.text` 0.8 to 3.0 % larger: `fnptr-gcc` 49,404 -> 49,836, `except-clang` 81,148 -> 83,612).
+
+**Earlier second packs**: the defect shows as a JIT miss at a call's return address. Round 2's second pack of Mario vs. Donkey Kong (the bundle of
+95daacad's "Repack with profile") ran four such continuations (`main+0x38d310`, `0x522e84`, `0x54f540` after a `bl`, `0x5f4190` after a `blr`) and reached
+level 1-1 without a fault; whether one of them carried a stale register the log cannot tell: a stale value need not fault (the synthetic's x19, with
+another register order, ends the loop early and prints a wrong sum). The conditional branch's, the svc's and the table's cases leave no miss line: they
+made the summaries of the fragment and its callers miss the continuation's effects, which only an open callee-saved register or a v register makes
+visible. Packs built with misses before this fix should be built again.
+
+## A miss as a case of its function's br
+
+A miss's entry inside a function cut it: the address became a function of its own, and the code around it pieces (Mario vs. Donkey Kong's second pack:
+`main` 545 functions that are no compiler's function against the first pack's 65, `sdk` 2,132 against 1,991), every `adr` and branch between the pieces
+a cut too. After a call in a piece x30 is not the entry lr, so every branch from it into another piece went through the JIT (`FnTailLr`): 41 of the
+second pack's 43 misses and 347,172 of its 352,912 JIT entries (round 5's run). The census of the three modules
+(`/srv/nxnative-games/agent-build/scripts/census6.py`, not in the repository: a piece is a function whose provenance is only tail, adr, miss or gap,
+cut from the compiler's function before it) shows which cuts can go: without misses the pieces are tail targets that other functions branch to (all
+but 21 of 2,369 reached from outside the function they lie in), and every piece the misses add (141 in `sdk`, 480 in `main`: the miss entries, the
+`adr` targets they leave outside, the branch targets between pieces, the code no walk reaches any more) is reached only from inside its function.
+
+**The rule** ([src/analysis/discover.cpp](src/analysis/discover.cpp) `MissCases`, `Function::cases`): an `indirect` or `nocode` miss at an address in the
+range of a function that has a `br` left to the dispatcher is a root of that function and a case of those `br`s, not an entry. The dispatcher missed
+there because the function's own `br` could not be bounded; the function stays one function for discovery, the summaries and the plan. Each such `br`
+gets the cases as `Edge::Table` edges and stays an `Indirect` exit (any other target goes on through the dispatcher), so the summary is the whole
+function's and is no more closed than before. The plan gives every such `br` every case of its function ([src/build/plan.cpp](src/build/plan.cpp)), and
+the lifter lowers it as a recovered table's: one LLVM `switch` over the cases' module offsets whose default is the dispatcher (`FnGoto`), a guard, so a
+stale or wrong case costs a compare. A transfer to a case is a branch inside the function: no x30 question, no JIT. Decided once per address, in address
+order, after the walks have found the `br`s (the misses' order in the file does not matter). An address no function with such a `br` holds keeps the
+rule of an entry (and of the cut: "A call into the next function"), as do `call` and `host` misses (something calls them); the Mario vs. Donkey Kong
+misses are all `indirect` but its `nonlocal` and `fpcr` rows.
+
+**The residual**: a case that something outside its function reaches still goes through the dispatcher, which finds no entry there. The pack lists its
+cases (`nxaot_cases`, include/nxaot/aot_module.h: module offsets, then all ones; exported by a Windows DLL; a pack without cases has none), and the
+host names a dispatcher miss at one of them `indirect-case` (`dm/host/aot_run.c`, `aot_arena.c` `dm_aot_is_case`): its function's own `br` branches
+there directly, so it came from outside. nxaot makes an `indirect-case` row an entry, the function cut there as before, with a
+`[RED] discover: the JIT miss at <offset> (indirect-case) was a case of its function's br ...` line. An older nxaot reads the word as unknown (unserved,
+its `[RED]` line), so the file's header is unchanged. The unit key's format is 10 (the cases are in it with the tables).
+
+**Checked** by `t_aot_host`'s `casecall` rows: cutcall's loop with its cases inside the function (before the loop's head) and a third piece, CX, that
+another function calls through a pointer it computes. Packed without misses: the cases and CX in the JIT, the misses file naming the three (`indirect`);
+packed with it: the cases are cases of the function's `br` (the function one function, no JIT run) and only CX's call goes through the dispatcher, which
+the host names `indirect-case`; packed with that row: CX an entry, no JIT run. `test_misses.py`'s cases checks read the same module: with the cases'
+misses the function set is the first pack's (7 functions, no new piece), the rows in another order give the same discovery row for row, the misses line
+counts 2 cases, and an `indirect-case` row makes CX an entry with its `[RED]` line (CX lies between the cases and the loop's head, so the cut there leaves
+the function without its `br` and its cases become entries too: round 5's continuations join the pieces).
+
+**Measured** on Mario vs. Donkey Kong in the clone of its NSP folder, the second pack built from round 5's inputs (run A's profile, misses and bindings,
+a first pack without bindings, 6 workers), round 5's nxaot against this one; then the same route to level 1-1 on each (round 5's run started from the
+original folder's save, this one from the save that run left):
+
+| | round 5 | round 6 |
+|---|---:|---:|
+| `main`: misses as | 23 new entries, 1 resume point | 31 cases, 0 new entries, 1 resume point |
+| `main`: functions | 71,213 (545 pieces) | 70,733 (the first pack's) |
+| `main`: units from the first pack's cache, functions kept at W | 4,450, 44,809 | 6,007 of 6,015, 59,474 |
+| `main`: `.text`, pack time | 280,858,644, 164.8 s | 197,598,900, 105.5 s |
+| `sdk`: misses as, functions | 4 new entries, 40,437 | 6 cases, 40,296 |
+| `sdk`: `.text`, pack time | 140,861,088, 40.4 s | 140,776,960, 40.4 s |
+| the run: JIT runs, CPU time, share | 3.32 million, 5.54 s of 80.1 s, 6.92 % | 0.82 million, 2.26 s of 71.4 s, 3.16 % |
+| the physics workers (of it under FZ), AudioFrame, ModuleSystem, main thread | 2.64 (1.94), 1.64, 0.64, 0.45 s | 2.01 (1.49), 0, 0.08, 0.16 s |
+| misses left | 43 addresses (41 pieces the JIT reached, 2 new cases) and `fpcr` | 5 new cases of unbounded tables and `fpcr` |
+
+`sdk`'s cache figures stay low because the first pack had no bindings ("PLT stubs bound to their own module"); `subsdk0` has no miss. The most cases one
+site gets is 8 (`main+0x5f4088`, one `br`; `sdk`'s most is 2). The corpus packs (no misses) are the bytes round 5's nxaot made, but excl's, whose program
+changed (the pause rows).
+
+## Static cases of a br left to the dispatcher
+
+Most play sessions run a first pack (a second needs a profiled session and a repack). Mario vs. Donkey Kong's first pack, as a player gets it (the host's
+bindings, "PLT stubs bound to their own module"), spent 7.32 % of the route's sampled guest CPU time in the JIT fallback; the host now says what began
+each stretch (`aot: profile: JIT time from ...`, `dm/host/aot.h` `dm_aot_profile_jit_origin`: each JIT run counts for the last miss that sent its thread
+there), and [the game's note](../../games/0100B99019412000/README.md#on-linux-the-x86-64-engine) has the table: 3.30 s after a `nonlocal` miss and 2.14 s
+under flush-to-zero, both on the physics workers (below, open), and 0.65 s at 33 cases of 16 jump tables that discovery left to the dispatcher (the main
+thread, `ModuleSystem`, the base processes). A profile serves only the cases a route reached; round 6's cases need it. This section serves the tables
+without one.
+
+**The rule** ([src/analysis/discover.cpp](src/analysis/discover.cpp) `Guesses`, last in each round of discovery, when every other source is
+exhausted): each `br` left to the dispatcher that is no pointer load or constant (a function pointer, a vtable slot, a PLT stub) is tried once more,
+as a candidate generator rather than a table:
+
+- its regions are lifted with every call taken to keep what the calling convention keeps (`AbiEffectOf`: x19..x29 and SP kept, x0..x18, x30, the v
+  registers and NZCV changed; a known callee's summary narrows that). The table idiom whose base a loop's call made unknown (the call's union, or a `blr`:
+  `main+0x5f41c4`, `sdk+0x841b0`) then has its base, and its index its compare; optimistic first (the code only speculative roots reach left out, as a
+  tentative table is found: the cases of a loop's table branch back to its head, which then has no dominator inside the function), then every block;
+- a table whose index nothing bounds (a `ccmp` chain, a bound in memory, a caller's contract: `main+0x7125d8`, `sdk+0x32a518`; and an index whose
+  compare a loop's region loses, `main+0x54f5d4`) is read from its index's lowest value while the entry's address is in the image and is no address the
+  module's code names (`DataRefs`: `adr`, `adrp` + `add`, `adrp` + a load's or store's offset, the relocations' targets, the data symbols: another object
+  starts there), at most 4,096 entries, the index stepping by one entry, and its targets kept up to the first that is not an instruction of the
+  function (`AnalyseTarget`'s scan, `ResolveJumpTable`'s `guess_refs`);
+- a bounded table with a target outside the function (`main+0x523230`: "a target (0x523394) is not a decoded instruction of the function") keeps its
+  targets that are instructions of the function; and a guess reads a bounded table, too, only up to the next object of the module's data (a bound wider
+  than the table, a mask of the index whose compare is on another value: `sdk+0x48f254`'s 256 entries for 16, `main+0x839708`'s, read the next tables).
+
+A candidate must be an instruction of the function's own range (the text, a word that decodes) and no function's entry. The candidates join that
+`br`'s guesses (`Function::guesses`, only growing; tried again whenever the function's walk changed, so a table whose loop the cases close is seen
+whole once they are walked: `main+0x2eea24`'s index was 0 alone in the optimistic region, 0 to 3 once its case 0 was walked). They are guarded cases
+exactly as round 6's miss cases are: the walk follows them from the `br`, they are its `Edge::Table` edges, the `br` stays an `Indirect` exit, and the
+plan gives that `br` (not the function's other `br`s) a switch over its cases and guesses whose default is the dispatcher; the pack lists them in
+`nxaot_cases`, so the host names a dispatcher miss at one `indirect-case`. `nxaot discover --tsv` writes a `guess` row per `br` (`guess <br> <function>
+<targets>`), and discovery a line `aot: guessed cases: N brs left to the dispatcher in F functions, T targets; W functions' guesses withdrawn`.
+
+**What a wrong candidate costs.** It cannot change where the `br` goes: the switch compares the computed address, so another value goes on to the
+dispatcher as before. It cannot close the function: the `Indirect` exit stays in its summary. What it can do is add paths: a block nothing takes is
+compiled (code size), and the function's summary and the regions of its other tables see the paths through it. So each function with guesses is checked
+when the round's summaries are in: if it went from preserving to open, or from returning to not returning, or one of its tables no longer comes out of
+its regions with the guesses' edges in the CFG (`TablesHold`, which derives each table again as `Verify` does: a guess that enters another table's
+region from outside it, or carries an index past that table's compare into it, would make that table's switch take a default the analysis says is
+never taken), its guesses are withdrawn for good. The lifter refuses a function with an opcode it does not lower: measured, none.
+
+**Regions with a `br`'s cases** (`jumptable.cpp` `CaseEdges`, round 6's latent defect): the region lifter lowered a `br` left to the dispatcher as an
+exit although the slice holds the blocks its `Edge::Table` edges (round 6's miss cases, now the guesses) enter. Those blocks were unreachable in the
+region's IR, and LazyValueInfo took a value they carry back round a loop for none: `main+0x2eea24`'s index came out as its first value alone, a table of
+one entry. Such a `br` is now lowered as the pack lowers it, a switch over its cases whose default leaves the region, and the cases are in the region's key.
+
+**Why not the speculative roots.** `Function::speculative` and `spec_live` are code whose entry discovery does not know: the summaries enter them with
+nothing known and the optimistic regions leave them out. A guess is the opposite, an entry from the `br` with the `br`'s state; the walk follows it from
+the `br`, so a case that was a speculative root stops being one and the summaries see it entered from the `br`. `tentative` is a table that closes the
+function once verified; a guess never closes it. The guesses reuse the optimistic regions (as a tentative table is found) and `Verify`'s derivation
+(`TablesHold`).
+
+**The analysis cache** (format 3, [src/build/analysis_cache.cpp](src/build/analysis_cache.cpp)) now holds a function's PLT stubs bound to the module
+(`FnFacts::bound`) and its cases: format 2 left both out, so a warm repack lowered a bound stub's `br` through the dispatcher, recorded no binding and
+listed no case. The unit key's format is 11 (a `br`'s guesses are in the key with its tables).
+
+**Measured** on Mario vs. Donkey Kong in the clone of its NSP folder: discovery of the three modules (`sdk` and `subsdk0` with the host's bindings,
+`main` has none) and their first packs (balanced, tier W, 6 workers), round 6's nxaot (the tip's) against this one:
+
+| | `sdk` | `subsdk0` | `main` |
+|---|---:|---:|---:|
+| functions; preserving / open / noreturn | 40,296; 17,482 / 22,324 / 490, unchanged | 14,003; 3,806 / 9,849 / 348, unchanged | 70,733; 23,361 / 47,193 / 179, unchanged |
+| jump tables | 673, unchanged | 327, unchanged | 647 -> 653 (6 `br`s of `main+0x71cf9c` bounded once their cases are in their regions) |
+| `br`s with guesses (functions, targets) | 29 (25, 208) | 11 (11, 72) | 28 (26, 329) |
+| guesses withdrawn | 0 | 0 | 0 |
+| discovery, s (its tables' step) | 11.4 -> 13.5 (2.2 -> 3.3) | 2.4 -> 2.7 (0.5 -> 0.7) | 122.4 -> 128.8 (4.5 -> 7.3) |
+| `.text` of the first pack | 55,035,792 -> 55,241,152 (+0.37 %) | 27,344,608 -> 27,401,952 (+0.21 %) | 166,608,036 -> 166,884,884 (+0.16 %) |
+| functions the lifter refused | 0 -> 0 | 0 -> 0 | 0 -> 0 |
+| pack time, s | 76.2 (266 units from a cache) -> 86.7 (none) | 27.0 (497 cached) -> 40.5 (none) | 377.2 -> 341.7 (none either) |
+
+The packs of the runs below were made before the guess's read of a bounded table stopped at the next data object, with 288 targets in `sdk` and 367 in
+`main` (`sdk+0x48f254` and `main+0x839708` read the next tables, and their functions had 61 and 53 blocks against 24 and 17: garbage cases, none on
+the route); the table's `br`s and `.text` are this nxaot's (a repack without a cache: 92.5, 43.8 and 362.3 s, a shared machine).
+
+Then the same route to level 1-1 on each first pack, from the same save (the profile's per-thread lines):
+
+| | round 6's first pack | this one |
+|---|---:|---:|
+| JIT runs, CPU time, share of the sampled guest CPU time | 2.97 million, 6.09 s of 83.3 s, 7.32 % | 2.67 million, 5.25 s of 79.0 s, 6.64 % |
+| under flush-to-zero | 1.58 s, 1.90 % | 1.54 s, 1.95 % |
+| the three physics workers | 5.44 s | 5.25 s |
+| the main thread, `ModuleSystem` (2), the base processes, `BancModule`, `UpdateTexture` | 0.26, 0.30, 0.04, 0.05, 0.01 s | none |
+| misses | 33 `indirect` (`main` 29, `sdk` 4), `nonlocal` `main+0xa01314`, `fpcr` `sdk+0x5b827c` | `nonlocal` `main+0xa01314`, `fpcr` `sdk+0x5b827c` |
+
+Every case the route reached was a guess. The second pack from that run (`--profile --misses --bind`) had no case left to make: `main`'s miss a
+resume point, `sdk`'s `fpcr` unserved; every first-pack unit it looked up came from the cache (`sdk` 2,651, `subsdk0` 1,226, `main` 6,034), `sdk` 28 s
+and 59.0 MB of `.text`, `subsdk0` 3.5 s and 28.9 MB, `main` 162 s and 196.2 MB. Its run: 0.71 million JIT runs, 2.34 s of 84.9 s, 2.75 % (round 6's
+second pack 3.16 %), 1.74 s of it under flush-to-zero, all on the physics workers; one miss left, `sdk+0x5b827c` (`fpcr`), and none of `main`.
+
+What is left of the first pack's share is the physics workers' flush-to-zero: each job's FP environment scope (`main+0xab9010`) tail-calls `sdk`'s FPCR
+setter (`sdk+0x5b826c`, `msr fpcr`), whose `fpcr` miss runs the job in the JIT; the return that ends it reaches the worker's frame
+(`main+0xa012f4`, a virtual call's return at `main+0xa01314`) as a non-local transfer no native frame takes, and the rest of the worker's loop runs in
+the JIT at its thread's outermost level until the next job. The second pack's resume point at `main+0xa01314` cuts that part; the first pack has none
+(open, for the lead: see the game's note).
+
+**Checked** by CTest `discover` ([tests/test_discover.py](tests/test_discover.py)): a hand-written module with a table whose base a `blr` before its
+compare makes unknown, and one read by an index nothing bounds, each a `guess` row of exactly its cases and still a `br` (none with `--no-guess`); and a
+guess that lands in the region of the function's other table, which would then no longer be derived, withdrawn (no `guess` row, the other table its two
+cases, the function's rows those of a discovery without guesses, `1 functions' guesses withdrawn`). `t_aot_host`'s `guesscase` rows: casecall's loop
+(its base set before a loop that calls an open function, its index unbounded) and a loop whose index is compared right before its table (its base set
+before the loop, which calls through a register): packed with `--no-guess`, the cases run in the JIT (20 runs) and the misses file names them; packed as
+a first pack, no JIT run. `guessbad`: the withdrawn guess's module as a program, both packs the same run, the same JIT runs and misses. `casecall`'s rows,
+which check the misses' path, pack with `--no-guess` (a test option of `nxaot build` and `nxaot discover`, in the analysis cache's key); `cutcall`'s and
+`lrtail`'s brs have no guess (their cases are entries of their own, or the `br` is no table). The corpus's 46 packs (`build_packs.sh`, Linux and Windows)
+are the bytes round 6's nxaot made: no corpus program has a `br` a guess serves (`aot: guessed cases: 0 brs` in each of its 21 build logs). The 4,000-function
+benchmark (`measure_packs.py`, A this nxaot with `--no-guess`, B without; the five corpus programs of "Unbounded brs by form"): identical packs, so not
+run; the benchmark's `.text` 6,268,880 bytes (that section's 6,268,624, before rounds 4 to 6), its pack time 5.77 s and 6.06 s (that section's 6.50 s; one
+build each on a shared machine, load 10 to 14).
+
+## A return no native frame took
+
+After round 7 the first pack of Mario vs. Donkey Kong spent what was left of its JIT time on the three physics workers: 3.18 s after a `nonlocal` miss
+at `main+0xa01314` and 2.06 s under flush-to-zero, of 5.24 s (6.25 % of the route's sampled guest CPU time; [the game's note](../../games/0100B99019412000/README.md#on-linux-the-x86-64-engine)).
+Each job runs inside an FP environment scope: the wrapper (`main+0xc4fc70`, called through a vtable by the worker's `main+0xa012f4`) calls
+`main+0xab9010`, which tail-calls `sdk`'s FPCR setter (`sdk+0x5b826c`, `msr fpcr` with FZ: the `fpcr` miss); the JIT runs the rest under FZ, the
+job and the scope's end, which clears FZ, and the wrapper's return to `main+0xa01314` is the first compiled return it stops at (the JIT stops nowhere
+under another FPCR: `rt/jit.h`). That return is above the SP the JIT was entered with, so it went up as `st->pending`: the wrapper's frame, the
+worker's and every frame above returned at once, none of them waiting at that address, and the thread's outermost level ran the rest of the worker's
+loop in the JIT until the next job. The second pack's resume point at `main+0xa01314` (the `nonlocal` miss) cut it; a first pack has none.
+
+**The rule** ([src/lift/lower_calls.cpp](src/lift/lower_calls.cpp) `FnCall`, after the call site's resume points): a pending transfer whose target is the
+function's own return address (its entry lr), with `st->sp` its entry SP (the SP its caller had at the call) and the packs' FPCR, is that function's
+normal return. The frame clears `pending`, loads the return convention's registers from the block (x0, x1 and the RV v registers) and returns natively
+(`OwnReturn`, one block per LLVM function). The argument, beside the code:
+
+- **The registers**: the block holds the whole register file as the JIT left it at the stop. The caller reloads after the call what the callee writes (its
+  WRITES, FnCall's continuation) from the block, which is current; so nothing is stored, and this frame's host-held values, older than the block's (of
+  before its call), are not. The caller's own host-held values, the registers this function's summary keeps, are right: the JIT ran this function's own
+  guest code to its return, which keeps them as its summary says, as a native return relies on.
+- **The SP identifies the frame**: two frames of one function with the same return address (a recursion) have different entry SPs, the outer one's higher,
+  so only the frame the guest returns from matches. A frame at or below the JIT's own level never matches: the JIT passes a return up only above the SP it
+  was entered with.
+- **Resume points first**: one at the same address would be a block of this function at its own return address with this function's frame SP, and the own
+  return needs the caller's SP: both match only for a function that calls with no frame of its own and recurses with its return address as its resume point,
+  and then either goes on at that address with the block's registers.
+- **The frames in between** (here the setter's, which the scope's tail call left in its place): their pending checks find neither a resume point nor their
+  own return and return at once, writing nothing; their host frames are released by those returns, and nothing of them is live (the JIT ran their guest
+  code).
+- Under another FPCR it does not match, and the transfer goes on up as before.
+
+**The host** ([dm/host/aot_run.c](../../host/aot_run.c) `jit_loop`; `rt/host.cpp` `JitLoop` the same): a return to the native frame the JIT was handed over
+by, under another FPCR than the packs', went up as a pending transfer to every frame (design 3.3's propagation) and the outermost level ran the rest of the
+thread in the JIT (`fpret`'s path: a host function's return there). The JIT now runs on past it, the frame's code under that FPCR (`[RED]` and the miss
+`fpcr`, as before), and the frames above stay; a compiled return it reaches above its SP under the packs' FPCR goes up and the frame it belongs to takes it
+as its own return. The frame at lr is never returned to afterwards (`lr_live`): neither once the JIT ran past it, nor after a run that began under another
+FPCR and did not end at lr, which may have gone through lr without a stop and left that frame's host-held values older than the guest's. Design 3.3 and 11
+say so. Open: a run that begins and ends under the packs' FPCR but changes it in between and passes lr then (the JIT running both `msr`s itself, a setter
+with no standard entry called around a loop) leaves lr live; the JIT gives no signal of it, and nothing here does it.
+
+**Checked** by `t_aot_host`'s rows, a module each the test writes word by word whose FP check (2^-126 times 0.5, zero only when flushed) proves the work
+ran under FZ: `fpframe`, the workers' shape (a loop calls F 16 times, F calls D through a pointer, D sets FZ, checks, clears it and returns): 32 JIT runs,
+no `nonlocal`; round 7's nxaot's pack 64 runs and a `nonlocal` miss at F's call site. `fprec`, a recursion whose frames share their return address: R(0) sets
+FZ, R(1) checks and tail-calls the clearing function, whose return reaches R(2)'s call site with R(1)'s entry SP; R(0)'s frame, the same return address
+and a lower SP, passes it on and R(1)'s takes it: 1 JIT run, no `nonlocal` (round 7: 4 runs and a `nonlocal`). `fprec` with a resume point at that address
+(a `nonlocal` row in a misses file, as a landing pad or a setjmp continuation is one): 1 run, R(1)'s own return before R(2)'s resume point. `fpret` and
+`fpresume`: 2 misses, both `fpcr`, none `nonlocal`. The unit key's format is 12. Since FZ is a run-time state of compiled code ([FZ as a run-time
+state](#fz-as-a-run-time-state)) the rows set round towards zero instead, whose check is 1 + 0.75 ulp rounded down to 1; the counts are the same.
+
+**Measured** on the game's first pack (the bindings of the host's dry run, as a player's), the same route from the same save, round 7's nxaot and host
+against this round's:
+
+| | round 7 | own return |
+|---|---:|---:|
+| JIT fallback, share of the sampled guest CPU time | 6.25 % (5.24 s of 83.8 s, 2.65 million runs) | 2.67 % (2.12 s of 79.1 s, 0.70 million runs) |
+| the three physics workers' JIT time | 2.03, 1.72, 1.49 s | 0.84, 0.69, 0.59 s |
+| of it under FZ | 0.59, 0.50, 0.44 s | 0.62, 0.51, 0.45 s |
+| the workers' CPU time | 4.98, 4.14, 3.78 s | 2.79, 2.32, 2.11 s |
+| misses file | `main+0xa01314` `nonlocal` and `sdk+0x5b827c` `fpcr`, 230,114 entries each | `sdk+0x5b827c` `fpcr` alone, 231,900 |
+| `.text` of `sdk`, `subsdk0`, `main` | 55.24, 27.40, 166.88 MB | 56.32, 27.91, 169.71 MB (+1.95, +1.85, +1.69 %) |
+| pack time (6 workers, a loaded machine) | 90.7, 42.5, 366.1 s | 92.9, 45.3, 362.1 s |
+
+No fault, no stall; the JIT time left is the flush-to-zero sections themselves and the part of each section after FZ is cleared, up to the
+wrapper's return ([FZ as a run-time state](#fz-as-a-run-time-state)). The code it adds is on the pending path: every call site's pending path branches to its
+function's `OwnReturn` block, which keeps the entry SP live to there (a compare per call site on that path cost 2.6 % in `sdk`). The corpus's packs grow 1.3 % in `.text` (1,471,620 to 1,491,024 bytes, up
+to 3.4 % for `fiber-clang` and `sjlj-clang`), and `measure_packs.py` finds the benchmark and five corpus programs within noise (benchmark +0.8 %,
+`int_ops-gcc` -1.3 %, `fp-gcc` -1.1 %).
+
+## The second pack's cached units
+
+`nxaot build --profile` compiles a sampled function at tier H and every other one at tier C in the balanced mode (H+ and H in the max mode:
+"Tiers by profile"). Design 9.3 chose C for the functions the profile never sampled for the pack's time: a pack with a profile compiled every
+function, and C compiles at about twice W's rate ("Phase 5d"). But the profile comes from a game run on the first pack, built without one
+(every function at the mode's tier), and that pack's units sit in the per-function cache: compiling them again at C costs time, and C's code is
+about twice W's and slower (the game's `.text` with a profile was 481 / 169 / 87 MB for `main` / `sdk` / `subsdk0` against 166 / 57 / 28 at W).
+
+**The rule** ([src/build/pack.cpp](src/build/pack.cpp) `FirstPackUnits`, with `--profile` and `--cache`): the units the first pack's tiers make
+(the mode's tier; gap code as `GapTiers` makes it without a profile) are formed, and every one at the mode's tier with no sampled function
+whose key the cache holds keeps that tier: its code comes from the cache, compiled by nothing. Units are groups of neighbours cut by size,
+content and tier changes, so the final tiers' units are checked again: one at the mode's tier the cache does not hold (a sampled neighbour cut
+the group elsewhere) goes back to the profile's tiers, until every such unit hits. The sampled functions and the guarded sites (at H and H+
+only, none in those units) are as before, and so is a pack with no cache or no first pack in it. Logged as `aot: second pack: <n> functions
+(<i> instructions) the profile did not sample keep the first pack's tier W, their units cached (<u> of them in <l> units looked up); the
+others at C`. The test switch `NXAOT_FIRST_PACK_UNITS=0` gives the profile's tiers alone (docs/env_switches.tsv).
+
+**Measured** on Mario vs. Donkey Kong's three modules (balanced, 6 workers, one run each on a machine shared with another agent's container,
+load 6 to 14): the first pack into a cache, then the second pack with the game's profile of round 2 (`<work>/profile/<module>.tsv`, its targets
+beside it, no misses file) from a hard-link copy of that cache each way:
+
+| module | functions kept at W (instructions) | units hit / missed | pack time, the profile's tiers → kept | `.text`, the profile's tiers → kept |
+|---|---:|---:|---:|---:|
+| `sdk` | 36,066 of 40,296 (1,433,980) | 0 / 3,403 → 2,649 / 776 | 40.0 → 11.5 s | 169,566,404 → 61,973,940 |
+| `subsdk0` | 12,126 of 14,003 (826,132) | 0 / 1,424 → 1,220 / 216 | 17.9 → 4.5 s | 87,900,956 → 30,095,868 |
+| `main` | 60,973 of 70,733 (3,578,810) | 0 / 8,432 → 6,146 / 2,458 | 112.4 → 35.7 s | 481,148,560 → 193,957,696 |
+| all three | | | 170.3 → 51.7 s (−70 %) | 738.6 → 286.0 MB (−61 %) |
+
+The first pack's `.text` (tier W everywhere) was 57.5 / 28.1 / 166.7 MB: the second pack now adds the H functions and the units a sampled
+neighbour moved to C (4,230, 1,877 and 9,760 functions). The choice itself (`FirstPackUnits`: the first grouping, a key and a lookup per unit,
+then the final grouping checked) took 3.5, 1.4 and 7.3 s of those times. The corpus's second-pack game (`t_second_pack.py --prebuild`: 10
+functions, 136 instructions, with its misses file and a profile of its largest function): 3 of 6 units from the first pack's cache, `.text`
+13,092 → 10,660 bytes (the first pack's 9,660), 0.27 → 0.24 s. CTest `cache` checks it on the corpus ([tests/test_cache.py](tests/test_cache.py):
+a profile of one function of the changed NRO, the other functions kept at W where their units hit, none with `NXAOT_FIRST_PACK_UNITS=0`).
+
+## Threads and safepoints
+
+**Threads** (design 6.1, 6.5; [src/rt/host.cpp](src/rt/host.cpp)): each guest thread is a host thread (pthreads, an 8 MB native stack, its own
+alternate signal stack), with a state block of its own (64-byte aligned, outside the arena) and, at its first use, a JIT instance. The SVCs, with
+the semantics and result codes of Horizon's kernel, mapped onto one lock and one condition variable (correctness first, as dm/host's
+`hle_thread.c`): CreateThread (0x08: x1 entry, x2 argument, x3 stack top; w1 the handle), StartThread (0x09), ExitThread (0x0A), SleepThread
+(0x0B), CloseHandle (0x16), WaitSynchronization on thread handles (0x18: signalled when the thread exited), ArbitrateLock / ArbitrateUnlock
+(0x1A, 0x1B: the waiters bit 0x40000000, the lock handed to the first waiter), WaitForAddress (0x34: types 0 to 2) and SignalToAddress (0x35:
+types 0 and 1); output lines are serialised. A thread that returns from its entry ends the run (Horizon requires svcExitThread); svcExitProcess on
+any thread, or a failure, stops every other thread at its next poll, SVC, JIT block boundary or wait (the poll byte, `dm_jit_halt`, the condition
+variable), and the run joins them. nxaot_run gives the reference the same SVCs with its threads as contexts on one dynarmic instance, switched round
+robin at a blocking SVC, at svcSleepThread and every 20,000 instructions: a deterministic interleaving.
+
+**The exclusive monitor across threads** (6.5): compiled code keeps the monitor in the thread's block (`st->excl_*`) and stores with a compare-and-
+swap against the value its `ldxr` read (`lock cmpxchg`, `cmpxchg16b` for pairs); the JIT's inline exclusives check dynarmic's monitor for the
+processor and then do `lock cmpxchg` against the value it read on the same memory
+(`dm/third_party/dynarmic/src/dynarmic/backend/x64/emit_x64_memory.cpp.inc:411-500`), so compiled code and the JIT interoperate through the memory
+itself (design 6.5's [A], checked in the emitter); a JIT store also clears other processors' reservations of the address, a compiled one does not,
+which a compare-and-swap does not need.
+
+**Memory ordering** (6.3), what the lifter emits ([src/lift/lifter.cpp](src/lift/lifter.cpp), `LowerMemory`, `LowerContext`) and LLVM 18 makes of
+it on x86-64 (checked with `llc-18` and in the excl pack's assembly):
+
+| ARM | LLVM | x86 |
+|---|---|---|
+| `ldr`, `str` and the other plain accesses | `load volatile`, `store volatile` | `mov` |
+| `ldar*` | `load atomic acquire` (natural alignment) | `mov` |
+| `stlr*` | `store atomic seq_cst` | `xchg` |
+| `ldxr` / `stxr`, `ldaxr` / `stlxr` | `load atomic` monotonic / acquire; `cmpxchg` monotonic / seq_cst | `mov`; `lock cmpxchg` (a full barrier either way) |
+| `ldxp` / `stxp` and the acquire / release pair | `load atomic i128`; `cmpxchg i128` | `lock cmpxchg16b` |
+| `dmb` and `dsb` of every kind | `fence seq_cst` (dynarmic's IR does not keep the option, so `dmb ishld` / `ishst` too) | `mfence` |
+
+Why it is sufficient: x86-TSO reorders only a later load before an earlier store to another address; acquire loads and release stores are
+free under TSO, the one ARM ordering TSO lacks (an `stlr` before a later `ldar`, RCsc) is the store-load one, which `xchg` gives, and `mfence` and
+`lock`-prefixed instructions order everything. The excl program's threaded part runs 25 times natively and 5 times in the JIT per compiler in
+CTest `corpus_threads` ([tests/test_threads.py](tests/test_threads.py)), with real host threads contending on every counter, and 200 times
+natively and 10 times in the JIT per compiler in a longer run (`--runs 200 --jit-runs 10`: 420 runs): every run gives the exact totals.
+
+**Safepoints** (6.2): recompiled code polls `st->poll` (a monotonic atomic byte: `cmpb $0, 856(%r13)` and a branch weighted cold) at the entry of
+every function that calls or tail-calls (every cycle of the call graph passes through one), at every branch to a block at or before its own start
+(every cycle of a function has such an edge: addresses cannot only grow around it) and before a jump-table switch that can branch back. A function
+that neither calls nor loops runs a bounded time and has no poll. The cold path stores the dirty registers (so the block holds the whole register
+file), NZCV only where some path reads it before writing it (a dead NZCV would keep every compare's flags materialised in the loop: the cost went
+from 17.9 % to 4.4 % on int_ops with it), and pc (the block the thread continues at), and calls `nxaot_rt_safepoint` through a preserve_all
+wrapper. `nxaot build --no-safepoints` leaves the polls out (measurements only). The pause protocol is dm/host's `SetThreadActivity`
+(`hle_thread.c`): the requester sets `pause_req` and the poll byte, halts the thread's JIT instance (the JIT polls nothing: `dm_jit_halt` stops it
+at the next block boundary, and dm_jit_run then copies its state to the block), and counts a thread inside an SVC (bit 0 of `svc_state`) as stopped
+at once, the block having been complete when the SVC was entered; such a thread waits at the SVC's exit until the resume. A stopped thread's block
+holds x0..x30, SP, pc, NZCV, v0..v31, FPCR, FPSR and the TLS registers; x0..x8 of a thread stopped inside an SVC may still change as the SVC writes
+its results. The resume clears the requests and the poll bytes and wakes every waiter.
+
+**Polls a loop bounded by a constant does not need** (6.2; [src/lift/lower_calls.cpp](src/lift/lower_calls.cpp), `FnElidePolls`). What 6.2 asks
+of the polls is a bound on how long a thread runs between two safepoints, not a poll on every edge. Measured first, per kind
+(`measure_packs.py --rounds 12 --layouts 3`, the base binary against one with that kind of poll removed: builds for the measurement only,
+unsound; per-layout medians, the load 4 to 20): the entry polls cost nothing measurable (tier W: int_ops-gcc +0.6 %, int_ops-clang −0.9 %,
+switch-gcc +1.5 %, switch-clang −1.0 %, simd 0 and 0, the benchmark −1.1 %; tier H: −1.7 to 0 %), the backward branches' polls are the cost
+(W: switch-gcc −8.2 %, switch-clang −10.6 %, simd-gcc −9.3 %, simd-clang −2.7 %, the benchmark −3.6 %, int_ops ±0.9 %; H: int_ops-gcc
+−29.0 %, int_ops-clang −11.7 %, switch-gcc −6.6 %, switch-clang −9.2 %, simd-gcc −13.2 %, the benchmark +0.2 %: at H a poll also keeps LLVM's
+loop passes from unrolling a loop or computing it away). The entry polls stay, and with them a poll on every cycle of the call graph.
+
+The rule: the branch back to the head h of an innermost natural loop L (no inner loop) that calls nothing but intrinsics and the run time's
+floating-point and AES helpers (no guest code, no host call, no gate) and whose trip count ScalarEvolution bounds by a constant has no poll
+when N × P ≤ 4,096, N the passes through h per entry into L (its constant maximum backedge-taken count plus one) and P the longest path from
+h over L's blocks in lifted-IR operations (cold paths left out, a helper call counted 256, the sum of all of L's blocks when a cycle inside L
+avoids h). Why it keeps the bound (the comment in lower_calls.cpp has it whole): every pass through h but the first comes over a back edge,
+and between two passes no block repeats without a poll (a cycle inside L that avoids h is no natural loop's: it holds a backward branch to
+another block, which keeps its poll), so one entry into L runs at most 4,096 operations without a poll; a cycle through the branch stays in L
+(leaving L it would enter again at h, which a simple cycle passes once), and a cycle that leaves L holds a backward branch the rule does not
+cover (the innermost loop containing h is L itself), which polls: a stretch without a poll enters each such loop at most once and grows by at
+most 4,096 operations there, as straight-line code of that length would. 4,096 operations are about as many x86 instructions, a few thousand
+guest instructions, about a microsecond (a few hundred if every one were a cache miss); the requester (hle_thread.c `SetThreadActivity`) waits
+on a condition variable it checks again every 100 µs and warns after a second, and its own wake-up of the paused thread takes microseconds.
+The lifter decides on a copy of the function: mem2reg, InstCombine (a 32-bit counter kept in a 64-bit register becomes a narrow induction
+variable ScalarEvolution can count) and LoopSimplify (a preheader for every loop, its back edges joined in one empty block), which keep the
+meaning and only split or join edges, so a bound on the copy's runs between polls is one on the function's; then the function itself loses the
+poll (compare, branch, cold path) before the tier's passes. Kept: a loop bounded by a register or by a value loaded from guest memory (no
+constant bound), whose counter changes on some paths only, with back edges that change its counter differently, with a call or an inner loop,
+or over the budget; the polls before jump tables, at transfers between parts and at entries; the spin gates' and observation gates' loops
+(gates are calls). Every poll left is as it was, its cold path storing what the block needs.
+
+At tiers H and H+ only (`fp.elide_polls`, [src/build/pack.cpp](src/build/pack.cpp)). Measured at W as well (the rule at every tier, with the
+polls of backward branches on no cycle left out too, an earlier version): simd-gcc −4.65 %, switch-clang −4.8 %, the benchmark −4.2 % faster
+in every layout, int_ops-gcc +0.8 %, int_ops-clang +1.2 % and switch-gcc +3.0 % slower in every layout. W has no loop passes: what a loop
+loses there is the poll's few instructions, and what LLVM then makes of the rest moved other code: int_ops-clang's `ref_udiv` (64 passes
+around a data-dependent branch, laid out otherwise once the cold path is gone: with that loop's poll kept, int_ops-clang is −0.95 %),
+int_ops-gcc's `ref_udiv` (without the cold path's use of `r - d`, InstCombine turned `select(c, r - d, r)` into `r - select(c, d, 0)`, one
+more operation on the loop's carried path: +4.6 % until the removal was moved after W's passes, +0.8 % then), switch-gcc's `main` (3,000
+instructions: the register allocator spills two more values in the loop around the call at 0x434 once inner loops' cold paths are gone).
+The branches on no cycle (a backward branch to a shared exit, taken once per call) moved switch-clang −4.8 % and switch-gcc +2.2 % with none
+in the hot code (rt_relocate's, rt_check's): layout, not polls; that rule was dropped.
+
+Left out at tier H (`aot: safepoint polls:` in nxaot's log; `NXAOT_POLL_LOG=1` writes the decision for every backward branch, with the trips and
+operations or the reason it is kept): the 4,000-function benchmark 1,099 of its 1,439 backward branches' polls; int_ops-gcc 16 of 169,
+int_ops-clang 3 of 92, switch-gcc 29 of 267, switch-clang 1 of 164, simd-gcc 109 of 292, simd-clang 5 of 94, fnptr-gcc 4 of 137, excl-gcc 4 of 184,
+except-gcc 11 of 232, fiber-gcc 15 of 153, fp-gcc 5 of 222, sjlj-gcc 13 of 144, and 0 or 1 in the other clang builds (clang unrolls such loops in
+the guest code itself). Kept, in the benchmark: 101 with no constant bound (a counter stepped by 2 towards a bound ScalarEvolution cannot prove
+even, a register bound), 97 with at most 2^33 or more trips, 75 in no natural loop (a backward branch to a shared exit), 41 not a branch to their
+loop's head, 14 with inner loops, 4 over the budget, 2 that call (through the dispatcher). The test switch `NXAOT_POLL_ELISION=0` keeps every poll
+(then H's packs are the base's: A / B measurements, bisecting); the unit key's format is `nxaot-unit 6` and holds the switch. The cost at H on the
+benchmark: lifting 3.9 → 7.7 s of CPU (the copies), the pack 21.5 → 23.1 s wall with 4 workers, its peak 267 → 313 MiB.
+
+Measured, the base binary (A) against this one (B) at tier H, `measure_packs.py --rounds 12 --layouts 3 --cpu 7` (the load 16 to 21):
+
+| Program | A | B | change | per layout A / B | `.text` A → B (bytes) | pack time, peak A → B |
+|---|---:|---:|---:|---|---:|---:|
+| int_ops-gcc (`int_ops_rounds = 20`, 20 runs) | 5.024 ms | 5.051 ms | +0.5 % | 5.024, 5.024, 5.024 / 5.045, 5.054, 5.051 ms | 65,580 → 58,412 | 0.96 → 0.95 s, 84 → 83 MiB |
+| int_ops-clang | 5.139 ms | 4.681 ms | −8.9 % | 5.139, 5.140, 5.136 / 4.681, 4.672, 4.688 ms | 55,624 → 55,256 | 0.87 → 0.87 s, 81 → 82 MiB |
+| switch-gcc (1,500 runs) | 137.0 µs | 133.0 µs | −2.9 % | 137, 137, 137 / 133, 133, 133 µs | 368,316 → 359,484 | 1.73 → 1.62 s, 138 → 139 MiB |
+| switch-clang | 109.0 µs | 110.0 µs | +0.9 % | 109, 109, 110 / 110, 109.5, 110 µs | 79,656 → 79,656 | 1.26 → 1.27 s, 90 → 91 MiB |
+| simd-gcc | 38.0 µs | 35.0 µs | −7.9 % | 38, 38, 38 / 35, 35, 35 µs | 128,260 → 90,532 | 1.92 → 1.66 s, 112 → 98 MiB |
+| simd-clang | 34.0 µs | 33.0 µs | −2.9 % | 34, 34, 34 / 33, 33, 33 µs | 105,964 → 105,772 | 1.74 → 1.89 s, 104 → 109 MiB |
+| fnptr-gcc | 6 µs | 6 µs | 0 (1 µs resolution) | | 55,980 → 54,876 | 0.81 → 0.83 s, 77 → 78 MiB |
+| fnptr-clang | | | the same pack | | 48,940 | |
+| benchmark, 4,000 functions (300 runs) | 688.0 µs | 689.5 µs | +0.2 % | 687, 695.5, 688 / 689.5, 685, 695.5 µs | 6,315,824 → 6,288,080 | 22.65 → 24.14 s, 264 → 308 MiB |
+
+Faster in every layout: int_ops-clang, switch-gcc, simd-gcc, simd-clang (int_ops-clang's `ref_udiv`, `ref_rbit64` and `ref_ror` and
+simd's 16-pass checks unrolled once their polls are gone). Within a percent either way, which a pack's layout alone moves ("The sample
+profile at tier H": 1 to 3 %; see W above for what such moves are made of): int_ops-gcc +0.5 % in every layout, switch-clang +0.9 % in two
+of three, the benchmark +0.2 % in two of three (its short loops of 3 to 22 passes gain nothing at H, as without every backward poll: +0.2 %).
+The rule with the branches on no cycle left out too measured int_ops-gcc −0.7 %, int_ops-clang −12.2 %, switch-gcc −0.7 %, switch-clang
+−3.2 %, simd as here and the benchmark +1.1 % at H: the same order, other programs moved by layout.
+
+**The polls rows** (CTest `t_aot_host`, dm/host/tests/t_aot_host.c `polls_rows`, written in the manner of `lrtail_nro`): an NRO written word by
+word whose start runs five shapes in turn, forever: (0) a loop of 2^17 passes around an inner loop of 100 (the inner loop's poll left out), (1) a
+loop of 2^18 calls of a leaf whose loop of 50 passes has none (the calling loop keeps its own; the leaf, which calls nothing, has no entry poll),
+and three that look bounded and must keep theirs, each with a store to guest memory per pass so that nothing computes it away and 2^28 passes, a
+quarter of a second or more: (2) bounded by a register (loaded from data), (3) a counter that goes up on one path through the body and back down on
+the other, (4) two back edges, one leaving the counter as it was. Packed at H twice (the polls left out, and with `NXAOT_POLL_ELISION=0`), nxaot's
+counts checked (exactly the two loops left out, 10 backward branches); each run under a tester thread that pauses the main thread at random
+intervals of 10 to 100 µs until every shape has been stopped in 100 times, measuring for each pause the main thread's CPU time from the request to
+its stop (what a missing poll makes long, and what the machine's load changes little: a vCPU the hypervisor takes away still counts) and the wall
+time, the stop's pc naming the shape; then svcExitProcess, which the main thread obeys at its next poll. Required: every shape stopped in 100
+times, no inconsistent context, the worst CPU time under 50 ms. In CTest (the `DM_AOT_ARENA_CHECK=1` run, the load 16 to 22): with the polls left
+out 4,887 pauses, every shape stopped in 100 to 1,961 times, the median CPU time from request to stop 3 to 5 µs in every shape and the worst 81 µs
+(6.6 ms wall); with every poll 3,948 pauses, medians 4 to 5 µs, the worst 354 µs (2.0 ms wall); in two other runs the worst went to 0.73 and 1.88
+ms of CPU time (a vCPU the hypervisor took away). An nxaot that skips the trip-count check (an unsound build, for this check only) leaves out a
+third poll, the register-bound loop's: the counts fail the row, and its run stops that shape 0 times and one pause 138 ms of CPU time late.
+
+**The pause test** (CTest `safepoints`, [tests/test_safepoints.py](tests/test_safepoints.py); `nxaot_host --pause-test N`, in the manner of
+dm/host's `tests/t_preempt.c`): a host thread beside the guest's stops every guest thread N times at random intervals while more than one runs,
+reads every state block while the world is stopped, checks it (pc a guest instruction, SP in the arena and 16-byte aligned at a poll, and at the
+head of [corpus/rt/pause.S](corpus/rt/pause.S)'s loop the register invariant x20 = 2 × x19, x21 = ~x19, which a block written back incompletely or
+from another moment than its pc breaks), and resumes them. excl runs so with 50 pauses, 6 seeds natively and 2 in the JIT, per compiler: 800
+pauses, about 760 invariant checks, no inconsistent block, the output unchanged.
+
+**What dm/host provides** for the integration (`dm/host/aot_*.c`, [dm/host/aot.h](../../host/aot.h); built by dm/host/CMakeLists.txt only, where
+`DM_NATIVE_EXEC` is 0), item by item against the signatures this run time defines (include/nxaot/aot_module.h, src/rt/jit.h); CTest `t_aot_host`
+(dm/host/tests/t_aot_host.c) runs the corpus through it, packed by [tests/build_packs.sh](tests/build_packs.sh):
+
+- **done**: the arena allocator (5.2; aot_arena.c `dm_guest_reserve`, `dm_guest_alloc`, `dm_guest_free`: 256 GiB at 2^36 through the platform
+  layer's new `plat_vm_reserve_at`, the host-function page first, then the stub page) and the module loader's mapping into it (loader.c:
+  `loader_add_image` for an image as it is, an NRO, and `load_modules` for a game's modules from their manifests: "A game module in the host" below;
+  text readable and never executable);
+  `*desc->base` written per module (`dm_aot_pack_load`, after the identity checks of 9.4). hle_svc.c's guest block (heap, alias and stack
+  regions), thread.c's TLS blocks and thread-local regions (into the block's `tpidr_el0` / `tpidrro_el0`), GetInfo's user exception context and
+  the main thread's guest stack live in the arena. **Open**: NVN's virtual pools (`hle_nvn.c`) and Unreal's heap (`hle_uemalloc.c`), still host
+  memory;
+- **done**: `dm_aot_svc` (aot_run.c): `svc_dispatch(n, st->x, ...)` between `thr_svc_enter` / `thr_svc_leave` on the block; svcExitProcess
+  stops the process (every guest thread leaves at its next poll, SVC or kernel wait, hle_thread.c `thr_stop_all`);
+- **done**: `nxaot_rt_dispatch`: the lookup table of the pack whose image holds the target, bound in the call site's inline cache when that pack
+  is the caller's or records the same standard-entry signature, convention and mode (ABI 3: a cross-pack call then goes to the other pack's
+  standard entry directly from the next call on, counted in `dm_aot_stats_t.cross_pack`), the host-function page through `jit_entry` (the
+  target in `st->pc`, and `nxaot_rt_jit` runs the slot's thunk, `dm_aot_hostcall`), a pack of another signature through `jit_entry` and that
+  pack's `enter` (`cross_pack_handovers`: none with nxaot's packs), `jit_entry` with `NXAOT_TRAP_JIT_MISS` for the rest. **Open**: the packs are
+  scanned in order (FINAL FANTASY X/X-2 has 1,432 NROs: a sorted index then);
+- **done**: `nxaot_rt_gate` (aot_run.c): the site's gate of the calling pack's descriptor (the return address names the pack), `dm_aot_gate` at
+  its guest address (hle.c `gate_dispatch`: the observer on the block's registers, or the spin wait's back-off as an SVC frame, where a pause
+  stops the thread with its whole register file in the block), then a process stop leaves; counted (`obs_gates`, `spin_gates`);
+- **done**: `nxaot_rt_trap`, `nxaot_rt_jit` (`Host::JitLoop` in C), `nxaot_rt_safepoint` (hle_thread.c `thr_safepoint`: SetThreadActivity's
+  pause wait), `dm_aot_cntpct` (`guest_ns() * 12 / 625` after `guest_clock_read_wait`, as svcGetSystemTick and the counter gate);
+- **done**: `dm_guest_call` on top of `enter`, with the outermost level of `Host::RunGuest`; the outermost call on a thread is the base it leaves
+  through (ExitThread, a process stop, a trap, a fault). loader.c's `run_module_inits` calls DT_INIT through it. **Open**: the other places the
+  host calls guest code as a C function (main.c's start sequence, hle_ro.c's init and fini, hle_guestthread.c's host-created threads, whose
+  entry is a host function and needs a slot);
+- **done**: thread creation (hle_thread.c's x86-64 form: an 8 MB native stack, the state block made when the thread starts, its alternate signal
+  stack, a JIT instance at first use); SetThreadActivity (0x32) setting the poll byte and halting the JIT instance; GetThreadContext3 (0x33)
+  filling `hz_ctx_t` from the block. The host's pause test found that SetThreadActivity's resume does not clear `paused`: a thread paused inside
+  an SVC and resumed before the SVC returns leaves through `thr_svc_leave`'s fast path with it set, and its next pause, while it runs guest code,
+  returns at once with the thread still running (before the fix none of 150 pauses stopped a thread at a poll; after it, 130 to 200 stops at
+  polls). Fixed for x86-64 (the resume clears it, under `!DM_NATIVE_EXEC`); Apple's code has the same path (there GetThreadContext3 then returns a
+  zeroed context), and its one-statement fix waits for a Mac test;
+- **done**: the dirty-tracking fault hook (5.4) ahead of dynarmic's fastmem handler (aot_fault.c, the portable host's fault handling where crash.c
+  is Apple's: installed at start, installed again in front of dynarmic's after its first instance, chaining to it for faults the hooks leave); a
+  fault in compiled code or in the JIT's memory callbacks is reported at its guest instruction (the line table, 3.5) and stops the process
+  (status 4). Windows: a vectored exception handler that redirects a guest fault to an ordinary frame, written and not run;
+- **done**: MXCSR at every entry into compiled code (the module's FPCR). **Open**: `aot_fpcr` per profile (the host takes the first pack's FPCR, and
+  a pack specialised for another gets a [RED] line), the cumulative FPSR flags compiled code keeps in MXCSR across a JIT hand-over (cleared there,
+  as in nxaot_host);
+- **done**: the floating-point helpers of src/lift/runtime.h in C (dm/host/aot_fp.c: the functions of dynarmic's common/fp and common/crypto that
+  runtime.cpp wraps, ported, since the host's build image has no C++ library or Boost), checked against runtime.cpp by dm/host/tests/aot_fp_diff.sh
+  (in this image; CI runs it): 8,391,100 cases (every half-precision operand of the unary operations, round to integral and the conversions from
+  half under ten FPCR values; 300,000 random cases per operation), 0 mismatches; two deliberate mutations of the port gave 47,233 and 95,648.
+
+The corpus in the host (CTest `t_aot_host`, each run a child process whose lines are hle_svc.c's `[guest]` lines of svcOutputDebugString;
+docker/README.md, "The recompiled corpus in the host"): built without the JIT fallback (the nxnative-build image), 13 of the 18 NROs print their
+expected lines and exit 0, and fp-gcc, fp-clang, fiber-gcc, fiber-clang and except-gcc stop with status 3 and a [RED] line naming the address
+(fp at its `msr fpcr`, fiber at its first continuation, except-gcc at the opcode switch of rt/unwind.c); with it (`NXHOST_JIT`, this image) all 18
+do, entering the JIT at as many addresses as nxaot_host does ("The JIT fallback": fp 8 and 9, fiber 29 and 54, except-gcc 5). excl's threads: 6 runs
+per compiler, exact totals, 4 guest threads on hle_thread.c (56 to about 25,000 SVCs a run: the mutex handoff's convoy of "Measurements"). The pause
+test: 3 seeds of 50 pauses per compiler, 130 to 200 stops at polls and 130 to 140 register-invariant checks per compiler, 0 inconsistent blocks. A
+host call: fnptr's `hidden_ptr` set to a host function's slot, the program's check passes through it. Dirty pages (protected again every 0.5 ms):
+int_ops 1 write fault a run, excl from 4 to 634, all stores of compiled code; with the JIT, fiber's pages also take stores of JIT code (0 to 5 a run
+outside compiled code, none inside the JIT's memory callbacks). `t_aot_host` takes 3 to 5 s. Found by the pause rows under CPU load (one of excl's 35
+lines missing, status 0, 50 threaded pauses, 0 inconsistent: 11 of 300 runs of the pause child beside a `ctest -j6` of the Vulkan tests): not the pause
+but the host's log. dm.h's `LOG` wrote a line in two calls, `fprintf` and `fputc('\n')`, each a write on unbuffered stderr, and the main thread's
+`[guest]` line landed between them in the tester's `[dm] SetThreadActivity ... (ok)` line (its first four calls are logged), where the capture,
+which takes lines that start with `[guest] `, lost it. `LOG` is now one call on Linux and Windows (0 of 500 under the same load; Apple keeps its two
+calls, the same race, until a Mac test: docs/reference/threads.md, "Log lines of two threads spliced together"); the log-lines row checks it
+(20,000 lines from each of two threads: 19 of 20 runs spliced lines before, 0 of 120 after), and a failing row names its first differing line and a
+spliced one.
+
+## A game module in the host
+
+What a game's module needs from dm/host on x86-64 beside the run time above, written and checked without a game (phase 4's first half; CTest
+`t_aot_module`, `t_guest_map`):
+
+- **The input.** The modules' folder the host is given holds, per module, the manifest and behaviour image `patch_nso.py --aot` wrote ("Game modules"
+  above) and the pack nxaot built from them: `<name>.aot.tsv`, `<name>.image.bin`, `<name>.aot.so` (`.aot.dll` on Windows; aot.h
+  `DM_AOT_PACK_SUFFIX`). For a game that folder is `<NSP folder>/<id>_build/aot_<version>/`, beside Apple's `patched_<version>/`; the per-function cache
+  of design 13 stays in the work folder (`<id>-work/aot-cache/`). The image is decompressed already: the rewriter reads the NSO's LZ4, as it does for
+  Apple's `patched.bin`, so the host has no LZ4 and the pack and the manifest name the same bytes.
+- **The loader** (dm/host/loader.c, "The game-module path"; x86-64's `load_modules`, under `!DM_NATIVE_EXEC`: Apple's is unchanged): every row of the
+  manifest checked as nxaot's reader checks it; the image's size, layout and SHA-256 against the manifest (a mismatch stops the load with a [RED]
+  line naming both hashes); the image mapped one to one in the arena as `loader_add_image` maps one (text readable and never executable, the rest
+  readable and writable, bss zero); the build ID into `module_t.build_id`, as fixups.tsv's on Apple, so `dm_main_build` and per-build behaviour
+  work; the aux row's state page as the frame step's (`dm_fps_state`); every module mapped and parsed before any is relocated, as on Apple; then
+  each pack loaded with the identity of its image (`dm_aot_load_module_pack`: a pack of another image is refused with both hashes). NROs listed in
+  `nro.tsv` are not mapped on this path yet (a [RED] line; `ro::LoadModule` then finds none).
+- **Imports in the GOT** (design 2.4; aot_arena.c `dm_aot_bind`, called at the end of loader.c's `bind_sym`, so `relocate` and the NRO rebinds
+  take it): for a module in the arena, a host function (an HLE, HLE_FORCE or NVN entry) binds to its slot of the host-function page, and an import
+  nothing implements to the slot of its named stub in a stub page after it (4096 slots, as hle.c's `MAX_STUB`; `unimpl_stubs` is only their
+  identities here). A compiled `blr` through the GOT misses the inline cache and goes through `nxaot_rt_dispatch` and `jit_entry` to the slot's
+  thunk, or to hle.c's `unimpl_c` (the `UNIMPL` line once, 0 in x0, as Apple's stub). A host function with no thunk stops the load with a [RED] line
+  naming the import: hle_table.c's libc passthrough has none yet (it binds only where no module defines the symbol). Modules outside the arena
+  (the unit tests' hand-made images) keep the host addresses Apple binds.
+- **Observation gates and spin waits** (the manifest's `obs` and `spin` rows): registered in hle.c's gate table at the guest address of the observed
+  instruction and of each valid back-edge, with the number and parameter or the head Apple's `gates.tsv` gives, and dispatched by `dm_aot_gate(st,
+  pc)` (aot_run.c: `gate_dispatch` over the block's registers, which an observer may change), which the pack's code reaches through
+  `nxaot_rt_gate` ("Calls and returns", Gates). Once the pack is loaded, load_modules checks the manifest's rows against the gate sites its
+  descriptor lists (aot_arena.c `dm_aot_pack_check_gates`): a site no row names refuses the pack (one of another manifest), a row the pack does not
+  serve (no discovered function holds it; nxaot build says so too) is a [RED] line each, its observer or back-off not running; then
+  `aot: <module>: N gates (... observation gates, ... spin wait back-edges) called by its pack, M not`.
+- **The frame step's aux region**: the stubs run as compiled code of the functions whose sites branch to them ("Calls and returns", The aux
+  region), reading and writing the state page at `FPS_STATE_OFF` as on Apple.
+- **Guest memory and the graphics backend** (hle_svc.c, docs/design/vulkan-backend.md 4.2): SetHeapSize growing, MapMemory's destination and
+  MapPhysicalMemory call `be_guest_map` with the host range they opened, after opening it; SetHeapSize shrinking and UnmapPhysicalMemory call
+  `be_guest_unmap` with the range they are about to close, while it is still accessible, so an import of it goes first. UnmapMemory leaves its pages
+  accessible and calls neither; a request that changes nothing calls neither. Apple's `nvn_be.h` has them as empty inline functions and the SVCs
+  do not call them there. `t_guest_map` (28 checks) records every call through a stub backend on t_svc_memory's small layout.
+
+`t_aot_module` ([dm/host/tests/t_aot_module.c](../../host/tests/t_aot_module.c)) runs the synthetic module of [aot_synth.py](../tests/aot_synth.py)
+through this path, packed by [tests/build_packs.sh](tests/build_packs.sh) into `<packs>/module`: 30 checks in the run (the GOT's two slots, the
+relocated pointer, the image's permissions, the build ID, the state page, both gates through `dm_aot_gate`, the pack's gate sites, then `dm_aot_run`
+from the entry: the host function through the GOT and the dispatcher, the stub, SetHeapSize reaching `be_guest_map` with the heap's range, both x18
+jump tables, the exclusive window, the spin wait, the observed function twice, the cut function, the frame step's function through its stub, a
+relocated pointer, OutputDebugString and ExitProcess, with `results[]` as expected), and the pack's own gate calls: the observer runs before the
+observed instruction with x0 (41, then 1), x19 and x30 as the guest has them there and the row's parameter, and the x0 + 1000 it writes is what the
+instruction reads (results 1042 and 1002); the spin wait's flag is 0 for the run, so the loop spins, its back-edge reaching the host's back-off
+(hundreds to thousands of times) until a host thread sets the flag after three; the frame step's stub ran once (it counts at state +0x30). Then 7
+checks in the parent: the loader's gate line, the fault probe (its pointer set to the arena's first page: the report must say `guest instruction
+main+0xc8`, the probe's load, exactly), and two refusals (an image that is not its manifest's, the pack of another image), each with a [RED] line
+naming both SHA-256s. It shows the input path, the binding and the gates on a module made for the purpose: not a real NSO, not a game's size, imports,
+observers or spin waits.
+
+## Windows packs
+
+```sh
+build/aot/nxaot build dm/tools/aot/corpus/nro/fnptr-gcc.nro --target windows --shared /tmp/x/fnptr-gcc.dll     # the DLL the Windows host loads
+build/aot/nxaot build dm/tools/aot/corpus/nro/fnptr-gcc.nro --target windows -o /tmp/x/fnptr-gcc.obj           # and / or the module's COFF object
+build/aot/nxaot lines /tmp/x/fnptr-gcc.dll dm/tools/aot/corpus/nro/fnptr-gcc.nro                                # its line table, as for a shared object
+```
+
+`--target windows` ([src/build/pack.cpp](src/build/pack.cpp), "Windows packs"; [src/build/coff.cpp](src/build/coff.cpp)) makes the pack of the
+Windows host: a DLL, `<name>.aot.dll` beside a game's manifest (dm/host/aot.h `DM_AOT_PACK_SUFFIX`), which dm/host's loader opens with `LoadLibraryW`
+(aot_arena.c). `--target linux` is the default; a `--shared` name ending in `.dll` without `--target windows` is a usage error. `nxaot build` logs
+`aot: windows: <n> imports bound by the host (nxaot_imports): <names>; COFF object <s> sections, <y> symbol records, <r> relocations` and
+`aot: windows: unwind info for <N> of <M> functions, <K> not describable: <reasons>; <L> without CFI, which Windows unwinds as leaf functions:
+<names>; <E> RUNTIME_FUNCTION entries, <S> functions in several (a stretch with a frame of its own): <why> (<count>), ...`.
+
+- **The code is a Linux pack's.** The units are compiled as a Linux pack's are, for the Linux triple into ELF objects, with the same conventions
+  (swifttailcc or ghccc), state block, inline caches, line marks, gate sites, split parts and groups of phase 5b. The Windows triple
+  (`x86_64-pc-windows-gnu`) does not do with LLVM 18: its swifttailcc assigns arguments as Win64's C convention does (four in registers, the 128-bit v
+  registers by reference), and a `musttail` call to a prototype with more stack arguments stops code generation (llc on two such functions: `LLVM
+  ERROR: Can't handle guaranteed tail call under win64 yet`, in prologue insertion); and `!pcsections`, the line marks, has no COFF section
+  (`AsmPrinter::emitPCSections` switches to a null section and crashes), so the line table could not be written.
+- **What differs is the host's boundary**, the host being a Windows program: every call of a run-time entry (include/nxaot/aot_module.h, the
+  floating-point helpers of src/lift/runtime.h) and `enter`, which the host calls, take the Win64 C convention (`win64cc`: rcx, rdx, r8, r9 and a
+  32-byte home area; rsi, rdi and xmm6 to xmm15 preserved, so `enter` saves them around the guest code); and no function uses SysV's red zone, the 128
+  bytes below rsp, because Windows writes a fault's exception record and context below the faulting rsp on the same stack and the dirty tracker resumes
+  after such faults (design 5.4). A Windows unit's cache key says so (`host`), and a Linux pack is byte for byte what it was.
+- **The link**: the objects (the tables', the units', lines.o and imports.o) are joined by `ld.lld -r`, which keeps one copy of each comdat group
+  (phase 5b's NaN helpers: six in fp-gcc's DLL, six in its shared object), converted into one AMD64 COFF object by coff.cpp (code to `.text`; read-only
+  data and `.data.rel.ro`, which only relocation writes, to `.rdata`; `.data`; `.bss`; the DWARF sections under their names, discardable;
+  `.eh_frame`, the line marks, notes and groups dropped; R_X86_64_PC32 and PLT32 to REL32 with the addend + 4 written in place, R_X86_64_64 to
+  ADDR64, DWARF's R_X86_64_32 to SECREL; any other relocation, a TLS section or an initializer array fails the build, naming it; the unwind
+  information below as `.xdata` and `.pdata`), and linked by
+  lld's COFF driver as a library (`lld-link /dll /noentry /nodefaultlib /noimplib /Brepro /opt:noref /opt:noicf /debug:dwarf`, the export of
+  `nxaot_module` and `nxaot_imports` as data): a PE32+ DLL for x86-64 with no entry point and no import, a base relocation for every absolute
+  pointer (the descriptor's, the inline caches' first descriptor, the import table's), the DWARF line table as a MinGW program keeps it (the line =
+  guest offset of section 9.2).
+- **Imports are bound by the host**, not by the PE loader: a PE import names one module, and one pack is loaded by `nxhost-run.exe` and by the test
+  programs that link the engine (`t_aot_host.exe`, `t_aot_module.exe`, `t_aot_hostfn.exe`), as a Linux pack's undefined symbols resolve against
+  whatever executable loads it. imports.o, made once every unit is compiled, gives each run-time entry the objects call a hidden thunk of its name,
+  `jmp *nxaot.imp.<name>(%rip)` (a PLT entry's instruction: the units' call sites stay a Linux pack's `call`), and its slot, and exports the table
+  `nxaot_imports` ({name, slot} per entry, sorted, then {0, 0}; aot_module.h), which dm/host's loader binds against the loading program's exports
+  (`GetProcAddress` on its own module, the `DM_AOT_EXPORT` entries) before any of the pack's code runs, refusing the pack, naming the entry, when one
+  is missing. The build fails, naming them, when the objects call anything else: `--cpu x86-64` (no SSE4.1) makes LLVM call libm's `ceil`, `floor`,
+  `rint`, `roundeven` and `trunc` for fp-gcc, which a Linux pack takes from the process's libm and a Windows pack cannot (SysV calls; the host
+  exports none of them). The descriptor's ABI is unchanged (3).
+- **Where it loads**: anywhere `LoadLibraryW` puts it. The arena below 2^39 (design 5.2) holds what the guest can see, and the guest never holds a
+  native address of a pack: return and pc-built addresses are `*base` + module offset, inline caches and their descriptors are not guest data, the
+  dispatcher maps guest addresses to entries; the pack reaches the arena through 64-bit addresses and the host through its slots, never through a
+  32-bit displacement.
+- **Unwind information** (coff.cpp, "Unwind information"): `.eh_frame`'s CFI and the code's prologues become Win64's `.pdata` and `.xdata`
+  (Microsoft's "x64 exception handling"), so that Windows debuggers, profilers and `RtlVirtualUnwind` walk through a pack's frames; the host needs
+  none of it (it leaves guest code with `__builtin_longjmp` and handles faults in a vectored handler, which runs before any unwinding). Each
+  function's instructions are decoded (LLVM's x86 disassembler): its prologue's push, sub of rsp, frame pointer set from rsp and saves of
+  general and xmm registers give its UNWIND_INFO (`UWOP_PUSH_NONVOL`, `UWOP_ALLOC_SMALL` / `_LARGE`, `UWOP_SET_FPREG`, `UWOP_SAVE_NONVOL`,
+  `UWOP_SAVE_XMM128`), checked against the CFI where the prologue ends; past it the CFI and the instructions give each instruction's frame. The
+  SysV code compiled here has shapes Win64's compilers never emit, which one UNWIND_INFO cannot express, and those functions get one
+  RUNTIME_FUNCTION per stretch with a frame of its own, each describing its stretch exactly (no chained information is needed: phase 5b's split
+  parts have prologues of their own, and no FDE starts inside a frame). On the corpus's 18 packs and the synthetic modules' three every function
+  with CFI is described, none is left out: 1,684 of the corpus's 1,798 functions (4,948 RUNTIME_FUNCTIONs) and 80 of the synthetic modules' 97
+  (387); the others, 114 and 17, have no CFI: the import thunks (`jmp *` through a slot, which Windows unwinds as the leaf functions they are). 13
+  to 24 functions a corpus pack (4 to 7 a synthetic one) take several entries, for: a
+  frame set up after the function's start (shrink-wrapping); arguments pushed for a call in the body; a callee that pops its arguments
+  (swifttailcc: the CFI's row at the return address is the state after the pop, while Windows unwinds through the call with the arguments still
+  on the stack, so the instruction there takes the call's description); epilogues `RtlVirtualUnwind` does not recognise by their bytes
+  (`vzeroupper` after the pops, swifttailcc's add of its tail-call area after them, a store before a tail call, an indirect tail jump without
+  REX.W, a jmp to an address inside the function), whose states are followed instruction by instruction (swifttailcc's epilogue frees its
+  tail-call area after its pops, which LLVM's CFI does not say). Left out, counted by reason, would be a CFA on another register than rsp or rbp,
+  a CFI rule other than "saved at CFA + n", a frame pointer set before the frame's last push (SysV's `push %rbp; mov %rsp, %rbp`; Win64 sets it
+  last) and a function whose CFI starts inside a frame: none occurs here. The one inexact place is the instruction right after a call whose
+  callee popped its arguments, when a sample interrupts it there (described for unwinding through the call).
+- **Deterministic**: the same DLL with one worker and with eight, through a cache, in another folder; a DLL of another file name differs in its
+  export directory's name and the hash `/Brepro` derives its time stamp from (71 bytes for fp-gcc), as a shared object's soname differs.
+
+CTest `pack_windows` ([tests/test_pack_windows.py](tests/test_pack_windows.py)) packs switch-gcc (its jump tables, `sw_word` in 21 parts at the
+default limit), fp-gcc (the floating-point helpers, the NaN helpers' comdat groups), sjlj-gcc (tail calls that pop their own stack arguments), the
+synthetic module (gate sites, the aux region) and the host-function module's two, each as a shared object and as a DLL, and checks each DLL with
+llvm-readobj, llvm-objdump, llvm-dwarfdump and small PE and ELF readers: a
+PE32+ DLL for AMD64 with dynamic base and NX, no entry point, no import descriptor or delay import; exactly the two exports; the descriptor (ABI,
+flags, name, SHA-256, sizes, entry, FPCR, the standard entries' signature, every count) and the module-side columns of its tables (function map,
+lookup table, returns, gate sites) equal to the shared object's; `nxaot_imports` naming exactly the shared object's undefined symbols, each a
+`DM_AOT_EXPORT` or `FPEXPORT` entry of dm/host, each slot 8 zero bytes of writable data and each thunk a `jmp` through its slot; a base relocation at
+every pointer of the descriptor and of the import table; `nxaot lines` with no bad entry; every function of both packs disassembled and compared
+instruction by instruction (rip-relative displacements and branch targets out of the function normalized, the raw bytes compared elsewhere) and the
+line table's run of every function whose code is the same equal; the unwind information: `llvm-readobj --unwind` reading every
+RUNTIME_FUNCTION without a warning (as many as the exception directory and nxaot's log count), every UNWIND_INFO parsing, the entries sorted,
+disjoint and tiling every described function from its start to its last instruction's end (the function map's bodies among them), and at every call
+of the functions whose code is the shared object's (330 in switch-gcc, 203 in fp-gcc, 157 in sjlj-gcc, 20 in the synthetic modules) the codes of
+the entry holding the return address, run as `RtlVirtualUnwind` runs them, giving the return address and saved registers the shared object's CFI
+gives at the call; the same DLL with one worker in another folder; fp-gcc for `--cpu x86-64` refused naming libm's functions; a `.dll` without
+`--target windows` a usage error. What differs, by the test's comparison:
+
+| Module | Functions (bodies, entries, parts, the tables' code) | Identical | At the host's boundary | By the red zone | DLL / shared object bytes |
+|---|---:|---:|---:|---:|---:|
+| switch-gcc | 149 | 118 (24,489 instructions) | 11 | 20 (`sw_word`'s parts, leaves) | 673,792 / 673,760 |
+| fp-gcc | 69 | 54 (9,342 instructions) | 15 | 0 | 108,032 / 106,744 |
+| synthetic module | 24 | 17 | 7 | 0 | |
+| host-function module, main / sub | 39 / 15 | 26 / 10 | 13 / 5 | 0 | |
+
+At the host's boundary: the wrappers of the slow paths and `jit_entry` (their calls of the run time), `enter`, and the functions that call `dm_aot_svc`,
+`nxaot_rt_trap`, `nxaot_rt_jit` or a floating-point helper directly: the arguments in rcx and rdx instead of rdi and rsi, the home area in the frame
+(`subq $0x28, %rsp` for a `pushq %rax`), and what follows from it (branch offsets, a register chosen otherwise). By the red zone: leaf functions whose
+frame grows by the 128 bytes they kept below rsp (`sw_word`'s parts: `subq $0x1c8, %rsp` for `subq $0x148, %rsp`). The DLLs are about the size
+of the shared objects: no `.eh_frame`, dynamic symbol table, PLT or GOT, but `.pdata` and `.xdata` (switch-gcc: 426 RUNTIME_FUNCTIONs, 5,112 bytes
+of `.pdata`); their code is larger by the home areas, the red zones' frames and the thunks (switch-gcc: `.text` 370,886 bytes against 369,308). Nothing here has loaded a DLL: there is no Windows (or Wine) on the development machine. The
+owner's Windows runner (dm/host/tests/run_win64_tests.ps1) runs `t_aot_host`, `t_aot_module`, `t_aot_hostfn` and `t_host_program` on the DLLs
+[tests/build_packs.sh](tests/build_packs.sh) writes into `<out>/win64` ([docker/README.md](../../../docker/README.md#the-recompiled-corpus-in-the-host)).
+The Windows host has the JIT fallback (dynarmic built by llvm-mingw, Boost from [dm/third_party/boost](../../third_party/boost/VENDOR.md)), so there too
+all 18 corpus programs are expected to run to their output, fp and fiber through the JIT; its fault path on Windows (dynarmic's
+frame-based handler behind the host's vectored one, dm/host/aot_fault.c) is written, not run.
+
+## Floating point and SIMD
+
+Design sections 7.1 to 7.4, as lowered here.
+
+- **FPCR is a compile-time specialisation, except FZ (7.1).** `LiftOptions::fpcr` names the FPCR a region is compiled for; only AHP, DN, RMode and
+  FZ16 count (`kFpcrSpecMask`; dynarmic's location descriptor keeps those and FZ, `kFpcrModeMask`), and FZ is a run-time state of the same code
+  (`LiftOptions::fz_runtime`, [FZ as a run-time state](#fz-as-a-run-time-state)). Guest code runs with the MXCSR of the thread's FPCR
+  (`lift::GuestMxcsr`: RMode as the rounding control, FZ as FTZ and DAZ, every exception masked), which the host sets on every way into compiled code
+  and nxaot_vec sets around each run; lifted functions never load MXCSR themselves, but `msr fpcr`. LLVM is told the rounding mode through
+  constrained intrinsics with that static mode, so that nothing is folded in another mode, and `"denormal-fp-math"="dynamic"`. Chosen over a
+  `ldmxcsr` / `stmxcsr` pair at every function entry and exit: the pair costs tens of cycles per call and serialises, and every function of a module
+  shares one specialisation anyway; with round to nearest and the flags unmodelled the operations are plain LLVM ones and optimise freely. `msr fpcr`
+  writes `st->fpcr` and the new mode bits into MXCSR, and its block leaves the function when the new value differs from the specialisation in those
+  bits, for the dispatcher to continue in code compiled for the new value (the JIT of section 11; nxaot_vec lifts a continuation); FZ alone goes on.
+- **FPSR (7.4).** `LiftOptions::fpsr_flags` models the cumulative exception flags exactly: the function is `strictfp` and every floating-point
+  operation is a constrained intrinsic with strict exception behaviour (none removed, speculated or folded). Native operations raise their flags in
+  MXCSR, which `mrs fpsr` and the host's gate read (`lift::FpsrFromMxcsr`); operations lowered in integers raise none of their own and add the Arm
+  bits explicitly (conversions to integers: IOC, IXC; FZ: IDC per flushed operand); the helpers OR theirs into `st->fpsr`. QC is a flag of the
+  function stored at exit, from every saturating operation, scalar or vector, as dynarmic ORs `fpsr_qc`. A pack sets `fpsr_flags` for modules where
+  the census finds an FPSR read (`answer.fpsr_read`), as decision 5 says; nxaot_vec always sets it.
+- **NaN chains (7.3).** The P operations (add, subtract, multiply, divide, square root, fused multiply-add with FMA3 (`FzMulAddFix` under FZ), negate, absolute
+  value, single / double conversions, pairwise add; scalar and vector) are chain nodes (`ChainNode`): the native result, and how to rebuild the Arm
+  result from the operands' exact values. A use outside the chain (a register write that survives the block, a store, an integer or another
+  floating-point operation that keeps NaN bits) takes the node's escaped value: one NaN check (`ucomiss` / `vcmpunordps` and a branch weighted
+  cold); when it fires, a cold block recomputes the chain from its inputs with Arm's rules (`FPProcessNaNs`, the fused multiply-add's default NaN
+  and IOC for a quiet NaN addend with infinity times zero, FPCR.DN) in integer operations. With FPCR.DN an arithmetic node escapes branch-free (the
+  default NaN where the fast value is a NaN), except a chain that holds a fused multiply-add when the flags are modelled: x86 raises nothing for
+  that invalid case (known issue 16), so it takes the check and the cold block. Compares and conversions to integer read fast values directly. Chains span instructions because the lifter
+  forwards vector registers within a block (`ForwardVectorRegisters`, as dynarmic's get/set elimination does) and drops a write the block
+  overwrites. `NaNMode::PerOp` checks every operation instead (dynarmic's way, the reference of the measurements; CTest `vectors_perop` runs the
+  scalar and sequence vectors with it); `NaNMode::Unchecked` is inexact and exists only for measuring.
+- **The operations of rows 4 to 11 have their own exact lowering**, with quiet compares only so that quiet NaNs raise nothing: FMAX / FMIN
+  (AND / OR of equal operands, NaN rules), FMAXNM / FMINNM (a single quiet NaN loses), FMULX (0 times infinity is 2.0), FRECPS / FRSQRTS (FMA3,
+  and in the lanes where dynarmic runs its software step, a NaN or near infinity, that step's result inline: [The estimates and steps
+  inline](#the-estimates-and-steps-inline)), rounding to integral (roundss without Inexact, ties away from zero by an exact trunc-and-compare
+  sequence, FRINTX by `rint`), conversions to integer and fixed point (in double precision, saturation and NaN by compares and selects, IOC / IXC
+  computed; ties away included), from integer (one rounding in the current mode, unsigned 64-bit values halved with a sticky bit). FRECPE and
+  FRSQRTE of single and double precision are the Arm ARM's tables inline for normal operands and zeros (the same section). The other estimate
+  lanes, FRECPX, half-precision arithmetic, FZ fused multiply-add results of +-(smallest normal) and conversions in a mode other than FPCR's or
+  with AHP / FZ16 call the run-time helpers. F16C converts halves.
+- **Integer SIMD** is generic LLVM vector IR (shuffles, `smax` / `sadd.sat` and friends, widening and narrowing, `pshufb` per register for TBL /
+  TBX, table lookups for URECPE / URSQRTE); polynomial multiplication is PCLMULQDQ for PMULL 1Q or a shift-and-XOR sequence.
+- **Cryptography:** AESE / AESD as AESENCLAST / AESDECLAST with a zero key, AESMC as AESDECLAST then AESENC, AESIMC; SHA256H / H2 / SU0 / SU1 with
+  SHA-NI in dynarmic's register arrangement; SHA-1 is generic IR (dynarmic's frontend expands it); SM4's S-box is a table. Without AES-NI the
+  helpers, without SHA the lifter runs dynarmic's SHA-256 polyfill on the block first, without PCLMULQDQ the generic sequence. `Target` holds what the
+  target CPU has (`Jit::TargetFeatures`); x86-64-v3 is the baseline (FMA3, F16C, AVX2), and AES-NI, SHA and PCLMULQDQ are outside it.
+- **64-bit vector forms (2S):** when an operation's only uses keep the low 64 bits, a division divides 1.0 by 1.0 in the upper lanes and the
+  estimates skip them, so that the zero upper lanes raise nothing (`LowHalfOnly`; known issue 15).
+
+What is not done: the slow path of design 7.2 row 13 for add / subtract / multiply / divide / square root under FZ (they follow dynarmic, see the
+end of "Known issues"); the half-precision estimates and steps are scalar helper calls per lane; one combined check for all the escapes of a block
+(four checks of a 4x4 matrix multiply cost about 1.4 ns of its 5 per iteration).
+
+### FZ as a run-time state
+
+One set of code runs under both values of FPCR.FZ (design 7.1): FZ is MXCSR's FTZ and DAZ, which `msr fpcr` sets in compiled code and the host
+sets on every way in (dm/host/aot_run.c, the MXCSR invariant), plus a test of `st->fpcr` where a lowering depends on FZ itself; every check whether code
+may run under the FPCR of the moment leaves FZ out (`kFpcrSpecMask`: entries, resume points, a function's own return, `msr fpcr`, the JIT's stops,
+the host's `module_mode`). Chosen over a second set of code specialised for FZ, and over FP-free functions entered natively under any FPCR, for
+what ran under FZ on Mario vs. Donkey Kong's physics workers ([A return no native frame took](#a-return-no-native-frame-took)), and because it serves
+a first pack, which has no profile to name the functions a second set would need. The pack ABI is 4 (include/nxaot/aot_module.h): a host of ABI 3
+would run such code under FZ without the MXCSR invariant, and a host of ABI 4 would enter an ABI 3 pack, specialised for FZ clear, under FZ; each
+refuses the other's packs, which the bundle's message says to repack. The unit key format was 13 (14 since [the estimates and steps
+inline](#the-estimates-and-steps-inline)).
+
+- **What ran under FZ there** (round 8's first pack, the route of [A return no native frame took](#a-return-no-native-frame-took); a scratch host
+  recorded each profile sample in the JIT fallback, mapped through dynarmic's perf map, `PERF_BUILDID_DIR`, to its block and FPCR and through
+  `nxaot discover` to its function): 233,780 sections, 701,340 JIT runs, 2.18 s. Of the 1,615 samples in the JIT, 772 fell outside any block
+  (dynarmic's dispatcher and translation, the host's callbacks: the cost of a run, about 3 runs per section) and 829 in blocks under FZ: 92.8 % of
+  those in functions with no FPCR-dependent instruction at all (job and lock code: `sdk+0x131804`, `sdk+0x131734`, `main+0x481c18`,
+  `main+0xa01194`, ...; 142 such functions sampled), 98.4 % in functions with none of the instructions listed below as differing under FZ. A
+  second set of code or FP-free functions entered natively would have left each section's start and end in the JIT; one set of code right under FZ
+  leaves none of it there.
+
+- **dynarmic** sets FTZ and DAZ from FZ (`A64JitState::SetFpcr`), but it too translates a block per FPCR (the FPCR is in its location descriptor and
+  `msr fpcr` ends the block), and its emitter branches on FZ at translation time: the operands of FMAX / FMIN (and the NM forms) and of the vector
+  compares are flushed explicitly (`DenormalsAreZero`), a fused multiply-add result of +-(smallest normal) is computed again by the software FPMulAdd
+  (x86 flushes after rounding, Arm before), FRSQRTE's fast path changes its bounds, and its soft float, which every fallback runs, flushes inputs
+  (`FPUnpack`, IDC), tiny results (`FPRound`) and FRECPE's tiny inputs.
+- **The lowerings that test FZ at run time** (`lift::FzFamily`, src/lift/lower_fp.cpp; `FzNow` loads `st->fpcr`'s bit, `FpcrArg` gives the helpers
+  the specialisation with FZ of the moment): `minmax`, the FMAX / FMIN family's operands flushed (`MinMax`, a select each); `muladd`, a fused
+  multiply-add's result of +-(smallest normal) computed again by the software FPMulAdd under FZ (`FzMulAddFix`: a compare and a branch weighted cold
+  per FMADD / FMLA, as dynarmic's check, the cold part a call of `nxaot.fzfma.<type>`, preserve_all and defined once per pack as the NaN helpers are:
+  a helper call in place made the register allocator spill around it), and the invalid case's zero (`MulAddInvalid`, a denormal counts as zero);
+  `steps`, when FRECPS / FRSQRTS has a lane dynarmic gives to its software step (a NaN, or near infinity), IDC for a denormal operand of any lane and
+  FRSQRTS's lanes at the top given to the helper with the FPCR of the moment (since round 10: [the estimates and steps
+  inline](#the-estimates-and-steps-inline));
+  `helpers`, every run-time helper given it (the estimates' lanes the tables do not take, FRECPX, FCVTXN's round to odd, the roundings and
+  conversions the helpers do); `idc`, IDC for the operands of the roundings and conversions lowered in integers when the
+  flags are modelled, where dynarmic's software paths raise it (`InputDenormal`: the operands' test in a block of its own under FZ, which ORs IDC into
+  `st->fpsr` itself, so that code never run under FZ raises no flag of its own and keeps no FPSR flush). The operations dynarmic computes natively
+  (arithmetic, fused multiply-add, FMULX, compares, FMAX / FMIN, the steps' fast lanes, the pairwise add) raise no IDC under FZ, as dynarmic and so the
+  JIT fallback raise none (known issue 12; `NativeInputDenormal` raises it only with FZ specialised): the test at every such operation of `sdk`, whose
+  flags are modelled, was 2 MB of its 58 MB of code; `compare`, the vector compares' operands flushed: DAZ would do it for `cmpps`, but LLVM folds a compare
+  with zero into a test of the bits (`fcmeq #0.0` became `(x & ~sign) == 0`, `"dynamic"` or not), which sees a denormal as no zero. No family is left
+  to the JIT: the plan's guard (a block with such an instruction run in the JIT under FZ) was not needed once each family had its run-time lowering,
+  and it is not in the code.
+- **The vectors prove them** (nxaot_vec lifts each vector as a pack does, one function for both values of FZ, and runs it under the vector's FPCR
+  and MXCSR). CTest `vectors_fz` (the 30,917 vectors whose FPCR has FZ, 32,399 since round 10's `fp_est`, the flags modelled and compared, as `sdk`'s
+  pack has them) and `vectors_fz_noflags` (not modelled, as `main`'s): 0 mismatches against dynarmic under FZ, and the FPSR differences that known
+  dynarmic issues explain fewer than with FZ specialised (1,044 vectors against `--fz-specialised`'s 2,272: issue 12 explains 230, from 1,509, since the native
+  operations raise no IDC of their own now; a vector it explained first before and that differs by another issue as well counts under that one). The negative controls, which must show mismatches:
+  `vectors_fz_off_<family>` (`--fz-off <family>`, that family's test left out) `minmax` 125, `muladd` 18, `steps` 12, `helpers` 68, `idc` 70, `compare`
+  5 (without the flags modelled, where LLVM folds: `vectors_fz_noflags` found them); and
+  `vectors_fz_clear` (`--lift-fpcr-clear 1000000`, code specialised for FZ clear run under FZ) 293. Every other instruction (arithmetic, compares,
+  conversions, rounding, integer SIMD, crypto) is right under FZ with MXCSR alone.
+- **LLVM** is told `"denormal-fp-math"="dynamic"` (LLVM 17 on): neither mode holds, so nothing is folded for one. The corpus's FP and SIMD programs
+  (gcc and clang) and the benchmark packed to the same bytes with it as with `"ieee"` (round 8's experiment).
+- **`msr fpcr`** whose new value differs from the specialisation only in FZ sets MXCSR and the code goes on; DN, RMode, AHP and FZ16 stay
+  specialisations: the NaN chains are built for one DN, RMode is the constrained intrinsics' static rounding (a dynamic one needs `strictfp` in
+  every function), and the half-precision forms are helpers or F16C by AHP and FZ16. A change of those leaves the function for the JIT, as before.
+- **The host** (dm/host/aot_run.c, the MXCSR invariant; `rt/host.cpp`, nxaot_host, the same): compiled code runs with FTZ and DAZ equal to
+  `st->fpcr`'s FZ, the host's C code with them clear. Into compiled code: `native_call`, `run_guest` and the return of `nxaot_rt_jit` set MXCSR from
+  `st->fpcr`, and compiled code's own `msr fpcr`; out of it, `dm_aot_svc`, `nxaot_rt_jit` (the JIT driver, its host calls and SVCs), `nxaot_rt_gate`,
+  `nxaot_rt_safepoint`, `dm_aot_cntpct` and `nxaot_rt_trap` clear FTZ and DAZ when FZ is set and set them again before the code goes on (a test of
+  the block's FPCR when FZ is clear), and a compiled entry's return into the JIT driver clears them. The JIT keeps its own (dynarmic loads its MXCSR
+  from its FPCR and puts back the caller's around its callbacks); the run-time helpers (integer arithmetic) and the dispatcher keep the guest's.
+  Checked by t_aot_host's `fzsec` rows: a flush-to-zero section in compiled code that calls FP-free code, FP code of the families above, a host
+  function doing float work (`t_aot_fz_host`: 2^-126 * 0.5 and 2^-127 * 2, which need FTZ and DAZ clear), a poll's safepoint path, and a function
+  that clears FZ and returns: PASS with no JIT run, and the same with every instruction in the JIT (`DM_AOT_JIT_ALL`). Without the switch at
+  `nxaot_rt_jit` the host function's products flush and the row fails. Without the JIT (`-DNXHOST_JIT=OFF`) the row runs the same: an FZ section
+  needs no JIT.
+- **Measured** on Mario vs. Donkey Kong's first pack (the bindings of the host's dry run), the same route from the same save: no JIT run at all
+  (round 8: 2.67 % of the sampled guest CPU time, 0.70 million runs, 2.12 s, all from the workers' `msr fpcr`), no misses file, no `[RED] aot` line;
+  `.text` `sdk` 56.43 MB, `subsdk0` 27.92 MB, `main` 171.79 MB (+0.21, +0.02, +1.23 %: the FMA fix-up's compare and branch in `main`, which has 2,673
+  of them; in place, with the helper call in the hot code, `main` grew 2.4 %, and the IDC test of every native operation 2 MB of `sdk`); the corpus's
+  18 program packs 1,437,028 -> 1,480,656 bytes of `.text` (+3.0 %; `fp-clang` the most, +8.6 %: the run-time tests of the families above and the
+  out-of-line FMA fix-up, about 2 KB a pack). Run time, `measure_packs.py` with this nxaot built with FZ specialised (A) against it as committed (B),
+  5 rounds, 2 layouts, on a machine under load 7 to 8 (another agent's runs), so with wide noise: bench +3.7 % (noise 22 %), fp-gcc +1.4 % (5 %),
+  fp-clang -0.6 % (5 %), simd-gcc +11.0 % (18 %; a 45 us program), simd-clang +3.8 % (19 %): every program within its noise, none shown faster or
+  slower. Measured again in round 10 when the machine was quieter, A a build of 99e58a3b's sources with `LiftOptions::fz_runtime` false by default
+  (its 46 corpus packs, Linux and Windows, byte for byte those of round 9's A, whose build is not in its scripts) and B the tip, load 1.20 at the
+  start and 4.80 at the end (another agent's runs began during it): bench +2.6 % (noise 28.5 %), fp-gcc +1.9 % (7.6 %), fp-clang -0.7 % (25.1 %),
+  simd-gcc +6.5 % (12.2 %), simd-clang +3.8 % (9.8 %); a first attempt, load 1.98 to 7.63: -14.4 % (44.5 %), -1.2 % (8.6 %), +0.5 % (14.0 %),
+  -1.1 % (18.9 %), -5.8 % (12.2 %). Every program within its noise in both, as on the loaded machine: the corpus shows no cost of FZ's run-time
+  tests, and is too short and noisy to bound one below some 8 to 25 %.
+
+### The estimates and steps inline
+
+FRECPE and FRSQRTE of single and double precision are the Arm ARM's table lookups in the code, and FRECPS and FRSQRTS fix inline the lanes dynarmic
+gives to its software step (design 7.2 rows 9 and 10); the run-time helpers are left the lanes neither takes. Until round 10 every estimate lane was a
+helper call, and a step with one special lane called the helper for all of its lanes.
+
+- **What reached the helpers** on Mario vs. Donkey Kong (round 9's first pack, the route to level 1-1 from the same save, 30 s of level play
+  between two `profmark`s; a scratch host counted each helper call by its call site, the operands' classes and the thread, the call sites mapped to
+  guest instructions by the packs' positions): 32.2 million calls, 99.9 % on `Thread_0` (`AudioFrame` the rest), all but 976 from one `sdk`
+  function, `sdk+0x2231c0`, an audio limiter: an envelope follower over 15-bit fixed-point samples (`scvtf #15`, `fabs`, `fcmgt`, `bsl`), then the
+  gain as the reciprocal of the envelope by `frecpe` and two `frecps` steps, once a sample at 48 kHz, in a 2S and a 4S form. In silence the envelope
+  is 0:
+
+  | helper | guest form (sites) | operands | calls in 30 s | why the helper |
+  |---|---|---|---:|---|
+  | FRECPS | `frecps v.4s` (2) | 0 and +infinity | 11,706,960 | infinity times zero is a NaN in FMA3, so all four lanes went to the software step |
+  | FRECPS | `frecps v.2s` (2) | 0 and +infinity; 0 and 0 | 5,853,154; 5,853,120 | the same, and the zero upper lanes with them |
+  | FRECPE | `frecpe v.4s` (1) | +0 | 5,853,360 | every lane a call |
+  | FRECPE | `frecpe v.2s` (1) | +0 | 2,926,560 | every lane a call |
+  | FRECPE, FRSQRTE | `frecpe v.4s` (5, `main`), `frsqrte v.4s` (1) | normal | 976 | every lane a call |
+
+  No other helper ran in the window: no fused multiply-add fix-up, rounding or conversion. Over the whole session (start to the second mark)
+  `sdk`'s FRECPE and FRECPS made 384 million calls, `main`'s estimates 11,320. The host's profile of the same window (round 9's code, the tip
+  host): `Thread_0` 2,016 samples, 679 of them (33.7 %) in dm/host/aot_fp.c (`unpack_base` 296, `step_fused_op` 157, `nxaot_rt_fp_unary` 87,
+  `nxaot_rt_fp_binary` 66, `round_base` 57, `fused_mul_add` 16); no other host function above 2 % of the thread but the guests' wake-ups
+  (`pthread_cond_signal`, 90, 4.5 %).
+- **FRECPE / FRSQRTE** (`FunctionLifter::Estimate`, scalar and every vector arrangement): Arm's `FPRecipEstimate` / `FPRSqrtEstimate` take for a
+  normal operand an 8-bit estimate from a table (`RecipEstimate` of 256 plus the top 8 fraction bits; `RecipSqrtEstimate` of 128 plus the top 7
+  bits when the biased exponent E is odd, of 256 plus the top 8 when it is even) and an exponent from E alone: `2 * bias - 1 - E` for FRECPE,
+  `(3 * bias - 1 - E) / 2` rounded down for FRSQRTE. The lowering keeps the two tables as constants of the unit (`nxaot.frecpe.table`, 256 bytes;
+  `nxaot.frsqrte.table`, 512, indexed by E's low bit and the 8 fraction bits), built from dynarmic's `Common::RecipEstimate` /
+  `RecipSqrtEstimate` as URECPE's are, looks each lane up and composes the result with integer operations. Inline: an operand whose estimate is a
+  table's, that is a normal operand of either sign with E up to `2 * bias - 2` (FRECPE; above it the estimate is denormal, or zero under FZ) or a
+  positive normal one (FRSQRTE), and a zero (the infinity of its sign, Divide by Zero raised when the flags are modelled). The helper, given the FPCR
+  of the moment: NaNs, infinities, denormals, FRSQRTE's negative operands and FRECPE's top exponents. Those lanes go out of line: one branch for
+  the vector, then a call of `nxaot.fplanes.<which>.<type>` (`LanesFunction`), preserve_all, noinline and cold as `nxaot.fzfma`, which calls the
+  helper for each lane of a mask, so that no C call in place makes the register allocator spill around it; each unit that needs one defines its
+  own linkonce_odr copy in a comdat and the link keeps one (defined in every pack's tables' object, as the NaN helpers are, the twelve forms added
+  5.4 KB to every corpus pack, most of which have no estimate). The inline lanes are the same under both values of FZ (`FPUnpack` flushes only
+  denormals, which go to the helper) and raise no other flag. The 64-bit forms still compute two lanes only (`LowHalfOnly`).
+- **FRECPS / FRSQRTS** (`StepFused`, `StepSpecial`): the fast path is as before, FMA3 and a test of the lanes dynarmic gives to its software step
+  (a NaN result; for FRSQRTS an exponent at the top). When one is, the lowering gives each lane the software step's result itself: infinity times
+  zero (a NaN of no NaN operand; under FZ a denormal times infinity is one through DAZ, as `FPUnpack` flushes it), 2.0 or 1.5, one blend; a NaN
+  operand, `FPProcessNaNs` of (-a, b); an infinite operand, the native infinity; FRSQRTS's other lanes at the top (an overflow, which the halving
+  before rounding may bring back, or in a directed rounding mode the largest normal in its place), the helper through `nxaot.fplanes`; every other
+  lane the native result, which equals the software's because `2 - a * b` and `3 - a * b` of finite operands are 0 or at least 2^-48 of the
+  operands' scale, never tiny, so neither FZ's flush before rounding nor the halving after it changes them. dynarmic's software step unpacks
+  every lane's operands, so with the flags modelled the lowering raises IDC for a denormal operand of any lane when FZ is set at the moment (the
+  `steps` family of [FZ as a run-time state](#fz-as-a-run-time-state)). The NaN operands, that IDC and FRSQRTS's overflow lanes are parts of their
+  own behind a branch weighted cold, so that infinity times zero, the case the game runs, is a compare, a branch and the blend: with the NaN rules
+  and the IDC test in line (the round's first form) the special lanes' block was about 60 instructions, and the limiter's six estimate and step
+  instructions took twice the compiled time they take now (below). The native FMA's Invalid Operation for infinity times zero stays, as in dynarmic,
+  which computes it before its fallback too.
+- **The proof** is the vectors against dynarmic. `fp_est.tsv.gz` (3,756 vectors, gen_fp_simd.py `gen_estimates`): every entry of both tables
+  (FRECPE's 256 fraction prefixes with random signs and exponents, FRSQRTE's 256 for each parity of E) in every form (scalar S and D, 2S, 4S, 2D)
+  under each of FZ clear and set and DN clear and set, in other lane positions under each, eight instructions a vector (1,248 vectors); the
+  edges (signed zeros, infinities, quiet and signalling NaNs of both signs, the smallest and largest denormals, denormals FRECPE overflows or
+  estimates as denormal, the smallest and largest normals, FRECPE's last table exponent and the two above it, negative normals, 1.0) between normal
+  lanes under those FPCRs and the three directed rounding modes, and once more one instruction a vector so that the final FPSR is one instruction's (1,248); and the steps'
+  special lanes (infinity times zero of both orders and signs, a denormal factor, NaNs in either operand, infinite operands, products that overflow,
+  FRSQRTS's intermediate overflowing where its halved result does not, exact zeros, Newton steps of normal values, each between normal lanes and next
+  to denormal ones; 1,260). CTest: `vectors` 183,052 vectors, `vectors_perop` 20,856, `vectors_fz` and `vectors_fz_noflags` 32,399 each: 0
+  mismatches. Its first run found FRSQRTS's directed-rounding case (the largest normal halved where Arm rounds the halved overflow back to it); it
+  goes to the helper now. The negative controls: `vectors_estimate_fault` (`--estimate-fault 300`: entry 44 of FRECPE's table and 300 of FRSQRTE's
+  changed by one bit) 45 mismatches; `vectors_fz_off_steps` 92 (without the IDC of the special lanes) and `vectors_fz_off_helpers` 215 (round 9:
+  12 and 68, before `fp_est`). The unit key format is 14 (src/build/pack.cpp): units of format 13 call the helpers.
+- **Measured** on the game, the same route from the same save with the same host binary (the tip's), first packs with the bindings of the host's
+  dry run, 30 s of level play between two `profmark`s at 1,000 Hz, on a machine under load 17 to 20 (another agent's runs) in both windows:
+
+  | `Thread_0`, samples in the window | all | compiled code | host calls and SVCs | elsewhere in the host | in dm/host/aot_fp.c |
+  |---|---:|---:|---:|---:|---:|
+  | round 9's packs | 2,016 | 1,049 | 253 | 714 | 679 (33.7 %) |
+  | round 10's packs | 1,747 (-13.3 %) | 1,430 | 258 | 59 | 0 |
+  | the round's first form (the NaN rules and the IDC test in line) | 1,705 | 1,441 | 213 | 51 | 0 |
+
+  The windows' totals move with the machine's load; the profile's samples by guest instruction say more: the limiter's six estimate and step
+  instructions took 542 samples of compiled code over the session with round 9's packs (their helpers' time apart), 1,432 in the first form, 733
+  now. The helpers ran
+  no call in the window. The route: no fault, no stall, no `[RED] aot` line, 0 JIT runs. `.text` `sdk` 56,434,576 -> 56,436,192 bytes, `subsdk0`
+  27,915,296 unchanged, `main` 171,794,212 -> 171,941,332 (+0.09 %; with the helpers' lanes as calls in place, 174,157,604, +1.38 %: the spills
+  around them); pack times 91, 44 and 372 s (cold cache, 6 workers, load 6 to 12; round 9: 94, 42 and 400 s under load 7 to 8). The corpus: of the
+  23 packs of build_packs.sh only fp-gcc, fp-clang, simd-gcc and simd-clang change, Linux and Windows alike (their `.text` +4,376, +4,192,
+  +1,056 and +936 bytes: the inline lookups and the `nxaot.fplanes` copies they use), and run each estimate and step a few times only:
+  `measure_packs.py` (A the tip's nxaot, B this round's, 5 rounds, 2 layouts) under load 7.6 to 9.6 (another agent's runs) fp-gcc -1.6 % (noise
+  5.6 %), fp-clang +1.0 % (6.8 %), simd-gcc -1.1 % (8.8 %), simd-clang -1.2 % (14.8 %), the benchmark's packs identical, and again at load 4.8
+  to 7.4: -2.5 % (10.0 %), +3.4 % (4.8 %), +2.0 % (19.5 %), -2.2 % (11.9 %): each within its noise (the round's first form, at load 1.4 to
+  2.1: +2.7, +0.7, 0.0 and 0.0 %, within noise too).
+
+## Measurements
+
+`nxaot_bench` on the development machine (Intel Core i9-13950HX, LLVM's `alderlake`, 2,000,000 iterations, best of 5, Docker): ns per iteration of
+each kernel's loop, and the x86 instructions of one iteration lifted alone, all of them and the hot ones (the blocks a run takes when no value is a
+NaN). Timings vary by about 10 % from run to run on this machine.
+
+| Kernel | Mode | ns / iteration | x86 instructions | hot |
+|---|---|---:|---:|---:|
+| 4x4 matrix multiply (`ld1` x 2, 4 x (`fmul` + 3 `fmla` by element), `st1`) | chains | 5.2 | 1,118 | 91 |
+| | per operation | 9.5 | 2,651 | 149 |
+| | unchecked | 3.7 | 63 | 63 |
+| 8 dependent `fmla v0.4s` | chains | 13.8 | 267 | 23 |
+| | per operation | 14.4 | 1,288 | 56 |
+| | unchecked | 14.0 | 16 | 16 |
+| 4 `fmadd s` + `fadd` + `fmul` + `str s` | chains | 7.9 | 581 | 41 |
+| | per operation | 7.6 | 879 | 45 |
+| | unchecked | 6.6 | 22 | 22 |
+
+The chain checks cost 40 % of the matrix multiply (four escaping 4-lane results, one `vcmpunordps` / `vmovmskps` / `test` / `jne` each, and the
+spills the cold recomputation causes), nothing measurable in a long dependent `fmla` chain (one check per eight operations), and 19 % in the scalar
+loop; checking every operation instead costs 2.6 times the unchecked matrix multiply. The cold blocks are most of the code size. With the flags
+modelled (strict floating point) the times are within the noise of these. dynarmic's JIT runs the same loops at 70 to 90 ns per iteration, but its
+memory goes through callbacks here (no fastmem), so that number is no comparison of the backends.
+
+Section 6.4 (each guest memory access one x86 instruction): the kernel `ldr q8, [x0, #16]; str q8, [x1, #32]; ldp q9, q10, [x0, #32]; ld1 {v12.4s,
+v13.4s}, [x1]; st1 {v12.s}[2], [x2]; ldr d14, [x0, #24]; str s14, [x1, #20]` (`3dc00408 3d800828 ad412809 4c40a82c 4d00804c fd400c0e bd00142e`) makes
+nine guest accesses (the pair and the two-register `ld1` two each), and its lifted function nine x86 memory instructions: `vmovups 16(%rax)`,
+`vmovups %xmm0, 32(%rcx)`, `vmovups 32(%rax)`, `vmovups 48(%rax)`, `vmovups (%rcx)`, `vmovups 16(%rcx)`, `vextractps $2, %xmm3, (%rdx)`,
+`movq 24(%rax)`, `movl %eax, 20(%rcx)` (`nxaot_bench --asm`; the other instructions are the state block's loads and stores).
+
+The big sweep (`gen_vectors.py --count 1000000 --seed S --classes C --seeds-per-word 20 | nxaot_vec --batch 1024 -`, once per class, four or
+five processes at a time), vectors, mismatches, FPSR differences of known issues (by issue number), seconds: `fp` 1,000,000, 0, 65,727 (8: 26,903,
+9: 26,338, 10: 1,380, 11: 620, 12: 10,486), 255; `simd_same` 1,000,000, 0, 17,311 (11: 36, 12: 12,990, 13: 2,961, 15: 1,324), 265; `simd_misc`
+1,000,000, 0, 70,847 (8: 21,313, 9: 28,873, 10: 2,172, 12: 8,310, 14: 7,334, 15: 2,845), 250; `simd_shift` 1,000,000, 0, 18,055 (9: 17,133,
+12: 922), 226; `simd_perm` 1,000,000, 0, 7,866 (11: 453, 12: 7,413), 262; `crypto` 1,000,000, 0, 0, 289; `simd_ldst` 1,000,000, 0, 0, 897.
+Between 21 % and 38 % of the vectors of the data-processing classes are undefined encodings (the field sweep includes the reserved values),
+which both executors must agree on. `fp_seq` did not complete: its first run found the FMA bug of known issue 16 (vector 28,302 of seed 1008)
+and was stopped for the fix; the second ended without a result (its container was removed from outside the run). The first run of
+`simd_ldst` found that the generator left `sp`-based addresses at the seed's random `sp`, which can lie within 256 bytes of the image's ends
+(both executors faulted on the same address); the generator now sets `sp` as it sets other base registers. `simd_misc`, `simd_shift` and
+`crypto` ran before the FMA fix, which does not reach them.
+
+### Phase 1: calls, the dispatcher, a jump table, throughput
+
+`nxaot_bench --sections calls,dispatch,spills,int_ops,pack` on the same machine (Intel Core i9-13950HX, LLVM's `alderlake`, Docker, Linux without a
+GPU), every module built by `nxaot build` into a shared object and run by the native run time; synthetic programs of x3 = 20,000,000 iterations,
+best of 5. The TSC runs at 2.419 GHz (the cores turbo well above it: a TSC cycle is about two core cycles here). In the W rows every guest function
+is kept out of line (`noinline`), so that a call is a call; the H+ rows are built as the max mode builds (LLVM inlines the leaf and the tail chain:
+0). ns per operation, minus the baseline's time per iteration (the loop alone, 0.03 ns: LLVM unrolls its doubling), divided by the operations per
+iteration; blr_hit against the direct call, blr_miss against blr_hit.
+
+| Program | swifttail W | ghc W | swifttail H+ | ghc H+ | What one operation is |
+|---|---:|---:|---:|---:|---|
+| leaf | 2.22 ns, 5.4 cycles | 2.23 ns, 5.4 | 0 (inlined) | 0 | `bl` to `add x0, x0, x0; ret`: a call and a return |
+| chain8 | 2.58 ns, 6.2 | 2.23 ns, 5.4 | 1.34 ns, 3.2 | 1.20 ns, 2.9 | one of 8 nested calls, each function with a frame record (`stp` / `ldp x29, x30`) |
+| saved | 3.55 ns, 8.6 | 3.75 ns, 9.1 | 1.95 ns, 4.7 | 1.96 ns, 4.8 | an iteration: a call to a function that saves and uses x19, x20, with x19..x22 live across it |
+| tail4 | 2.20 ns, 5.3 | 2.22 ns, 5.4 | 0 | 0 | a call into 3 tail calls (`b`) and a return |
+| blr_hit | +0.91 ns, 2.2 | +0.70 ns, 1.7 | 3.07 ns, 7.4 | 2.61 ns, 6.3 | `blr` to the same leaf: the inline cache hits (W: over a direct call) |
+| blr_miss | +22.1 ns, 54 | +22.9 ns, 55 | +19.7 ns, 48 | +22.0 ns, 53 | `blr` alternating between two targets: every call misses (the dispatcher's lookup and the slot's update) |
+| switch8 | 2.53 ns, 6.1 | 5.42 ns, 13.1 | 2.95 ns, 7.1 | 2.89 ns, 7.0 | an iteration through a switch of 8 cases (a byte table, `br`), a native jump table |
+
+Spills and reloads of the register allocator (tier W), the text, and the run time of the program natively (best of 5, warm):
+
+| NRO | Convention | Spills | Reloads | Text bytes | Call and tail-call sites | Run ms |
+|---|---|---:|---:|---:|---:|---:|
+| fnptr-gcc | swifttail | 169 | 309 | 31,437 | 93 | 0.005 |
+| | ghc | 161 | 382 | 29,002 | | 0.005 |
+| fnptr-clang | swifttail | 210 | 266 | 27,581 | 74 | 0.005 |
+| | ghc | 208 | 346 | 25,498 | | 0.005 |
+| switch-gcc | swifttail | 314 | 646 | 205,373 | 102 | 0.144 |
+| | ghc | 328 | 741 | 202,506 | | 0.138 |
+| switch-clang | swifttail | 361 | 629 | 57,245 | 73 | 0.100 |
+| | ghc | 377 | 697 | 54,490 | | 0.109 |
+
+The conventions cost the same per call and return; ghccc has no callee-saved host registers, so what lives across a call is spilled to the native
+stack (10 to 30 % more reloads on the corpus), and its fixed argument registers took one loop (switch8) to twice the time; it is faster on a deep
+chain of frame-building calls (no callee-saved registers to push in each) and on an inline-cache hit. swifttailcc is the default. preserve_none
+(LLVM 19) is the convention to measure again when nxaot.lock moves.
+
+Integer throughput, `int_ops-gcc.nro` with `int_ops_rounds = 200` (398,275,757 guest instructions as dynarmic counts them; best of 5; the native
+and the dynarmic runs print the same lines):
+
+| Executor | Seconds | Guest instructions per second |
+|---|---:|---:|
+| native, swifttailcc, balanced | 0.0611 | 6,514 M |
+| native, ghccc, balanced | 0.0612 | 6,504 M |
+| dynarmic's JIT, memory callbacks (`nxaot_run`) | 0.4256 | 936 M |
+| dynarmic's JIT, fastmem (`nxaot_run --fastmem`) | 0.2631 | 1,514 M |
+
+The recompiled code runs int_ops 4.3 times as fast as dynarmic with fastmem, 7 times as fast as with memory callbacks.
+
+The pack stage over the whole corpus (14 NROs, 86,141 guest instructions, one thread, swifttailcc; guest instructions per second of each stage;
+`switch-gcc`, 51,097 of them, dominates):
+
+| Tier | Analysis (discovery, census, plan) | Lifting | Optimisation and code generation | Link (lld) per NRO | Text | Peak memory |
+|---|---:|---:|---:|---:|---:|---:|
+| C | 37,988 | 156,921 | 23,570 | 0.005 s | 1,465 KiB | 232 MiB |
+| W (balanced) | 38,005 | 148,691 | 6,700 | 0.006 s | 742 KiB | 232 MiB |
+| H | 37,823 | 150,710 | 6,535 | 0.006 s | 733 KiB | 232 MiB |
+| H+ (max) | 37,525 | 157,530 | 6,199 | 0.005 s | 775 KiB | 232 MiB |
+
+These are far below design section 10's estimates (at least 10 million for analysis, 2 to 5 million for lifting, 150,000 to 300,000 for tier C,
+50,000 to 100,000 for tier W): at these rates Monster Hunter Rise's 31 million instructions would take about 95 minutes on one core in the balanced
+mode (77 of them optimisation and code generation), against the target of 10 minutes on 4 cores. Where the time goes,
+per stage of `switch-gcc` at tier W: discovery 1.0 s (jump-table regions lifted afresh per br, summaries that translate each instruction again per
+pass), lifting 0.5 s, optimisation 1.4 s, code generation 3.7 s (DWARF line info costs 5 to 10 % of it). Code generation dominates; the functions
+carry an alloca per register, the pending check after every call and the NaN-chain cold blocks. Shards in parallel, the per-function cache and the
+caching of the analyses (design 10, 13) are phase 5's; the numbers are the measured starting point. Phase 5a's are in "Pack throughput".
+
+### Phase 3: the JIT fallback, safepoints, threads
+
+`nxaot_bench --sections polls,jit` on the same machine (best of 5; timings vary by about 10 % from run to run):
+
+| What | Measured |
+|---|---|
+| Safepoint polls on int_ops-gcc (`int_ops_rounds` = 200): with them / without (`--no-safepoints`) | 0.0680 s / 0.0657 s: +3.5 % (+4.4 % and +8.4 % in two other runs, one beside another container's build); text 62,829 / 35,629 bytes (+76 %: the cold paths) |
+| The same before NZCV was stored only where live, and with polls at every function entry | +17.9 % (the flags of every compare kept materialised in the polling loops) |
+| Hand-over: x0..x30, SP, PC, v0..v31, NZCV, FPCR, FPSR into the JIT and back (`dm_jit_measure_handover`) | 102 to 109 ns (four runs) |
+| A `dm_jit_run` that stops at once (hand-over, `Run()`, a cached block with no code, its callback, the halt) | 133 to 137 ns |
+| Per block in the JIT, int_ops-gcc with `--jit-all` (`int_ops_rounds` = 20, 5,733,411 blocks; time inside `dm_jit_run`, translation included) | 4.7 to 4.9 ns |
+| Per block with one block per `Run()` and the next pc checked in the host (`--jit-one-block`, the alternative to the code-reader stops) | 40.2 ns (+35.6 ns; 45.0 ns, +40.0 ns, in the runner's run) |
+| Compiled code against the JIT on the same run | 4.0 times as fast (phase 1: 4.3 against dynarmic with fastmem in `nxaot_run`) |
+| A new JIT instance (16 MB code cache; dynarmic's emitter builds its fastmem and exclusive fallback thunks) | 27 to 32 ms; the first instance of a process and its first translations about 100 ms more (dynarmic's static decoder tables): the time of every `--jit-all` run of the small NROs and of the pause test's first pause in the JIT (dm/host makes both ahead now: "The JIT fallback", the first use) |
+
+The corpus with the JIT (CTest `corpus_jit`): ms of the run natively (mixed) and with `--jit-all`, the mixed run's JIT runs and the addresses they
+started at; the native times of the NROs that enter the JIT include an instance's creation and the first translations:
+
+| NRO | mixed ms | JIT runs / addresses | jit-all ms | | NRO | mixed ms | JIT runs / addresses | jit-all ms |
+|---|---:|---:|---:|---|---|---:|---:|---:|
+| int_ops-gcc | 0.506 | 0 | 104.5 | | int_ops-clang | 0.353 | 0 | 111.4 |
+| switch-gcc | 0.273 | 0 | 350.8 | | switch-clang | 0.147 | 0 | 127.3 |
+| fnptr-gcc | 0.036 | 0 | 106.2 | | fnptr-clang | 0.036 | 0 | 110.2 |
+| fp-gcc | 120.6 | 8 / 8 | 109.0 | | fp-clang | 106.5 | 9 / 9 | 122.6 |
+| simd-gcc | 0.098 | 0 | 117.5 | | simd-clang | 0.087 | 0 | 122.5 |
+| sjlj-gcc | 0.039 | 0 | 173.3 | | sjlj-clang | 0.040 | 0 | 107.5 |
+| excl-gcc | 586.5 | 0 | 337.8 | | excl-clang | 229.2 | 0 | 285.8 |
+| except-gcc | 100.7 | 1,618 / 5 | 130.6 | | except-clang | 0.690 | 0 | 117.6 |
+| fiber-gcc | 100.5 | 442 / 29 | 114.1 | | fiber-clang | 105.5 | 421 / 54 | 111.3 |
+
+excl's native time is its threaded part, and it varies from 7 ms to about 0.9 s from run to run (420 runs of `test_threads.py --runs 200`):
+the libnx-style mutex hands the lock to the first waiter in the kernel (ArbitrateUnlock), and with two workers contending a handoff waits for the
+waiter's wake-up through a condition variable, so a convoy forms on some runs; the totals are exact on every run. The pause test (CTest
+`safepoints`): 50 pauses with more than one thread running in each run; a thread at a poll stops within about 100 microseconds of the request (its
+wake-up from the previous resume), the longest stop natively 0.2 to 10 ms, in the JIT about 100 ms (a worker's first instance and translations).
+CTest's new tests take about 33 s (`corpus_jit`), 11 s (`corpus_threads`) and 7 s (`safepoints`).
+
+## Against native
+
+How far the recompiled code is from the same C compiled natively for x86-64, what the difference is made of, and what was changed for it
+(the tier pipelines are those of "Phase 5d"; no profile).
+
+```sh
+python3 dm/tools/aot/tests/native_ratio.py --nxaot build/aot/nxaot --host build/aot/nxaot_host --work /tmp/ratio --cpu 7   # in the nxnative-aot image
+python3 -m unittest dm/tools/aot/tests/test_native_ratio.py                                                                 # its parsing, statistics and port
+```
+
+**The native build.** [tests/native_ratio.py](tests/native_ratio.py) compiles each program's C with the image's clang-18 for the host,
+`-O2 -march=native` (nxaot compiles for the host's CPU by default, design 9.3) and the corpus's flags that change code (`-std=gnu11
+-ffreestanding -fPIE -fno-stack-protector -ffp-contract=off -fno-math-errno`, the program's unwind flags), and links it with
+[tests/native_rt.c](tests/native_rt.c): the corpus's `rt.c` compiled for the host (its DT_INIT and DT_FINI functions renamed, run as the first
+constructor and the last destructor), the output SVC as a line on standard output, and a harness that runs `main` N times in one process,
+each run after the first from the executable's writable data as it was before the first (as `nxaot_host --repeat` maps a fresh image),
+`--set` through `dlsym`. int_ops is built from a port of its source: its six inline-assembly divisions and shifts become the C of the A64
+results they check, and `arm_acle.h` a header with the CRC-32 that nxaot lowers CRC32B / H / W / X to (a 256-entry table a byte at a time),
+SSE4.2's `crc32` for CRC-32C, `bitreverse` and rev16. Every native program prints its `corpus/expected` file (the script checks it) and every
+pack the native build's lines. The guest builds are GCC 15.2 (devkitA64) and clang-18; the native one is clang-18 for both, so the clang rows
+compare one compiler with itself. Measurable: int_ops (`int_ops_rounds = 20`), switch, fnptr and the 4,000-function benchmark (`gen_bench.py`'s
+`bench.c`, compiled natively from the same file). Not: simd (NEON intrinsics), fp (an inline A64 instruction per case; its run is the JIT
+fallback's), sjlj, excl, except, fiber (A64 assembly, Horizon's SVCs). fnptr runs 1.3 µs natively, below `nxaot_host`'s resolution (it
+prints microseconds) and its fixed cost per run (a thread record, `sigsetjmp`, MXCSR): its row is the run time's floor, not the code's.
+
+**The machine.** The development machine is a virtual machine on a hybrid CPU (8 vCPUs of an i9-13950HX), and a pinned process runs at one
+of two speeds, 1.7 to 2.4 times apart depending on the program, which changes from one process to the next: the native switch takes 24.4 or
+58.8 µs, native int_ops 2.48 or 4.28 ms, switch-gcc's tier W pack 67 or 135 µs, the same binary on the same CPU minutes apart. A probe run
+just before and after a sample did not tell its speed (a first version of `native_ratio.py` had one: the probes ran slow while the samples
+between them ran fast), nor does turning ASLR off (`setarch -R` on the host). So `native_ratio.py` splits each variant's samples (each the
+fastest of N runs in one process) into those within 1.3 times its fastest, the fast speed, and the others, and compares variants at one
+speed; in 8 rounds every variant but fnptr's met both. measure_packs.py does not split: with another agent's builds loading the machine (a
+one-minute load of 5 to 13 during these runs) most of its samples ran at the slow speed, so its per-layout medians are the slow speed's
+and agree within 1.5 %, while its rounds' spread (the two speeds) is 30 to 56 %; its rule, whose noise takes the rounds' spread, calls most
+changes below "within noise" although B is below A in every layout, and the tables give the per-layout medians, which are what the verdicts
+compare (where both speeds were met in every layout, the fast speed's medians change the same way: below). Earlier sections' timings mixed
+the two speeds where they say "varies by about 10 %" or more.
+
+**The ratio**, the base binary (5f154c9) and this one, `native_ratio.py --rounds 8 --cpu 6` (8 samples per variant; the load 3 to 7);
+each cell the ratio to native's time at one speed, base → now, and now's time; `.text` of this tree's packs against the native
+executable's (17,002 bytes for int_ops, 42,074 for switch, 11,738 for fnptr, 2,571,754 for the benchmark; it holds the C library's start-up
+besides the program). At the slow speed (most samples, and the speed of measure_packs.py's medians below):
+
+| Program | native | tier W: base → now | tier C | tier H | tier H+ | `.text` / native's: W, C, H, H+ |
+|---|---:|---:|---:|---:|---:|---:|
+| int_ops-gcc | 4.275 ms | 1.60 → **1.28** (5.452 ms) | 3.97 → 3.43 (14.649 ms) | 1.49 → 1.08 (4.612 ms) | 1.46 → 1.15 (4.907 ms) | 3.2, 7.9, 3.9, 4.0 |
+| int_ops-clang | 4.275 ms | 1.65 → **1.31** (5.588 ms) | 3.14 → 2.41 (10.296 ms) | 1.43 → 1.20 (5.122 ms) | 1.51 → 0.91 (3.884 ms) | 3.2, 7.2, 3.3, 3.4 |
+| switch-gcc | 58.8 µs | 2.57 → **2.30** (135.0 µs) | 6.18 → 5.70 (335.0 µs) | 2.52 → 2.33 (137.0 µs) | - → 2.21 (130.0 µs) | 8.4, 16.1, 8.8, 8.8 |
+| switch-clang | 58.8 µs | 1.87 → **1.77** (104.0 µs) | 5.29 → 5.14 (302.5 µs) | 1.84 → 1.85 (109.0 µs) | 1.83 → 1.70 (100.0 µs) | 1.9, 4.8, 1.9, 1.9 |
+| benchmark | 274.9 µs | 2.45 → **2.40** (659.0 µs) | 6.04 → 6.13 (1.686 ms) | 2.39 → 2.51 (690.0 µs) | 2.50 → 2.42 (664.5 µs) | 2.4, 5.4, 2.5, 2.5 |
+
+At the fast speed (fewer samples: 1 to 8 per variant, the native benchmark's one):
+
+| Program | native | tier W: base → now | tier C | tier H | tier H+ |
+|---|---:|---:|---:|---:|---:|
+| int_ops-gcc | 2.483 ms | 1.86 → **1.28** (3.182 ms) | 3.60 → 2.97 (7.365 ms) | 1.49 → 1.12 (2.793 ms) | 1.45 → 1.17 (2.916 ms) |
+| int_ops-clang | 2.483 ms | 1.64 → **1.21** (3.002 ms) | 3.34 → 2.53 (6.284 ms) | 1.61 → 1.38 (3.426 ms) | 1.58 → 1.04 (2.580 ms) |
+| switch-gcc | 24.4 µs | 2.95 → **2.75** (67.0 µs) | 7.12 → 6.66 (162.5 µs) | 2.91 → 2.66 (65.0 µs) | 2.77 → 2.58 (63.0 µs) |
+| switch-clang | 24.4 µs | 1.89 → **1.76** (43.0 µs) | 5.73 → 5.78 (141.0 µs) | 1.93 → 1.84 (45.0 µs) | 1.79 → 1.76 (43.0 µs) |
+| fnptr-gcc, fnptr-clang | 1.3 µs | 3.08 → 3.07 (4.0 µs) | 5.39 → 5.38 (7.0 µs) | 3.08 → 3.07, 2.31 (4.0, 3.0 µs) | 3.08 → 3.07 (4.0 µs) |
+| benchmark | 162.7 µs | 2.26 → **2.02** (328.0 µs) | 6.06 → 5.50 (894.0 µs) | 2.41 → 2.23 (362.0 µs) | 2.35 → 2.15 (350.0 µs) |
+
+With the polls of loops bounded by a constant left out at H and H+ ("Threads and safepoints"; W's packs unchanged), `native_ratio.py --tiers
+W,H,H+ --cpu 7`, the base binary (38293f9) then this one, 8 rounds each, the load 18 falling to 4 during the first and 4 to 14 during the
+second; at the slow speed, base → now: int_ops-gcc H 1.17 → 1.17, int_ops-clang H 1.20 → 1.09, switch-gcc H 2.33 → 2.24 and H+ 2.23 → 2.19,
+switch-clang H 1.87 → 1.86 and H+ 1.71 → 1.70, the benchmark H 2.49 → 2.53 and H+ 2.44 → 2.47; but W, whose code is the same in both, moved
+the benchmark 2.30 → 2.44 between the two runs, and several variants had all their samples at one speed (the split then puts them in the
+fast group whatever their speed: int_ops-gcc's H+ and W): two runs minutes apart differ by that much here. measure_packs.py's alternating
+rounds ("Threads and safepoints") are the comparison to go by.
+
+So at tier W, without a profile, the recompiled code takes 1.2 to 1.3 times native's time on int_ops, 1.8 to 2.8 times on switch and 2.0
+to 2.4 times on the game-shaped benchmark; the GCC builds are the farther (their code is not native's compiler's, and GCC's switch code is
+8 times native's size). At H+ int_ops-clang comes to native's time (0.9 to 1.0) and int_ops-gcc to 1.15: H and H+ inline the guest's
+functions that the native build keeps out of line (`RT_NOINLINE`), which is the C's attribute, not a property of the code. Tier C is 2.4 to
+6.7 times native: code the profile never sampled. fnptr's 1.3 µs is below what `nxaot_host` resolves (above).
+
+**Where the difference goes.** Sampled on the tier W packs with a `SIGPROF` sampler preloaded into `nxaot_host` (a `CLOCK_MONOTONIC` timer
+asked for 20 kHz, about 9 kHz delivered; each interrupted pc mapped to its function and, through the pack's DWARF line table, its guest
+offset; a measurement tool,
+not in the repository; the image has no `perf`, and the host's `perf_event_paranoid` is 4), then the hot loops read beside the native code and
+the A64 original, and each mechanism measured by switching it off (below). int_ops-gcc: `ref_crc` 45 % of the samples, `main` 23 %,
+`ref_udiv` 17 %; int_ops-clang: `ref_crc`'s share the same order; switch-gcc: `main` half of the pack's time, its loop around the call at
+0x434 the hottest place. The loops, int_ops-clang's `ref_crc` (one bit of the CRC; the loop runs it 8 times per byte):
+
+| A64 (clang-18 -O2, 3 instructions) | native x86-64 (clang-18 -O2, 6) | pack before, tier W (9) | pack after, tier W (6) |
+|---|---|---|---|
+| `sbfx w11, w10, #0, #1` | `movl %eax, %edi` | `movl %eax, %r10d` | `movl %eax, %r10d` |
+| `and w11, w11, w3` | `shrl %edi` | `andl $0x1, %r10d` | `andl $0x1, %r10d` |
+| `eor w10, w11, w10, lsr #1` | `andl $0x1, %eax` | `movl %r10d, %r11d` | `negl %r10d` |
+| | `negl %eax` | `negl %r11d` | `andl %r9d, %r10d` |
+| | `andl %ecx, %eax` | `andl $-0x2, %r11d` | `shrl %eax` |
+| | `xorl %edi, %eax` | `orl %r10d, %r11d` | `xorl %r10d, %eax` |
+| | | `andl %r9d, %r11d` | |
+| | | `shrl %eax` | |
+| | | `xorl %r11d, %eax` | |
+
+and per byte the pack adds the back edge's poll, `movzbl 0x358(%r13), %ebp; testb %bpl, %bpl; jne <safepoint>`, and a loop shape of two
+branches where the native loop has one (`cmpq; je <exit>; poll; addq; jmp <head>`). int_ops-gcc's `ref_crc` keeps the bit loop GCC wrote (not
+unrolled): per bit 6 instructions of work, the same 6 as native's after the change, plus a test, the poll and a `dec; jmp`. Its `main` makes
+about 20 calls per inner iteration, each of them in the pack (the native side calls the same noinline functions): the dirty registers the
+callee is not passed stored to the block, before the change the flags of the last compare packed into NZCV (three `setcc`, shifts, ors, a
+store to `0x108(%r13)`: 10 to 15 instructions), the return address built from the base (`movq nxaot.base, %rax; leaq off(%rax), %rsi`), the
+call, `subq $8, %rsp` after it (swifttailcc's callee pops an argument area that LLVM rounds to 8 bytes), `st` reloaded from the stack (R13,
+swiftself, is not callee-saved in swifttailcc), the pending check (`cmpq $0, 0x350(%r13); jne`) and the reloads of what the callee may write;
+the native call is the arguments' moves and `call`. switch-gcc's loop at 0x434 stored x4..x27 at its call on every iteration, most of them
+values set before the loop and never changed in it.
+
+The items, each a share of the base pack's distance from native at tier W at the slow speed (the base's tier W time minus native's: the
+times of measure_packs.py's per-layout medians, which are the slow speed's, against native's slow-speed median in `native_ratio.py`'s
+runs), measured as the change when the item alone is taken out or changed (measure_packs.py, 12 rounds, 3 layouts; the experiments'
+binaries were hacks of this tree, reverted, and remove what the design requires, so their packs are not correct in general, only on these
+programs). "Changed" are the three changes below; "left" is what the experiments of "What is left" take out of this tree's packs:
+
+| Item | int_ops-gcc | int_ops-clang | switch-gcc | switch-clang | benchmark | Avoidable within the design? |
+|---|---:|---:|---:|---:|---:|---|
+| the distance, base tier W − native (slow speed) | 6.878 − 4.275 = 2.603 ms | 7.095 − 4.275 = 2.820 ms | 151.5 − 58.8 = 92.7 µs | 110 − 58.8 = 51.2 µs | 692 − 274.9 = 417 µs | |
+| sbfm lowered as dynarmic writes it | 43.8 % | 37.9 % | 0 (no sbfm in its hot code) | 0 | 0 | yes: changed (1) |
+| registers set before a loop stored at its call on every iteration | 0 | 0 | 10.8 % | 5.9 % | 0 | yes: changed (2) |
+| NZCV packed and stored at every call | 10.6 % | 11.0 % | 4.3 % | 17.6 % | 0.8 % (not in every layout) | yes (a dead NZCV, design 6.2's rule): changed (3) |
+| safepoint polls | 0 | 1.0 % | 10.8 % | 18.6 % | 8.5 % | the entry polls cost nothing; a loop's bounded by a constant: left out at H and H+ ("Threads and safepoints"), not at W (it moved other code there, both ways) |
+| the pending check after each call | 1.9 % | 2.0 % | 0 | 2.0 % | 3.2 % | no (3.3) |
+| guest memory volatile | 0 | 0 | (hangs) | (hangs) | (hangs) | no (6.4) |
+| FnTailLr's compare | 0 | 2.0 % | 0 | 7.8 % | (mixed) | no (3.3) |
+| swifttailcc against ghccc | 5.1 % | 3.8 % | 5.4 % | 9.8 % | 0 | the convention (2.3): the owner's |
+| left after the change, not taken apart: the convention's other per-call costs (`st`, the argument area, the return address, stores and reloads; indirect calls through the inline cache), the code's size (2 to 8 times native's `.text`), no inlining or unrolling at W | 45.5 % | 48.9 % | 82 % | 88 % | 96 % | partly (the tiers: H, H+); the rest the convention |
+
+The rows are not additive where items interact (switch-clang: the three changes together take 6 µs, 11.7 %, of its 51.2; "left" is this
+tree's tier W time less native's, as a share of the base's distance). The changed rows are of the base or the base with the earlier
+changes (the "Each change alone" table below); the "left" experiments are of this tree.
+
+**What was changed** (in this order, each a lowering in the lifter; the unit key's format is `nxaot-unit 5`, since a unit's object changes
+for the same key):
+
+1. **sbfm as a shift pair** ([src/lift/lifter.cpp](src/lift/lifter.cpp), `SignedField`). dynarmic's frontend writes sbfm (`asr` by an
+   immediate, `sxtb` / `sxth` / `sxtw`, `sbfx`, `sbfiz`) as `Or(And(ReplicateBit(src, S), ~T), And(And(RotateRight(src, R), W), T))`, T the
+   low k bits; lowered as written, LLVM kept an or of the replicated bit's select and the field, since nothing told it that bit k - 1 of the
+   field is the replicated bit: `asr x0, x1, #5` became five x86 instructions and a 64-bit constant (`sar $63`, `movabs`, `and`, `shr`, `or`),
+   `sxtw` five, `sbfx w0, w1, #0, #1` five (checked with `opt-18` and `llc-18` on the lowering's IR). An `Or` whose operands have that form,
+   checked on the operands (W has bit k - 1, and bit k - 1 of the rotate is bit (k - 1 + R) mod n of src, which is S) and not on the
+   instruction, is now `ashr(shl(And(Y, T), n - k), n - k)`: a `sar`, a `movsx`, or a `shl` / `sar` pair. The integer vectors of `bitfield`
+   (in `dp_imm.tsv`) and every other vector pass.
+2. **The stores of a loop whose iterations call, on the edges into it** ([src/lift/lower_calls.cpp](src/lift/lower_calls.cpp),
+   `FnLoopHeads`, `FnDataflow`, `FnGoto`). A call stores every dirty register the callee is not passed (design 2.3, the block's invariant);
+   the dirty set at a loop's head was the union over its predecessors, so the edge into the loop brought what the code before it changed,
+   and every call in the loop stored it again on every iteration. Now, for the head of a natural loop (it dominates the source of a back edge
+   into it) entered only through the lifted code's own branches (not the function's entry, a landing pad, a part's entry, a resume point or a
+   jump table's case), in which a call or an svc runs on every iteration (the head dominates it and it dominates every back edge's source): an
+   edge from outside the loop stores the registers that call would store and that are dirty on the edge but not at the head (sp, x30 and NZCV
+   excepted), once per entry instead of once per iteration; the head's dirty set is what its back edges bring. Such stores enter what a
+   preserving function stores again at its return (`restore_block`). switch-gcc's loop at 0x434 stores 7 registers at its call instead of 22.
+3. **NZCV at a call only where it is live** (`FnCall`, `FnDataflow`; `CalleeView::reads_nzcv` from the callee's summary, `src/build/pack.cpp`).
+   NZCV's liveness took every call as a reader, so a call stored a dirty NZCV (the flags of the last compare, packed) to the block. A call now
+   reads NZCV when the callee may read it before writing it (its summary's `reads`; the indirect view always, its callees may be no function
+   of the module) or the caller's code after it may (its successors' liveness), and a return when `LIVE_AFTER` holds it (`FnReturn` stores
+   nothing else); a dead NZCV is left in the block as a poll leaves it (design 6.2), and a callee that may read it, or a caller that reads it
+   after the call, still gets it. The deferred flags are made before a call block's terminator (`LowerBlock`), as its reloads replace them.
+   Found on the way: without that, a reload of NZCV after the call met flags still deferred and the lifter refused the function (in a first
+   build the main loop of every corpus program it was tried on ran in the JIT fallback: int_ops-gcc's `main`, switch-clang's 0x57a0, ...;
+   the refusal count of every corpus pack, 0 since, and CTest's `corpus_native` check it).
+
+Measured, the base binary (A) against this one (B), `measure_packs.py --rounds 12 --layouts 3 --cpu 7`, the per-layout medians:
+
+| Program | A | B | change | per layout A / B | `.text` A → B (bytes) |
+|---|---:|---:|---:|---|---:|
+| int_ops-gcc (`int_ops_rounds = 20`, 20 runs) | 6.878 ms | 5.460 ms | −20.6 % | 6.878, 6.879, 6.877 / 5.463, 5.456, 5.460 ms | 64,860 → 53,852 |
+| int_ops-clang | 7.095 ms | 5.654 ms | −20.3 % ("faster") | 7.095, 7.083, 7.104 / 5.638, 5.659, 5.654 ms | 60,824 → 54,104 |
+| switch-gcc (1,500 runs) | 151.5 µs | 135.0 µs | −10.9 % | 152, 151, 151.5 / 135, 135, 135 µs | 365,692 → 353,612 |
+| switch-clang | 110.0 µs | 104.0 µs | −5.5 % | 110, 110, 110 / 104, 104, 104 µs | 85,864 → 79,480 |
+| simd-gcc | 47.0 µs | 43.0 µs | −8.5 % | 47, 47, 47 / 43, 43, 43 µs | 109,300 → 92,756 |
+| simd-clang | 38.0 µs | 37.0 µs | −2.6 % | 38, 38, 38 / 37, 37, 37 µs | 107,812 → 102,292 |
+| fnptr-gcc, fnptr-clang | 6 µs | 6 µs | 0 (1 µs resolution) | | 58,188 → 49,196; 49,768 → 45,784 |
+| benchmark, 4,000 functions (300 runs) | 692.0 µs | 677.0 µs | −2.2 % | 687, 692, 697 / 675.5, 677, 682.5 µs | 6,339,712 → 6,262,560 |
+
+B is faster in every layout of every program it changes and slower in none; by measure_packs.py's own rule int_ops-clang is "faster" and
+the others "within noise", their rounds' spread being the machine's two speeds (31 to 56 %; see above). The pack's time and memory: the
+benchmark 18.55 → 18.89 s and 140 → 136 MiB (4 workers, under load), the corpus programs within 0.1 s. Each change alone, in the same way
+(per-layout medians; a binary with the change taken out of this tree, built for the measurement and not kept):
+
+| Program | 1. sbfm (base → base + 1) | 2. loop stores (this tree less 2 → this tree) | 3. NZCV (base + 1 + 2 → this tree) | 1 and 2 without 3 (base → base + 1 + 2) |
+|---|---:|---:|---:|---:|
+| int_ops-gcc | −16.6 % | identical packs | −4.8 % ("faster") | −16.7 % |
+| int_ops-clang | −15.1 % | +0.3 % | −5.2 % | −16.1 % |
+| switch-gcc | identical packs | −6.9 % (145.5 → 135.5 µs) ¹ | −2.9 % | −8.0 % |
+| switch-clang | identical packs | −2.8 % | −8.0 % | +2.7 % |
+| simd-gcc | identical packs | 0.0 % | −8.5 % | −1.1 % |
+| simd-clang | 0.0 % | identical packs | −2.6 % | 0.0 % |
+| fnptr-gcc, fnptr-clang | identical packs | identical packs | 0 (1 µs resolution) | identical packs |
+| benchmark | −0.1 % | identical packs | −0.5 % (not in every layout) | −0.4 % |
+
+¹ measure_packs.py's medians for this pair were split between the two speeds (A 74.5, 145, 75.5 µs per layout); the figure is from five
+alternating runs of the two packs on another CPU, each the fastest of 2,000 (145, 146, 145, 147, 145 µs against 135, 136, 136, 136, 135);
+the fastest samples of measure_packs.py's run agree (73 → 69 µs, −5.5 %, "faster" by its rule applied to them). At the fast speed, where
+every layout of both variants met it (each layout's samples split as `native_ratio.py` splits them), the changes go the same way: sbfm −29.1 %
+and −19.1 % (int_ops-gcc, -clang), the loop stores −4.8 % (switch-gcc), NZCV −10.2 % (switch-clang), each "faster" by the rule.
+
+Change 2 without 3 made switch-clang 2.7 % slower (110 → 113 µs in two of three layouts; sbfm alone 110 → 110; the pack differs from the base
+in `main` and one other function only): why was not found (its loop's NZCV is still packed and stored at each call there); with 3 the same
+loop stores are 3 % faster (107 → 104 µs, alternating runs on another CPU). Kept together, the three are faster on every program and slower on
+none.
+
+**What is left**, with the measured potential of each where an experiment could take it out, for the owner (each is design-level: the
+convention of 2.3, the returns of 3.3, the safepoints of 6.2, the memory model of 6.4, the tiers of 9.3). After the change, at tier W:
+
+| Taken out (an experiment on this tree; per-layout medians, change of the median) | int_ops-gcc | int_ops-clang | switch-gcc | switch-clang | simd-gcc | simd-clang | benchmark |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| the safepoint polls (`--no-safepoints`) | +0.3 % | −0.5 % | −7.4 % | −9.1 % | −9.3 % | −2.7 % | −5.3 % |
+| the pending check after each call | −0.9 % | −1.0 % | +0.7 % | −1.0 % | −2.3 % | −2.7 % | −2.0 % |
+| volatile guest memory (every plain access a plain LLVM one) | 0.0 % | +0.4 % | hangs | hangs | 0.0 % | 0.0 % | hangs |
+| FnTailLr's compare | +0.8 % | −1.0 % | +1.5 % | −3.8 % | 0.0 % | 0.0 % | −2.0 % (not in every layout) |
+| swifttailcc replaced by ghccc (`--cc ghc`) | −2.5 % | −1.9 % | −3.7 % | −4.8 % | 0.0 % | 0.0 % | −0.3 % (not in every layout) |
+
+fnptr (6 µs at the host's resolution) moved by none of them beyond its 1 µs steps (5 to 6 µs without polls). Changes of about 1 % with
+either sign (FnTailLr's compare, the pending check on switch-gcc) are within what a pack's layout alone moves ("The sample profile at
+tier H": 1 to 3 %).
+
+- **The convention's cost per call** (design 2.3), the largest part of what is left wherever the code calls (int_ops' `main`, the
+  benchmark's drivers and chains): `st` reloaded from the stack after every call (swifttailcc keeps R13, its swiftself register, in no
+  callee-saved slot), `subq $8, %rsp` after it (the callee pops an argument area that LLVM rounds up to 8 bytes even when it is empty), the
+  return address built from the base for the lr argument, the stores of what the callee is not passed and the reloads of what it may write.
+  ghccc (the stand-in for preserve_none: no callee-saved register, one signature) measured 0 to 4.8 % faster than swifttailcc on every
+  program above, where phase 1 had chosen swifttailcc for 10 to 30 % fewer reloads and one loop twice as fast; LLVM 19's `preserve_nonecc`
+  is the one to measure when nxaot.lock moves. Changing the convention changes the standard entries' signature (ABI 3,
+  [include/nxaot/aot_module.h](include/nxaot/aot_module.h)): the owner's decision, now with this measurement for ghccc.
+- **The pending check after every call** (3.3: `cmpq $0, 0x350(%r13); jne`): 0 to 2.7 % by its removal. A return to a frame that waits for
+  a non-local transfer cannot be told apart otherwise without another way back from a callee (a second return address, or unwinding to the
+  resume points), a change of 3.3.
+- **The safepoint polls** (6.2): 3 to 9 % of switch, simd and the benchmark at W, nothing on int_ops (there a load, a test and a predicted
+  branch beside the loop's own work); measured by kind since ("Threads and safepoints"): the backward branches' polls are the cost, the
+  entries' cost nothing, and at H a poll also keeps the loop passes from unrolling a loop (int_ops-gcc −29 % without them at H). The polls of
+  loops bounded by a constant are left out at H and H+ now; at W the same rule was faster on simd-gcc, switch-clang and the benchmark and
+  slower on int_ops and switch-gcc (code moved by what LLVM made of the loops without their cold paths), and is not applied. What polls
+  remain: unbounded loops (a register or memory bound, the state machines' 1,000 steps of a whole switch, over the budget), loops that call,
+  and the entries.
+- **Guest memory as volatile** (6.4): every plain access made non-volatile, an unsound experiment, changed int_ops, simd and fnptr by at most
+  0.4 % and made switch and the benchmark hang: on this code the guest compilers left LLVM nothing to merge; nothing here argues for
+  revisiting 6.4 for speed.
+- **No inlining and no loop passes at tier W** (9.3): the W and H+ columns of the ratio table. int_ops-gcc's `ref_crc` keeps GCC's bit loop
+  at W, where native clang unrolled it fully; the profile's tier H is where that is bought.
+- **FnTailLr's compare** (4cbabbf, before every tail call: x30 against the entry's lr, folded where x30 is never written): its removal moved
+  the programs by −3.8 to +1.5 %, with no consistent sign: no measurable cost here.
+
+## Pack throughput
+
+Phase 5 (design sections 9.3, 10 and 13): where the pack stage's time went, the causes fixed, the units compiled on worker threads and the
+per-function cache (phase 5a, the first sections below), then the compile stage's rate, functions split for size, units of several functions,
+the analysis cache and tiers by profile (phase 5b, "Phase 5b" below), then the analysis on the workers (phase 5c, "Phase 5c" below), then the
+compile stage's rate per core at tiers C and W (phase 5d, "Phase 5d" below). No game module is on the development machine, so the corpus and a
+game-shaped benchmark are measured and the rest is extrapolated per instruction.
+
+```sh
+build/aot/nxaot build <module> --shared <lib.so> [-o <object.o>] [--workers N] [--cache <dir>] [--profile <file>] [--time-passes] [--ir <file.ll>]
+                      [--isel-misses] [--memory]
+python3 dm/tools/aot/tests/gen_bench.py --functions 4000 /tmp/bench          # the game-shaped benchmark, in the nxnative-aot image
+python3 dm/tools/aot/tests/gen_bench.py --direct --functions 600000 /tmp/big # the same statements' words at any size, no clang ("Memory at scale")
+NXAOT_ARGS='--cache /tmp/aot-cache' sh dm/tools/aot/tests/build_packs.sh build/aot /tmp/packs   # the corpus packs, cached
+```
+
+`nxaot build` logs, besides the module's numbers and sites: `aot: tiers C <n> W <n> H <n> H+ <n>`; `aot: seconds discover .. plan .. lift ..
+verify .. optimise .. codegen .. link ..; compile wall .. with <n> workers; total ..; peak memory .. MiB`, where lifting, verification,
+optimisation and code generation are the units' seconds summed and the others wall-clock seconds, and the peak memory is the process's peak
+resident set, the link's included (before "Memory at scale" it was taken before the link); `aot: workers <n> (<m> MiB available, about <k> MiB
+each, <t> MiB for the tables)` or `aot: workers <n> (--workers)`, the compile's workers and why ("Memory at scale"); the instructions per
+second of each (per core) and of the compile and the whole pack (wall); `aot: discover seconds: ...`, discovery's steps with their counts (jump-table tries and
+regions, summary runs, rounds, computed and reused summaries, the distinct words translated); `aot: units <n> (...), workers <n>`; `aot: split
+functions <n> into <p> parts, <t> transfers between parts, joined in <s> s`; with `--profile`, `aot: profile <file>: <s> samples at <o> offsets,
+<x> outside every function`; with `--cache`, `aot: cache <dir>: <h> hits, <m> misses (units; functions <fh> hit, <fm> missed), <r> bytes read,
+<w> bytes written, keys <s> s` and `aot: analysis cache: hit | miss (<why>), <s> s`; when the analysis ran, `aot: analysis on <n> threads:
+discover CPU <s> s, plan <s> s wall, CPU <s> s; summaries <r> rounds in <s> sweeps` (phase 5c: it runs on the workers). `--time-passes` prints
+LLVM's pass timers (one worker);
+`--ir` writes the lifted IR before the tier's passes, `--ir-opt` after them (what code generation is given). `--no-groups` (one function per
+unit at tiers C and W, as phase 5a), `--no-split` and `--split-above N` are for measurements and tests. `NXAOT_CHECK_PROGRAMS=1` runs every
+cached abstract program of the summaries beside the interpretation of dynarmic's IR it replaces and stops at the first difference;
+`NXAOT_TRACE=1` prints each unit before it is compiled; `NXAOT_DEBUG_SUMMARIES=1` prints each round of the summaries (its sweeps, the
+functions looked at and computed: "Phase 5c"). `--memory` (also `nxaot discover` and `nxaot plan`) prints each table's bytes at its peak and the
+resident set at each stage; `NXAOT_MEM_AVAILABLE_MIB` is a test switch that stands for the available memory ("Memory at scale").
+
+**The benchmark** ([tests/gen_bench.py](tests/gen_bench.py)): a C program generated from a seed, built with the corpus's run time and clang
+flags, with unwind tables and no exported symbols but main's: thousands of functions, most of one to three statements (accessors, arithmetic),
+some of four to twelve, one in twenty of twenty to sixty; statements of the kinds game code has (arithmetic, loads and stores, loops, switches
+over a field with a range check (jump tables), floating point, NEON vectors, struct copies, byte loops, direct calls, calls through a table of
+pointers); main calls every function through drivers with a bounded depth and prints one checksum, so a pack of it runs and is compared with
+dynarmic (`nxaot_run`). `--unbounded-switches` switches over a remainder instead, which discovery cannot bound (a stress case; but a remainder
+by 16, a mask). With 4,000
+functions (seed 1): 533,160 instructions in 4,088 functions; with 16,000 (seed 2): 2,163,759 in 16,276. Both packs print what dynarmic prints
+(`bench 9bd31f1d51c59eda` for seed 1), with 1 and with 8 workers, balanced and max; 383 of its brs compute their table's index from more than one
+value, which discovery did not bound then, so their cases ran in the JIT fallback at run time (7,818 JIT runs, the same before and after these
+changes; discovery bounds them since "Jump tables whose index depends on several values").
+
+### Before and after
+
+On the development machine (Intel Core i9-13950HX, 8 vCPUs and 11 GiB in a virtual machine, Docker image `nxnative-aot`, tier W, swifttailcc),
+best of 3 per stage; the benchmark's runs each waited for the one-minute load to fall under 1.5, but another agent's builds ran on the machine
+at times, so single runs vary by up to 20 %. Guest instructions per second; discovery includes the plan; optimisation and code generation are
+the units' seconds summed; the last three columns are the whole `nxaot build` in seconds (the baseline's sum of its stages: it logged no total):
+
+| NRO | Instructions | Functions | Discovery and plan, per s | Lifting, per s | Optimisation and code generation, per s | Pack before | Pack after, 1 worker | Pack after, 8 workers |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| except-clang | 2,663 | 46 | 9,900 → 32,877 | 71,973 → 98,630 | 2,553 → 2,704 | 1.36 s | 1.13 s | 0.31 s |
+| except-gcc | 2,672 | 48 | 3,790 → 28,731 | 66,800 → 92,138 | 2,627 → 2,914 | 1.77 s | 1.09 s | 0.24 s |
+| excl-clang | 1,962 | 50 | 15,092 → 28,853 | 72,667 → 85,304 | 2,752 → 2,835 | 0.88 s | 0.82 s | 0.25 s |
+| excl-gcc | 1,910 | 51 | 27,681 → 28,088 | 136,429 → 76,400 | 3,304 → 2,550 | 0.67 s | 0.88 s | 0.19 s |
+| fiber-clang | 1,801 | 37 | 16,373 → 27,708 | 85,762 → 100,056 | 3,538 → 3,463 | 0.65 s | 0.64 s | 0.21 s |
+| fiber-gcc | 1,635 | 38 | 15,139 → 24,403 | 65,400 → 86,053 | 2,620 → 2,659 | 0.77 s | 0.74 s | 0.22 s |
+| fnptr-clang | 1,606 | 59 | 15,442 → 23,970 | 69,826 → 76,476 | 2,920 → 2,788 | 0.68 s | 0.70 s | 0.22 s |
+| fnptr-gcc | 1,603 | 61 | 14,441 → 22,900 | 59,370 → 76,333 | 2,532 → 2,524 | 0.78 s | 0.77 s | 0.23 s |
+| fp-clang | 1,724 | 31 | 13,903 → 24,629 | 74,957 → 101,412 | 2,907 → 2,737 | 0.79 s | 0.77 s | 0.21 s |
+| fp-gcc | 1,809 | 32 | 15,462 → 25,843 | 64,607 → 86,143 | 2,242 → 2,428 | 0.96 s | 0.87 s | 0.20 s |
+| int_ops-clang | 2,453 | 68 | 12,776 → 33,603 | 79,129 → 90,852 | 3,479 → 3,383 | 0.94 s | 0.87 s | 0.31 s |
+| int_ops-gcc | 2,312 | 69 | 12,989 → 32,563 | 68,000 → 82,571 | 2,901 → 2,837 | 1.02 s | 0.96 s | 0.34 s |
+| simd-clang | 6,632 | 48 | 20,406 → 80,878 | 92,111 → 105,270 | 4,265 → 5,043 | 1.97 s | 1.53 s | 1.06 s |
+| simd-gcc | 3,548 | 49 | 19,711 → 46,684 | 68,231 → 77,130 | 2,187 → 2,310 | 1.86 s | 1.71 s | 1.10 s |
+| sjlj-clang | 1,593 | 35 | 21,240 → 23,087 | 122,538 → 79,650 | 3,231 → 2,714 | 0.59 s | 0.71 s | 0.23 s |
+| sjlj-gcc | 1,592 | 36 | 13,157 → 21,808 | 54,897 → 79,600 | 2,217 → 2,291 | 0.88 s | 0.84 s | 0.26 s |
+| switch-clang | 7,259 | 61 | 21,102 → 64,812 | 115,222 → 134,426 | 7,673 → 7,986 | 1.37 s | 1.14 s | 0.42 s |
+| switch-gcc | 51,097 | 63 | 46,116 → 364,979 | 104,067 → 109,650 | 9,015 → 9,469 | 7.28 s | 6.19 s | 5.15 s |
+| synthetic module | 106 | 9 | 1,606 → 1,606 | 106,000 → 53,000 | 2,865 → 1,656 | 0.11 s | 0.15 s | 0.11 s |
+| all 19 modules | 95,977 | | 21,636 → 64,806 | 91,320 → 101,348 | 4,895 → 5,023 | 25.3 s | 22.5 s | 11.3 s |
+
+Discovery is 7.9 times as fast on switch-gcc and 7.6 on except-gcc, 3 times over the corpus; the small NROs' lifting and compile rates move by a
+few milliseconds either way (noise at this size). Peak memory: 65 to 209 MiB before (one module), 64 to 187 MiB with one worker, 73 to 239 MiB
+with eight. The game-shaped benchmark (533,160 instructions, 4,088 functions; seconds, the units' seconds summed for lifting to code generation):
+
+| Stage (seconds) | Baseline | Analysis and lifting fixed, one module, one thread | Units, 1 worker | Units, 8 workers |
+|---|---:|---:|---:|---:|
+| discovery | 243.4 | 6.13 | 5.97 | 3.63 |
+| census (FPSR) | 0.58 | 0.000 | 0.000 | 0.000 |
+| plan | - | 0.10 | 0.09 | 0.10 |
+| lifting | stops (`type == Type::Opaque`) | 4.17 | 3.65 | 3.06 |
+| verification | - | 0.92 | 1.25 | 0.94 |
+| optimisation | - | 39.15 | 34.44 | 30.33 |
+| code generation | - | 41.89 | 42.50 | 37.93 |
+| link (lld) | - | 0.035 | 0.125 | 0.118 |
+| compile, wall | - | 86.1 | 82.86 | 9.13 |
+| whole pack, wall | - | 92.4 | 89.19 | 13.09 |
+| peak memory | - | 1,188 MiB | 126 MiB | 226 MiB |
+
+The baseline cannot pack the benchmark (cause 6 below); its discovery is `nxaot discover`'s and its census the pack stage's.
+
+### The causes, and what was changed
+
+Measured first with timers around discovery's steps, the plan, the lifting, the verifier, the passes and code generation (the log lines above),
+LLVM's pass timers (`--time-passes`) and `getrusage` (the image has no perf or valgrind). The fixes keep every result: the discovery tables
+(`nxaot discover --tsv`) of the eighteen NROs, the synthetic module and both benchmarks are byte for byte the baseline's, but for the count of
+regions lifted (work, not a result); the tests below pass.
+
+1. **The summaries** ([src/analysis/summary.cpp](src/analysis/summary.cpp), [discover.cpp](src/analysis/discover.cpp)): 87 % of switch-gcc's
+   discovery (0.87 of 1.0 s) and 79 % of except-gcc's (0.57 of 0.73 s: 13 runs of the fixed point, 65 rounds, 3,120 functions summarised for 48
+   functions). Every run started afresh after each discovery round that reached the summaries; each run computed every function in every round;
+   the preservation analysis translated every instruction with dynarmic at every visit and interpreted every block in every iteration; the
+   register effects were cached per pc and per run only; the union over the address-taken functions was recomputed for every blr of every
+   function at every step. Now: `InsnCache` translates each distinct word once (twice more to find the immediates that follow the pc or its page:
+   adr, bl's return address, literal addresses, adrp) into the register effects and a small program of the operations the analysis reads, which
+   runs as the interpretation did (`NXAOT_CHECK_PROGRAMS=1` runs both on every instruction: no difference on the corpus); a block's instructions'
+   effects are composed once per computation; a block is interpreted again only when its entry state changed (the same states, the same order);
+   within a run a function is computed again only when a summary it reads changed since its last computation (the same rounds); across runs a
+   function's summary for inputs seen before (its walk's state, its callees' summaries, the address-taken union) is taken from `SummaryMemo`; a
+   run is skipped when nothing it reads changed.
+2. **The jump tables** ([discover.cpp](src/analysis/discover.cpp), [jumptable.cpp](src/analysis/jumptable.cpp)): a br that no region bounds was
+   tried again after every walk of its function and, past calls, after every run of the summaries, each try lifting up to 13 regions in a new
+   LLVM context: on the benchmark 91,700 regions, about 70 s. Now a try is skipped when the function's walk state (a SHA-256 of what a region
+   reads of it) and every call effect and target validity the last try read are unchanged; a region's analysis is kept by everything its lifting
+   and analysis read (`RegionMemo`); and the functions' brs are tried on the workers, their results applied in function order. 3,376 regions on
+   the benchmark.
+3. **The census in the pack stage** ([src/build/pack.cpp](src/build/pack.cpp)): the whole census of the text ran to answer whether the code reads
+   FPSR; `ReadsFpsr` ([census.cpp](src/analysis/census.cpp)) answers that alone, as the census does.
+4. **The plan** ([src/build/plan.cpp](src/build/plan.cpp)): its own register effects per pc, now discovery's `InsnCache`; LIVE_AFTER's fixed point
+   passed every function in every round, now only those whose LIVE_AFTER changed (it only grows by unions: the same result).
+5. **Lifting, a fixed cost per function** ([src/lift/lower_calls.cpp](src/lift/lower_calls.cpp), `FnInitRegisters`): the prologue stored all 31
+   x registers, 32 v registers, SP and the flags into their allocas in every function, about 250 IR instructions that SROA and dead-code
+   elimination removed again: fnptr-gcc's lifted IR was 57,717 lines, 47,015 now. Only the registers some part of the function reads are
+   initialised (the optimised code is the same up to register assignment: 8 of fnptr-gcc's 125 functions allocate other registers).
+6. **A crash the benchmark found** ([src/lift/lower_fp.cpp](src/lift/lower_fp.cpp), `Exact`): the exact recompute of a NaN chain asked dynarmic for
+   the instruction of an operand before checking whether it was an immediate (`fmov s1, #3.0` forwarded into an `fadd`), and dynarmic's assertion
+   (`type == Type::Opaque`) stopped the pack: the baseline cannot pack the benchmark.
+7. **One module for everything** (pack.cpp): every function was lifted into one LLVM module, optimised and compiled on one thread, with the
+   module's memory (990 to 1,188 MiB on the benchmark). Units on workers, next.
+
+Looked at and not the cause: the verifier (1 to 2 %), one LLVM context per function (there was one per module), DWARF (about 9 % of compile time
+and a third of the units' object bytes on the benchmark; line tables only would save 6.5 % of the bytes: left as it is), dynarmic's decoder table
+(60 to 70 ms per process, built once). The compile stage's own rate (LLVM's O1 pipeline and code generation on the lifted IR: InstCombine is 52 %
+of optimisation, instruction selection 39 % and the assembly printer 19 % of code generation on the benchmark) is unchanged per core: it is the IR's
+size per guest instruction, phase 5b's (below).
+
+### Compile units on workers
+
+[src/build/pack.cpp](src/build/pack.cpp) (design 9.3, 10): after the analysis (discovery and the plan, on the calling thread; discovery's jump
+tables on the workers), each function is a compile unit (as phase 5a built them; since phase 5b a unit at tiers C and W is a group of
+neighbouring functions, and a function over the split limit is a unit per part: "Phase 5b" below): its body and its standard entry lifted,
+verified, optimised by the tier's pipeline and
+compiled into an object of its own, in an LLVM context and module of its own, by one of `--workers` threads, each with its own target machine.
+At H and H+, whose pipelines inline, a unit is a shard of neighbouring functions instead (16,000 to 64,000 instructions in address order, ended
+after a function whose code's SHA-256 starts with a multiple of 8, so that a change moves the shards' ends near it only), and they inline within
+the shard. One more object holds what every unit shares: the module's base, the empty inline-cache descriptor, the slow-path wrappers,
+`jit_entry`, `enter`, the lookup table, the function map, the returns, the line table's bounds and the descriptor. Bodies, standard entries and
+the shared code are hidden symbols, which units declare and lld resolves; lld links the tables' object and the units in entry order into the
+shared object (`--shared`), or into one relocatable object (`-o`, `ld.lld -r`). Workers take the largest units first. A unit's object depends on
+the unit only, so the number of workers changes nothing in the pack; the objects that are not the cache's go to `<output>.parts/`, removed after
+the link. `--workers 0` (the default) runs the analysis on one thread per CPU this process may run on (`sched_getaffinity`) and, once it is
+done, counts the compile's workers by the memory then available ("Memory at scale"; before it: one per CPU, at most one per 512 MiB of
+`MemAvailable`).
+
+Packs are deterministic: LLVM 18 writes the `!pcsections` groups of a function in the order of a `DenseMap` keyed by metadata pointers
+(`AsmPrinter::emitPCSections`), so two compilations of the same unit can order its marks' section differently, but that section stays out of the
+link (`SHF_EXCLUDE`) and the pack's line table is nxaot's, sorted ("Calls and returns"): two cold packs of switch-gcc are the same but for the
+soname (checked after ABI 3; before it they differed in `nxaot_lines`). A warm repack reuses the cached objects and is byte for byte the cold pack.
+
+The speedup (best of 3 per worker count by the whole pack's time; discovery's jump tables run on as many threads as there are workers):
+
+| Workers | Benchmark: discovery | compile, wall | whole pack | speedup, compile / pack | peak memory | switch-gcc: whole pack | speedup | peak memory | synthetic module: whole pack |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 5.97 s | 82.86 s | 89.19 s | 1.00 / 1.00 | 127 MiB | 5.96 s | 1.00 | 185 MiB | 0.16 s |
+| 2 | 4.62 s | 36.47 s | 41.40 s | 2.27 / 2.15 | 146 MiB | 4.75 s | 1.26 | 204 MiB | 0.12 s |
+| 4 | 3.72 s | 17.89 s | 21.94 s | 4.63 / 4.07 | 171 MiB | 4.73 s | 1.26 | 226 MiB | 0.11 s |
+| 8 | 3.63 s | 9.13 s | 13.09 s | 9.08 / 6.82 | 227 MiB | 4.72 s | 1.26 | 239 MiB | 0.11 s |
+
+The benchmark scales with the workers: its 4,088 units are small and many, and the largest-first order leaves no long tail. Its units' summed
+seconds are about 13 % higher with one worker than with two to eight (82 against 71 to 72), so the compile stage's speedup at 8 is 9.1. That is
+not the main thread: pinned to one vCPU (`taskset -c 3`), one worker and two take the same time (86.0 and 84.2 s); the vCPUs of this virtual
+machine run on the host's performance and efficiency cores, a possible cause (not isolated). switch-gcc stops at 1.3 times: its
+`sw_word` (44,059 instructions) is one unit of about 4.5 s (functions split for size, phase 5b). The synthetic module is too small to gain (a
+process's fixed costs). The 16,000-function benchmark (2,163,759 instructions, 16,276 functions) packs in 51.7 s with 8 workers (discovery 12.7
+s, compile 37.5 s, link 0.43 s, peak memory 438 MiB): 41,800 instructions per second for the whole pack, as the 4,000-function one's 40,700.
+In the max mode the benchmark is 31 shards of neighbouring functions, 15.3 s with 8 workers and a peak of 599 MiB.
+
+### The per-function cache
+
+[src/cache/](src/cache/) (design 13), `--cache <dir>`; for a game `<NSP folder>/<id>-work/aot-cache/`. An entry is `<dir>/<2 hex>/<key>.o`, the
+unit's object, and `<key>.tsv`, its counts and notes, both written to a temporary name and renamed (the object first), so an interrupted pack
+leaves no entry that looks whole and two packs may share a directory. The key ([pack.cpp](src/build/pack.cpp), `UnitKey`) is the SHA-256 of:
+the key's format; nxaot.lock's LLVM and dynarmic, LLVM's version and this executable's SHA-256 (the chain version until `AOT_CHAIN` exists); the
+target triple, CPU and features; the tier, the convention, the correctness mode, the debug information, line table and safepoint options,
+FPCR and whether FPSR is modelled; the module's symbol prefix; the standard entries' signature and the indirect view (the union over
+address-taken functions); then the function's entry and limit, its convention facts (PASS, WRITES, RV, returns, LIVE_AFTER, a standard entry,
+setjmp continuations, landing pads, jump tables, roots), its instruction words from entry to limit with the pc-relative fields (b, bl,
+b.cond, cbz, tbz, adr, adrp, literal loads) cleared and a reference number in their place, as `nso_match.py` normalises relocations, the
+referenced addresses in order, and the convention facts of every function it references. A shard's key is the SHA-256 of its functions' keys.
+`--asm`, `--spills` and `--ir` compile every unit (the cache holds objects only).
+
+Limits: the lowering writes module offsets into the code (the body's symbol, return addresses, pcs, the line table), so the entry and the
+referenced addresses are module offsets in the key, and a function that moved in a game update misses (its words, normalised, are the same:
+reusing it needs the lowering to reach other code through symbols only, phase 5b). A change to a function's convention facts (a callee's WRITES,
+say) misses the functions that read them, as it must.
+
+### The cache's size
+
+Nothing removed an entry, and every key holds the tool that made it (`ToolIdentity`: nxaot.lock's LLVM and dynarmic, LLVM's version, this
+executable's SHA-256), so the packs of a new nxaot reach none of the entries of the one before: about 600 MB a bundle for a game of 250 MB of packs
+(Mario vs. Donkey Kong's cache was 1.8 GB after three). The executable must then be the same file whenever its sources are: the Linux nxaot is
+(two builds in the image give the same bytes), and nxaot.exe is linked without its link time for it (`-Wl,--no-insert-timestamp` in
+[CMakeLists.txt](CMakeLists.txt); the linker's time stamp made every Windows bundle's recompiler another tool, and a player's cache gave a new bundle
+nothing). Two records make the old ones removable ([src/cache/cache.h](src/cache/cache.h)):
+
+- a pack marks the cache with its tool once, `<dir>/tools/<16 hex of the tool's identity>` (`MarkTool`): the file's time is the tool's first use of
+  this cache, and every entry the tool can reach is younger;
+- a hit sets the modification time of the entry's facts file to now (`Touch`; only when it is over an hour old, so a warm pack writes nothing), and
+  so does a load from the analysis cache.
+
+`nxaot cache-prune <dir> <seconds>` removes the entries last used before both this tool's first use of the cache and `<seconds>` ago: the facts
+first, then the object (an entry never looks whole without its object), the analysis entries, objects whose facts never came and the temporary
+files of interrupted packs; only files of those names in the cache's folders are looked at. The tool's own entries stay whatever their age: a pack
+with a profile takes the first pack's units ("The second pack's cached units"), which may be weeks old. Those of another tool used within the time
+stay too (the other platform's nxaot on the same folder). A tool that never packed into the cache gets its mark and removes nothing. The packer
+runs it after a game's packs with one day (`scripts/build_ipa_from_nsp.py` `prune_unit_cache`). Not removed: the tool's own entries that no pack
+reaches any more (the units of functions a profile moved to another tier, of an older version of the game): they grow with the packs made, not with
+the bundles, and deleting the cache folder is always safe.
+
+CTest `cache` ([tests/test_cache.py](tests/test_cache.py)): every corpus NRO packed cold into a new cache (every function a miss) and warm with
+another number of workers (every function a hit, the shared object byte for byte the cold one's); a copy of fnptr-gcc with one `movz` immediate
+changed, in a function without a jump table, whose discovery tables are otherwise the original's: one miss, the other functions hits; fnptr-gcc
+at tier C: every function a miss. The `cache-prune` rows: a pack marks its tool; the tool's own entries stay with no time allowed; a hit refreshes an entry set
+three days back; an older tool's entries, an object without facts, a temporary file and an analysis entry go with an hour allowed and stay with ten
+days, files the cache never wrote stay; the pack after it misses exactly the removed units; a first use removes nothing.
+
+Measured with 8 workers (the default here): the corpus's packs (`build_packs.sh` with `NXAOT_ARGS='--cache <dir>'`: the eighteen NROs and the
+synthetic module) cold in 12.7 s, 891 misses, 5,792,296 bytes written (891 objects, 5.9 MB with the facts files); warm in 3.3 s, 891 hits, every
+shared object byte for byte the cold one's. The benchmark cold in 13.69 s, 4,088 misses, 24,821,360 bytes written; warm in 4.32 s, 4,088 hits,
+the same shared object: 3.89 s of it are discovery, about 0.1 s the keys and 0.2 s reading the objects and linking. A warm repack is the
+analysis's time.
+
+### Extrapolation to the games after phase 5a, against section 10's targets
+
+No game module is on this machine, so the benchmark's measured rates are carried over per instruction. That is an assumption: the benchmark's
+discovery is linear in its size (533,160 instructions in 3.7 s and 2,163,759 in 13.3 s, the tables on 8 threads), but a game's call graph,
+function sizes and jump tables may not be the benchmark's. Mario is the design's `main` and `sdk`, 8.5 million instructions and about 160,000
+functions; Monster Hunter Rise's `main` 31 million and about 600,000 functions (the function counts scaled from Super Mario Bros. Wonder's
+138,000 in 28 MB: assumed). Per second on this machine: the analysis (discovery and the plan) 87,879 instructions on one thread and 143,092 with
+the jump tables on 8; compilation 7,377 per worker with 8 workers at tier W (6,509 with one), 15,650 at tier C and 6,648 in the max mode (H+
+shards), so 8 workers compile 58,403, 122,933 and 47,502; lld links about 29 µs per unit. The reference machine (4 cores and 8 threads, Core
+i3-10100 class) is taken as r = 0.5 to 0.7 of one of this machine's vCPUs per core, and its 8 threads as 5 of them (both assumed, not
+measured):
+
+| Pack | Mode | This machine, 8 workers | Reference machine (r = 0.7 .. 0.5) | Target on the reference machine |
+|---|---|---:|---:|---:|
+| Mario `main` and `sdk` | balanced, no profile (tier W) | 3.5 min | 7.1 min .. 9.9 min | at most 3 min |
+| Mario `main` and `sdk` | every function at tier C | 2.2 min | 4.2 min .. 5.8 min | - |
+| Mario `main` and `sdk` | max (H / H+) | 4.0 min | 8.3 min .. 11.7 min | at most 30 min |
+| Mario `main` and `sdk` | repack, warm cache (the analysis and the link) | 1.1 min | 1.5 min .. 2.1 min | at most 1 min |
+| Monster Hunter Rise `main` | balanced, no profile (tier W) | 12.7 min | 25.8 min .. 36.1 min | at most 10 min |
+| Monster Hunter Rise `main` | every function at tier C | 8.1 min | 15.2 min .. 21.2 min | - |
+| Monster Hunter Rise `main` | max (H / H+) | 14.8 min | 30.4 min .. 42.6 min | at most 30 min |
+| Monster Hunter Rise `main` | repack, warm cache (the analysis and the link) | 3.9 min | 5.6 min .. 7.8 min | at most 1 min |
+
+On the reference machine, of section 10's targets only Mario's max pack is met (8 to 12 minutes against at most 30); Monster Hunter Rise's max
+pack is at its limit or over it (30 to 43 minutes); the balanced packs take 2.4 to 3.6 times their targets, and even every function at tier C
+(the floor of the balanced mode with a profile) misses Mario's 3 minutes. A warm repack is bounded by the analysis, which the cache does not keep:
+the benchmark's warm repack is 4.32 s, 3.89 s of it discovery, and the games' would be 1.5 to 8 minutes against 1. The compile stage's rate
+per core and the analysis's are the gap; phase 5b's items below close it.
+
+### What phase 5a left, and what was found on the way
+
+Phase 5b's list as phase 5a wrote it; "Phase 5b" below says what became of each item.
+
+- **The compile stage's rate per core**, now most of a pack: LLVM's O1 pipeline and code generation on the lifted IR run at 6,509 to 7,377
+  guest instructions per second per core at tier W, as phase 1 measured. The IR is the cost (fnptr-gcc's lifted IR is 47,015 lines for 1,603
+  instructions before the passes; the NaN-chain cold blocks, the polls, the stores at calls and returns; InstCombine is half of the
+  optimisation, instruction selection two fifths of code generation): tiers by profile (tier C is 2.1 times as fast per worker on the
+  benchmark, for code the profile never samples), a leaner lowering, and functions split for size (switch-gcc's `sw_word`, 44,059
+  instructions, is one unit and bounds its pack's wall time).
+- **A unit's fixed cost**: about 0.5 to 1.5 ms of pass-pipeline and object set-up per unit (fnptr-gcc's 62 units: 0.758 s of compile CPU against
+  0.725 s in one module), some 5 to 15 CPU-minutes over Monster Hunter Rise's estimated 600,000 functions, and about 2.7 KiB of object per unit
+  (DWARF headers, sections, symbols: the benchmark's units are 25.2 MB against 14.1 MB as one object, its shared object 10.2 against 9.4 MB).
+  Pipelines kept per worker, or units of a few functions where the cache keys them per function, are the options.
+- **Inlining across units**: H and H+ inline within a shard of neighbouring functions; design 9.3's ThinLTO import, devirtualisation and
+  function ordering are phase 5b's.
+- **The cache across game updates**: the lowering writes module offsets into the code, so a function that moved misses (above).
+- **The analysis, cold and warm**: the summaries' fixed point and the walks run on one thread (by design: the summaries' rounds are an order
+  on which the results depend; the tables run on the workers), 143,092 instructions per second here; and the cache keeps objects only, so a warm
+  repack runs the whole analysis again (the benchmark's: 3.89 of 4.32 s). Keeping the analysis's results (per module, keyed by its SHA-256
+  and the tool's, or per function as the objects are) is what a warm repack within a minute needs.
+- **One process per module**: dynarmic's decoder table costs 60 to 70 ms per process; FINAL FANTASY X/X-2's 1,432 NROs packed one process each
+  would pay it 1,432 times (one pack for every module, phase 4's list, removes it).
+- **Found here, fixed since (ABI 3)**: (1) the line table's entries were not {native, offset} pairs whenever several machine instructions share
+  one guest access's metadata node (a guest `ldp`, dc zva's stores, a loop rotated or duplicated by LLVM): LLVM writes such a group as all its
+  addresses and then the offset once (`AsmPrinter::emitPCSections`), and both readers took 8-byte pairs: 246 of fnptr-gcc's 415 entries and 8,812
+  of switch-gcc's 24,293 named an address outside the library's code or an offset outside the module's text. nxaot now reads the groups back from
+  each unit's object by their relocations and writes a table of its own ("Calls and returns"); CTest `lines` checks every entry (fnptr-gcc now
+  487 entries, switch-gcc 24,378, all at instructions of their function's code and at loads and stores of its guest code). (2) LLVM 18 orders
+  those groups by pointer hash: the marks' section is now kept out of the link, and the packs are deterministic. **Open**: (3) discovery does
+  not bound a table index computed from several values (above).
+
+### Phase 5b
+
+The compile stage's rate per core, functions split for size, units of several functions, the analysis kept for a warm repack, and tiers by
+profile, in that order; ThinLTO import was left (below). Measured as phase 5a was, on the same machine and benchmark (best of 3 unless said;
+the machine was shared with other agents' builds at times, and the runs below waited for its one-minute load to fall under 1.5), and checked
+by the same tests: CTest 20 of 20 (18 before, `split` and `profile` new), the vectors at 0 mismatches (179,296; the x86-64-v3 crypto set 9,600;
+the per-operation NaN mode 20,856), the per-function differential test at 0 failures of 3,724 runs, every corpus NRO printing its expected
+output natively in every configuration, CTest `lines` at 0 bad entries.
+
+#### 1. A leaner lowering
+
+Where the IR went, measured with `--ir` and `--ir-opt` (new: the IR after the tier's passes, what code generation is given) and LLVM's `opt`
+and `llc` with `-time-passes` over the dumped units of a 400-function benchmark (seed 3, 57,708 instructions): of the 470,477 IR instructions
+the units held before the passes, SROA left 281,407; of those, the NaN chains' cold blocks were 35,909 (12.8 %), the non-local return paths
+24,168 and the safepoints' cold blocks 12,100; after the O1 pipeline the NaN chains' cold blocks were still 21,259 of 151,851 instructions
+(14 % of what code generation compiled), most of it the integer form of Arm's NaN rules (FPProcessNaNs: some thirty operations per escape).
+InstCombine was 40 % of the optimisation: the O1 *module* pipeline runs it eight times, its function pipeline four. Before SROA a function
+carried 71 allocas (every register, flag and FPSR accumulator, 4,331 of fnptr-gcc's 42,240 instructions), an FPSR flush of some ten
+instructions at every call, return, poll and exit whether or not the function raised a flag, and dynarmic's spelling of every `mov`, address
+and carry-less add (`add x, 0`, `shl x, 0`, `select true`, `or 0, x`). The changes, each keeping the code what InstCombine would make of it:
+
+- **The NaN rules out of line** ([src/lift/lower_fp.cpp](src/lift/lower_fp.cpp), `NaNCall`): a chain's cold path (`Escape`) calls
+  `nxaot.nan<1|2|3>.<type>`, the same rules made by `NaN1` / `NaN2` / `NaN3` once per unit, `linkonce_odr` in a comdat (the link keeps one),
+  `noinline`, `cold`, `preserve_all`, no memory access. The hot path is unchanged; the cold blocks shrank from 21,259 to 6,026 instructions
+  after the passes.
+- **Tier W's pipeline** ([src/build/pack.cpp](src/build/pack.cpp), `Optimise`): design 9.3's "O1 function pipeline"
+  (`buildFunctionSimplificationPipeline(O1)` per function) instead of phase 5a's whole O1 module pipeline, whose interprocedural passes have
+  nothing to do in a unit of separately compiled functions and whose optimisation pipeline ran InstCombine four more times: on the 400-function
+  benchmark the passes' time fell by a third, for 1.4 % more instructions after them.
+- **Folded as it is built** ([function_lifter.h](src/lift/function_lifter.h)): the builder is `IRBuilder<InstSimplifyFolder>`, so what
+  InstSimplify folds (the forms above) is never made; InstCombine runs InstSimplify on every instruction, so the code is the same.
+- **What the passes only removed** ([lifter.cpp](src/lift/lifter.cpp), `FnCleanup`): a function whose lowering raised no FPSR bit and no QC has
+  its flushes removed (they were `st->fpsr |= 0`), then every alloca nothing loads, with its stores.
+
+| fnptr-gcc (1,603 instructions) | phase 5a | phase 5b |
+|---|---:|---:|
+| `--ir` lines | 52,133 (32.5 per instruction) | 39,088 (24.4) |
+| IR instructions before the passes | 42,240 (26.4 per instruction) | 29,195 (18.2) |
+| IR instructions after them | 11,594 | 12,042 |
+| 400-function benchmark (57,708 instructions): `--ir` lines | 721,511 (12.5 per instruction) | 565,909 (9.8) |
+| IR instructions before the passes / after them | 605,688 / 151,822 | 447,850 / 142,913 |
+
+Looked at and not changed, with the measurement that decided it: the polls (`--no-safepoints` saves 6 % of the compile on the 400-function
+benchmark, 0.35 of 6.0 CPU seconds; design 6.2's rule stays), debug information and the line marks (`--no-debug-info`, `--no-line-table`: no
+difference outside the noise), NZCV stored at calls (141 stores of NZCV in the 142,913 instructions after the passes), the field addresses of
+the state block computed once per function (at tier C, whose code generation has no CodeGenPrepare, they would stay live in registers across
+the function), and flags computed only when read (some 2,000 flag-setting instructions in the 400-function benchmark at about eight IR
+instructions each, which InstCombine removes when unused: about 3 % of its input, not done). Code generation is now three quarters of the
+compile at tier W and is where the time is: instruction selection about a quarter of it, the assembly printer a ninth; its cost follows the
+IR left after the passes, whose cold paths (safepoints 6 %, non-local returns 4 %, NaN chains 4 %) are what the design asks for.
+
+#### 2. Functions split for size
+
+[src/build/pack.cpp](src/build/pack.cpp) (`SplitParts`), [src/lift/lower_calls.cpp](src/lift/lower_calls.cpp) (`FnSplit`, `FunctionPlan::
+part_entries`): a function of more than `--split-above` instructions (8,192 by default) becomes parts of a quarter to a half of that, cut in
+address order where the fewest of its edges cross, at instruction boundaries outside exclusive windows (block starts, and every 256th
+instruction inside a long straight run: `sw_word` is 19 blocks of up to thousands of instructions); a function reaching the aux region is
+kept whole (its gate sites are checked per function). Each part is an LLVM function `<body>.part<offset>` and a compile unit of its own,
+entered with the whole register file in the state block, the function's entry SP and lr, and the module offset of the block it starts at in
+x0's argument (a switch over its entries). The function's body is a stub that stores what it was passed (and sp, lr), polls, and tail-calls
+the part holding the entry; a transfer to another part's block stores the whole register file, polls when it goes backwards (a loop through
+parts) and tail-calls that part (musttail: swifttailcc allows another prototype, ghccc's is uniform); a landing pad or setjmp continuation in
+another part is reached the same way from the pending path. A return stores every x and v register outside WRITES again (the whole
+function's restore set, which no part sees). The parts' objects are joined by `ld.lld -r` into one object whose code is one section, so the
+line table's offsets from the body hold for every part and the pack keeps one function map row per guest function (ABI 3 unchanged); the
+fault report names the function for an address in any part.
+
+Deviations from design 9.3: the cut points are chosen on discovery's CFG (the rewriter cuts its analysis after `ret` / `b` / `br` with no
+branch crossing); a transfer stores the whole register file rather than the registers newer than the block. The second was found by the new
+test: storing only the dirty registers left fnptr-gcc's `main` resuming in its last part with the SP an inner frame had left in the block
+(SP and lr travel in host registers, so the block's copies are the last ones some inner frame stored: include/nxaot/aot_module.h,
+`NXAOT_LOOKUP_SP_KEPT`), and a callee's safepoint poll, gate or JIT continuation stores registers it restores before returning, which only its
+inner calls and svcs make it store again; the function itself holds the right values in SSA, the next part reads the block. Found while
+reading those failures, though not their cause, and fixed for every function: after a call the lowering kept the block's dirty set of before
+the call, so a transfer that followed the call in the same block (a part's, or a tail call into the next function after a call that returns
+there) would not store x0, x1 and the returned v registers when they had not been dirty before it (`FnCall` now updates it as the data flow
+does).
+
+CTest `split` ([tests/test_split.py](tests/test_split.py)): every corpus NRO packed with `--split-above 64` (414 functions in 14,925 parts,
+across calls, loops, jump tables, landing pads, setjmp continuations, fibers and threads), in both conventions and the correctness mode, runs
+natively printing its expected output, and its line table passes `nxaot lines`; switch-gcc at the default limit splits `sw_word` into 21
+parts and prints its output. With `--split-above 24` and 150 (ghccc) and 24 in the max mode every NRO runs too (checked by hand, not a test).
+
+| switch-gcc (51,097 instructions; `sw_word` 44,059) | whole pack, 8 workers | compile CPU (optimise and codegen) | peak memory | text |
+|---|---:|---:|---:|---:|
+| phase 5a | 4.99 s | 5.47 s | 240 MiB | 238,584 bytes |
+| lowering (1), `sw_word` whole (`--no-split`) | 4.61 s | 4.81 s | 229 MiB | 240,490 bytes |
+| `sw_word` in 21 parts | 0.67 s | 2.30 s | 136 MiB | 367,886 bytes |
+| and groups (3) | 0.74 s | 2.53 s | 138 MiB | 368,287 bytes |
+
+The parts compile faster in sum (LLVM's superlinear cost) as well as in parallel; their code is half again as large (the stores and loads of
+the register file at 33 transfers, and each part's prologue).
+
+#### 3. The unit's fixed cost: groups of functions
+
+Measured first (timers around each unit's set-up, since removed): the O1 pipeline's construction cost 25 µs per unit and the LLVM context and
+kit 37 µs; the code generation pass manager's construction and destruction 0.54 ms per unit at tier W and 0.19 ms at tier C (some 3 to 4 % of
+code generation on the benchmark), plus each object's own ELF and DWARF headers, sections and symbols, its cache entry and its link input.
+Keeping the code generation pass manager across modules would mean re-running LLVM's legacy pass manager, its MachineModuleInfo and its
+streamer on another module, which LLVM does not do itself; units of several functions remove the same cost and the per-object ones with it.
+So at tiers C and W a unit is now a group of neighbouring functions of one tier (`Units`): a group ends after a function whose code's SHA-256
+starts with a multiple of 4 once it holds a quarter of the group limit, and at the limit, 1,024 instructions (in a module of less than 32
+limits' worth a thirty-second of it, at least 64, so that a small NRO keeps units for its workers; above that the limits are fixed, so a
+game module's groups do not move with its size); the functions are still optimised one at a time (the function pipeline does not inline). The cache stays keyed per function: a group's key is the SHA-256 of its functions' keys,
+as a shard's is, so a change misses its group only (`aot: cache` counts the units and their functions). `--no-groups` restores one function
+per unit.
+
+| | units | compile CPU | object bytes | per unit | shared object |
+|---|---:|---:|---:|---:|---:|
+| fnptr-gcc, one function per unit (`--no-groups`), 1 worker | 61 | 0.56 s | 308,784 | 5,062 | 111,840 |
+| fnptr-gcc, groups of up to 1,024 instructions, 1 worker | 4 | 0.51 s | 151,072 | 37,768 | 96,032 |
+| fnptr-gcc, groups of up to 64 (its size's limit), 1 worker | 17 | 0.51 s | 187,984 | 11,058 | 99,720 |
+| benchmark (4,000), one function per unit, tier W, 8 workers | 4,088 | 52.84 s | 27,137,392 | 6,638 | 9,765,536 |
+| benchmark, groups | 688 | 50.06 s | 16,982,416 | 24,684 | 8,816,280 |
+| benchmark, one function per unit, tier C | 4,088 | 25.91 s | 32,983,184 | 8,068 | 15,747,896 |
+| benchmark, groups, tier C | 688 | 22.32 s | 22,838,960 | 33,196 | 14,797,920 |
+
+(Phase 5a's fnptr-gcc: 61 units and the tables, 0.65 s of compile CPU with one worker in these runs, 0.758 s in its own table.) fnptr-gcc as 4
+units of up to 1,024 instructions took 0.35 s with 8 workers against phase 5a's 0.20 s as 61 units: hence the smaller limit for small modules;
+as 17 units, 0.19 s.
+
+#### 4. The analysis cache
+
+[src/build/analysis_cache.h](src/build/analysis_cache.h): with `--cache`, what the pack stage takes from discovery and the plan is kept per
+module in `<cache>/analysis/<key>.bin`, under the SHA-256 of the format, the tool's identity (nxaot.lock, LLVM, this executable's SHA-256:
+the chain version until `AOT_CHAIN` exists, as the units' keys have it), the module's name and image SHA-256, a behaviour image's manifest
+file, the convention, `--all-entries` and the split limit. It holds per function the entry, limit, block bounds (the gate sites and the
+returns' table read them) and call sites, for a function the pack may split also the blocks' successors and the exclusive windows; the census's
+FPSR answer; discovery's notes; the whole plan. A warm repack reads it instead of running discovery and the plan. The file is written through a
+temporary name and renamed; its payload is followed by its own SHA-256, and an entry that is short, fails its checksum, names another key or
+does not parse is ignored (`aot: analysis cache: miss (<why>)`) and written again: never trusted. A changed tier or profile reuses it (the
+analysis does not depend on them). CTest `cache` ([tests/test_cache.py](tests/test_cache.py)) now checks the cold pack misses and the warm one
+hits it for every corpus NRO, a changed instruction word misses it (another image), a changed tier hits it, and an entry with a byte changed,
+cut short, unparsable with a valid checksum or of another key is ignored, the pack byte for byte the cold one's, and the entry rewritten.
+The 16,000-function benchmark's warm repack fell from 15.42 s (13.4 of them discovery) to 0.81 s, its entry 1.6 MB (about 22 MB at Monster
+Hunter Rise's size); extrapolated, 27 to 37 s for Monster Hunter Rise's `main` on the reference machine (below), against the design's minute.
+
+#### 5. Tiers by profile
+
+`nxaot build --profile <file>` (design 9.3: "tier H only with a profile"): in the balanced mode a function holding a sampled offset is compiled
+at tier H and the others at tier C; in the max mode at H+ and H. Without a profile nothing changes (W, or H+ in the max mode; with
+`--gap-tier C`, "Gap code at tier C", gap code at C in the balanced mode); `--tier` and `--profile` exclude each other. The format, one sample per line:
+
+```
+# comment (from '#' to the end of a line); blank lines are ignored
+<guest module offset, hexadecimal, 0x optional> <count, decimal>
+0x1a2c40 118
+1a2c58	3
+```
+
+Separated by spaces or a tab; an offset may repeat (the counts add up); a count of 0 does not make its function hot; an offset in no function
+is counted (`aot: profile <file>: <s> samples at <o> offsets, <x> outside every function`) and ignored; a malformed line stops the build with
+its file and line number. The x86-64 host writes this file: `DM_AOT_PROFILE=<folder>` (`dm/host/aot_profile.c`, Linux and Windows) samples
+every thread that runs guest code about 1,000 times per second of its CPU time (a CPU-time timer per thread and `SIGPROF`; Windows: a sampler
+thread; the interrupted pc through the pack's function map, a host call or SVC counted for the guest function that made it) and at exit writes
+`<folder>/<module>.tsv` under `#` lines naming the module, its build ID, its image's SHA-256 and the pack: one line per sampled guest
+instruction, the pc mapped through the pack's positions ("The sample profile at tier H", "The sampler's positions"), and one at its entry for
+a function with samples at no instruction (its host calls and SVCs, or a pack without positions: the form it wrote before positions), each
+function's rows after a comment line `# function 0x<entry> <samples> <rows>` ("The sampler's positions", the file); the NSP
+script passes `<NSP folder>/<id>-work/profile/<module>.tsv` to the module's next pack (docs/development.md, the x86 packing section;
+`--no-profile` ignores it); beside it the host writes the JIT fallback's misses, `<module>.misses.tsv`, which `--misses` takes ("JIT
+misses"), and the targets its inline caches were bound to, `<module>.targets.tsv`, which `--profile` reads beside the profile ("Hot indirect
+targets"). Design 12's path (`dm/games/<id>/aot_profile/<build ID>.tsv`) is not where it writes, its rows are design 12's sampled instruction
+offsets. CTest `t_aot_module` (dm/host) checks a written profile's hot function, and `profile` below builds the synthetic module with a
+profile in the host's earlier form. Here the counts only chose the tier; since, the samples' positions inside a function weigh its code at H
+and H+ (the design's "the sample profile" of tier H: "The sample profile at tier H" below); a function sampled at its entry only still has
+its tier and nothing more. A function's tier is part of its cache key;
+units are of one tier each. CTest `profile` ([tests/test_profile.py](tests/test_profile.py)): a profile written by hand for fnptr-gcc,
+fp-clang, except-gcc and switch-gcc (three functions sampled at their entries, last instructions and a second offset, a sample outside every
+function, a count of 0): the logged tiers are C n-3 and H 3 in the balanced mode, H n-3 and H+ 3 in the max mode (fnptr-gcc: `aot: tiers C 58
+W 0 H 3 H+ 0`), the profile line counts what the file holds, and every pack prints its expected output; a malformed profile stops the build
+naming its line; and the synthetic game module of dm/tools/tests/aot_synth.py with a profile in the host sampler's form (its header lines,
+`synth_hot` and `synth_cut` at their entries) logs `aot: tiers C <n> W 0 H 2 H+ 0`.
+
+#### 6. ThinLTO import: not done
+
+Left open, as the brief allowed: items 1 to 5 took the phase. What it would take: H and H+ units are shards compiled in parallel, so importing
+a callee's body into another shard needs ThinLTO's per-module summaries, an import list per shard, and the imported functions' cache keys in
+the importing shard's key (a change in a callee then misses every shard that imported it). The bodies are hidden external functions, so an
+imported copy would be `available_externally`; the lifter's IR has no other obstacle. Devirtualisation and function ordering need the profile's
+indirect-call targets and hot functions, which the host does not record yet.
+
+#### The packs after phase 5b
+
+Best of 3 (the one-worker benchmark runs and the cold runs with a cache: best of 2 and 1), the same machine as phase 5a's tables, phase 5a's
+binary measured again beside phase 5b's in the same sessions; seconds; "compile CPU" is optimisation and code generation summed over the
+units; the rate is guest instructions per second per core of that CPU time:
+
+| Pack | phase 5a: whole pack | compile CPU | rate per core | phase 5b: whole pack | compile wall | compile CPU | rate per core | peak memory |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| fnptr-gcc, tier W, 8 workers | 0.20 | 0.82 | 1,950 | 0.19 | 0.10 | 0.64 | 2,497 | 90 MiB |
+| switch-gcc, tier W, 8 workers | 4.99 | 5.47 | 9,336 | 0.74 | 0.55 | 2.53 | 20,165 | 138 MiB |
+| benchmark (4,000), tier W, 1 worker | 91.92 | 78.77 | 6,768 | 70.81 | 63.73 | 57.64 | 9,249 | 125 MiB |
+| benchmark (4,000), tier W, 8 workers | 13.68 | 71.33 | 7,475 | 10.95 | 6.86 | 50.06 | 10,650 | 232 MiB |
+| benchmark (4,000), tier C, 8 workers | 8.38 | 29.89 | 17,838 | 7.36 | 3.38 | 22.32 | 23,889 | 213 MiB |
+| benchmark (4,000), a profile of 10 % (H 409, C 3,679), 8 workers | - | - | - | 7.92 | 4.03 | 27.26 | 19,561 | 225 MiB |
+| benchmark (4,000), the max mode (H+), 8 workers | 15.3 | - | - | 14.01 | 10.10 | 67.35 | 7,916 | 486 MiB |
+| benchmark (16,000), tier W, 8 workers | 52.69 | 283.75 | 7,626 | 44.16 | 28.39 | 207.66 | 10,420 | 450 MiB |
+| benchmark (16,000), a profile of 10 %, 8 workers (machine loaded) | - | - | - | 33.49 | 18.83 | 129.01 | 16,772 | 436 MiB |
+| the corpus's packs (`build_packs.sh`), cold, with a cache | 13.39 | | | 8.26 | | | | |
+| the same, warm | 3.60 | | | 3.17 | | | | |
+| benchmark (4,000), repack with a warm cache | 4.10 | | | 0.27 | 0.13 | | | 93 MiB |
+| benchmark (16,000), repack with a warm cache | 15.42 | | | 0.81 | 0.40 | | | 189 MiB |
+
+The rate per core at tier W rose by 37 % with one worker (6,768 to 9,249) and 43 % with eight; at tier C by 34 %. Of the benchmark's 11 s at tier W
+with 8 workers, discovery and the plan are now 3.9 s: the analysis is the next bound of a cold pack (below). The warm repack reads the analysis
+(0.06 s for the 16,000-function benchmark's 1.6 MB entry), computes the units' keys on the workers (1.4 s of CPU), takes 2,693 objects from
+the cache and links them (0.16 s); the corpus's warm packs are 21 processes, each paying its fixed start (the decoder table, the executable's
+SHA-256 for the keys).
+
+#### Extrapolation to the games after phase 5b
+
+The same model and assumptions as phase 5a's (above: the benchmark's rates per instruction, Mario 8.5 and Monster Hunter Rise 31 million
+instructions, the reference machine at r = 0.5 to 0.7 of one of this machine's vCPUs per core and its 8 threads as 5 of them; the analysis
+divided by r, the compile stage and the warm repack by 5 r / 8). Rates on this machine with 8 workers, from the 4,000-function benchmark: the
+analysis 135,700 instructions per second; compilation 77,700 at tier W, 157,700 at tier C, 132,300 with a profile of 10 % (H) and 90 % (C),
+52,800 in the max mode; a warm repack 2.67 million (the 16,000-function benchmark: 0.81 s).
+
+| Pack | Mode | This machine, 8 workers | Reference machine (r = 0.7 .. 0.5) | after phase 5a | Target |
+|---|---|---:|---:|---:|---:|
+| Mario `main` and `sdk` | balanced, no profile (tier W) | 2.9 min | 5.7 .. 7.9 min | 7.1 .. 9.9 min | at most 3 min |
+| Mario `main` and `sdk` | balanced with a profile (10 % H, the rest C) | 2.1 min | 3.9 .. 5.5 min | - | at most 3 min |
+| Mario `main` and `sdk` | every function at tier C | 1.9 min | 3.5 .. 5.0 min | 4.2 .. 5.8 min | - |
+| Mario `main` and `sdk` | max (H+) | 3.7 min | 7.6 .. 10.7 min | 8.3 .. 11.7 min | at most 30 min |
+| Mario `main` and `sdk` | repack, warm cache | 3.2 s | 7 .. 10 s | 1.5 .. 2.1 min | at most 1 min |
+| Monster Hunter Rise `main` | balanced, no profile (tier W) | 10.5 min | 20.6 .. 28.9 min | 25.8 .. 36.1 min | at most 10 min |
+| Monster Hunter Rise `main` | balanced with a profile (10 % H, the rest C) | 7.7 min | 14.4 .. 20.1 min | - | at most 10 min |
+| Monster Hunter Rise `main` | every function at tier C | 7.1 min | 12.9 .. 18.1 min | 15.2 .. 21.2 min | - |
+| Monster Hunter Rise `main` | max (H+) | 13.6 min | 27.8 .. 38.9 min | 30.4 .. 42.6 min | at most 30 min |
+| Monster Hunter Rise `main` | repack, warm cache | 11.6 s | 27 .. 37 s | 5.6 .. 7.8 min | at most 1 min |
+
+Met on the reference machine: both warm repacks (well under a minute) and Mario's max pack; Monster Hunter Rise's max pack is at its limit
+(28 to 39 minutes against 30). Not met: the balanced packs, 1.3 to 1.8 times Mario's 3 minutes with a profile and 1.4 to 2 times Monster Hunter
+Rise's 10. In both, the analysis is now about two fifths of the time (Mario with a profile: 89 to 125 s of 236 to 331), so the next gains are
+the analysis's rate on a cold pack (its summaries and walks on one thread) and the compile stage's at tier C (code generation, three quarters
+of it).
+
+#### What is left
+
+- **The analysis is now a third of a cold pack** (3.6 to 3.8 s of the 4,000-function benchmark's 7.4 to 11 s with 8 workers): discovery runs at
+  about 140,000 instructions per second here, its summaries' fixed point and walks on one thread. The analysis cache removes it from a warm
+  repack only.
+- **Code generation** is three quarters of the compile at tier W; what is left of the lowering's fat is small (above), so tier C for code the
+  profile never samples is the lever; the host's sampler now writes the profiles (`DM_AOT_PROFILE`, "Tiers by profile"), and no game has been profiled yet.
+- **The cache across game updates**: unchanged (the lowering writes module offsets into the code).
+- **One process per module**: unchanged.
+- **ThinLTO import, devirtualisation, function ordering**: open (6 above). **The sample profile at tier H**: done since ("The sample
+  profile at tier H"), for profiles with positions, which the host's sampler records since ("The sampler's positions").
+
+### Phase 5c
+
+The analysis (discovery and the plan) on the workers, with every result byte for byte the one-thread result and phase 5b's. Measured as
+phase 5b was, on the same machine, which other agents' builds and tests shared during these runs (best of 3; each table says the one-minute
+load average its runs saw where it mattered); checked by CTest (21 of 21, `analysis_threads` new) and the identity checks below. Gap code at
+tier C (design section 10) was not done (6 below; done since: "Phase 5d", 6, "Gap code at tier C": a discovery fix for functions without
+an FDE, and the tier as the option `--gap-tier C`, off by default).
+
+```sh
+build/aot/nxaot discover <module> [--threads N] [--times]   # the analysis's threads (0 or none: one per CPU); its steps' seconds on stderr
+build/aot/nxaot plan <module> [--threads N]
+python3 dm/tools/aot/tests/test_analysis_threads.py --nxaot build/aot/nxaot --work /tmp/at [--module <nro>]... [--baseline <phase 5b nxaot>]
+```
+
+`nxaot build` runs the analysis on its `--workers` (the jump tables did already) and logs `aot: analysis on <n> threads: ...` (above).
+
+#### 1. Where the single-threaded analysis went
+
+Measured on phase 5b's binary (18054f9) over the 16,000-function benchmark: its stage lines with one worker and with eight (the jump tables
+ran on the workers already), and the summaries, the sources and the plan split by timers added for the measurement (an instrumented build:
+the timers add about a tenth to the summaries; since removed). Seconds:
+
+| Step | 1 worker | 8 workers | What it is |
+|---|---:|---:|---|
+| words | 0.13 | 0.15 | every text word through dynarmic's decoder table (`ClassifyWord`) |
+| walks | 1.91 | 1.83 | the CFGs of the functions walked again, over discovery's 60 rounds |
+| jump tables | 17.34 | 2.85 | 42,515 tries (17,939 skipped), 14,306 regions lifted, 239,041 taken from the memo |
+| summaries | 7.08 | 6.83 | 24 runs (1 skipped), 168 rounds, 57,461 summaries computed, 831,727 from the memo |
+| of which: the instructions' facts | 1.05 | | 537,702 distinct words, four dynarmic translations each (`InsnCache`) |
+| the memo's lookups | 1.38 | | the inputs of 889,188 summaries built and compared |
+| computing | 4.80 | | the blocks' register effects 1.60, liveness 0.05, must-writes 0.19, preservation 2.95 |
+| the rest of the rounds | 0.46 | | the "need" checks, the unions |
+| sources | 1.14 | 1.02 | the gap sweep 0.61, the calls that do not return 0.47, `adr` addresses 0.10, the rest 0.04 |
+| windows | 0.22 | 0.21 | |
+| names, coverage | 0.03 | 0.03 | |
+| the census's FPSR answer | 0.001 | 0.002 | `ReadsFpsr` |
+| plan | 0.64 | 0.61 | the writes' fixed point 0.22, LIVE_AFTER 0.37, RV and the indirect view 0.04 |
+| the analysis | 28.54 | 13.57 | |
+
+With the jump tables on the workers, everything but them ran on one thread: 10.7 of the 13.6 s, the summaries alone half of the analysis.
+
+#### 2. The summaries on the workers
+
+[src/analysis/summary.cpp](src/analysis/summary.cpp) (`Summariser::Run`). A run of the summaries is phase 1's fixed point: rounds over every
+function in address order, each function's summary computed from its code and from the summaries it reads as they are at that moment (its
+callees'; for blr and unbounded br the union over the address-taken functions): Gauss-Seidel, from one start (nothing read or written,
+every function preserving and returning) until a round changes nothing or 64 rounds. The order of the rounds matters because the transfer
+functions are not monotone, so a Jacobi scheme (every function of a round from the last round's summaries) may stop at another fixed point
+or need other rounds. Which ones, in the order from the start toward the end of the iteration:
+
+- **returns**: whether a callee returns decides which of a function's exits are return paths, and its restored set is the intersection over
+  those (`Compute`, the verdicts), so a tail callee found not to return drops an exit and the restored set can grow back; the union over the
+  address-taken functions takes writes, must-writes and preservation from those that return only (`TakenAgg`), so a function found not to
+  return shrinks the union's writes.
+- **`must - restored`** (and `writes - restored`): a callee that stops preserving x19 leaves fewer registers restored in its caller, whose
+  must-writes then grow (x19 written on every path and no longer restored).
+- **the stack slots of the abstract interpretation**: a store through an address the analysis does not know is taken not to reach the save
+  slots (`WriteSlot`), so a callee that now writes SP leaves a later store through SP unknown, and the slot keeps the saved value the store
+  would have overwritten.
+
+The SCC scheme (components of the call graph in topological order, each iterated by one thread) has the same question inside a component
+(its members' order still decides), and the union over the address-taken functions joins every function with blr or an unbounded br to every
+address-taken one: on the 16,000-function benchmark one component holds 4,558 of the 16,276 functions (28 %) and the other 11,718 are alone;
+on the 4,000-function one, 1,191 of 4,088 (counted from `nxaot discover --tsv`'s call and br rows, tail calls left out).
+
+What runs in parallel instead is each round. In round r, function i's summary is a function of its own code (its walk state and exported
+flag, fixed during the run), of the round-r summaries of the functions before it in address order that it reads, and of the round-(r-1)
+summaries of the others, itself included: a lower-triangular system, which has one solution in whatever order its equations are solved. `Run`
+solves it on the pool: the functions in levels (past every callee before them in address order, and a function with blr or an unbounded br
+past the address-taken functions before it that have neither, so that the union it reads has their summaries of the sweep), a level's
+functions at once, the union over the address-taken functions before a function taken from what the round knows when its level starts, and
+sweeps over the levels until one finds every function's inputs those of its last computation. After a sweep only a union can be stale (an
+address-taken function with blr computed in the same level or a later one); a sweep that computes nothing has found the round's solution,
+which is the address-order loop's round, so the rounds, the stop and the 64-round limit are the loop's. A function is looked at in a sweep
+only when something its inputs read changed at or after its last look (epochs numbered by the rounds' starts and the levels' steps, the same
+on any number of threads); a level's stale functions are found first and the pool is woken for 32 or more; a function whose inputs were seen
+in an earlier run takes that run's summary from the memo, as in phase 5a. The summaries' counts are the same on any number of threads: on
+the 16,000-function benchmark 168 rounds (phase 5b's) in 360 sweeps, 58,544 summaries computed against phase 5b's 57,461 (a sweep computes
+some functions with a union that is not final yet), 530,345 from the memo.
+
+Before a run, the instructions of every function whose walk changed since the last run get their facts (`InsnCache::Prepare`): the new
+distinct words are found per shard of words, translated by dynarmic on the pool (four translations each) and entered shard after shard;
+afterwards the summaries only read the cache. Measured and changed on the way, each keeping the result: the abstract interpretation joined a
+state into a successor by copying both states and comparing them, now in place (`State::JoinFrom`); the program of an instruction filled 24
+pairs of values before running at every instruction interpreted, now left uninitialised until written (the preservation analysis 2.08 →
+1.46 s on one thread); a function's inputs are compared with its last ones without building them (`SameInputs`); the callees of each
+function are found on the pool. Computing the 16,000-function benchmark's summaries took 4.80 s on one thread in phase 5b (the blocks'
+effects 1.60, preservation 2.95), 2.81 s now (1.09 and 1.46; both instrumented).
+
+#### 3. Discovery's other steps and the plan
+
+One pool of threads per discovery ([src/analysis/parallel.h](src/analysis/parallel.h): the calling thread and `--workers` - 1 others, items
+handed out in chunks of neighbouring indices from an atomic counter), used by every step whose items are independent; each item writes only
+its own results, which are applied in index order afterwards, so that nothing depends on which thread ran what:
+
+- **The walks** (`WalkDirty`, `Walk`): the functions to walk again, on the pool; a walk reads the image, the set of functions and the
+  summaries and writes its own function, its walk count and state, and its own lists of the entries code names (`bl` and tail-call targets)
+  and of the text addresses `adr` / `adrp` + `add` build, which are then applied in function order, as walks one after another left them.
+- **The words** (the constructor): every text word classified (`ClassifyWord`, dynarmic's decoder table) in chunks.
+- **The gap sweep** (`Gaps`, `Covered`): the covered words marked per function (their text blocks lie in their own `[entry, limit)`), the
+  candidates found in chunks (a function of the covered words and the words alone), then taken in address order as before (`Owner` and
+  `AddEntry` read what the earlier candidates added).
+- **The calls that do not return** (`CutNoreturn`): each function checked on its own; the functions the last summaries cover and whether each
+  returns are kept in address order (they rebuilt a `std::set` of every entry at each call, and every check looked the callee up in it and
+  in the function map; the summaries change only at the next run, after which this runs again): the sources' seconds on one thread 0.89 →
+  0.78 on the 16,000-function benchmark, 0.25 → 0.18 with 8 threads for this step alone.
+- **The jump tables** (`Tables`): on the same pool, one function at a time (their costs differ by orders of magnitude).
+- **The windows** (`FindWindows`): each function's own.
+- **The plan** ([src/build/plan.cpp](src/build/plan.cpp), `MakePlan(..., threads)`): every function's own writes on the pool; the writes'
+  fixed point over the call graph (a union from each function's own writes: rounds in which every function takes its callees' sets of the last
+  round reach the least fixed point above the start, which rounds seeing this round's sets in address order reached; the rounds are not
+  recorded); LIVE_AFTER's rounds (already rounds that apply their additions at the end: `live_after_rounds`, which the analysis cache keeps,
+  is the same) with each function passed on the pool into its own additions, joined after the round. RV and the indirect view stay on one
+  thread (0.04 s).
+
+Left on one thread, measured: the sources (FDEs, symbols, the dynamic section, relocations: 0.016 s), the function boundaries (`Limits`), the
+landing pads, the pending entries, the `adr` addresses (0.095 s), Verify (0.025 s), the census's FPSR answer in the pack stage (`ReadsFpsr`,
+0.002 s), the names, the coverage and the oracle (0.03 s).
+
+#### 4. Identity
+
+The results are the same on any number of threads by construction (every parallel step writes only its own items' results, applied in index
+order; each round of the summaries has one solution), and checked byte for byte:
+
+- CTest `analysis_threads` ([tests/test_analysis_threads.py](tests/test_analysis_threads.py)): for every corpus NRO, the synthetic game module
+  and the host-function module's two (21 modules), `nxaot discover --tsv` (its TSV and its printed lines, with symbols as a source and as the
+  oracle) and `nxaot plan` with 1 thread and with 8; `nxaot build --cache` with 1 worker and with 8, each into a cache of its own: the analysis
+  cache's entry (discovery's view and the plan, under the same key) and the shared object: 5 outputs per module, 105 in all, the same.
+- Against phase 5b's binary (`--baseline`, 8 outputs per module): the same discover and plan outputs for the 21 modules and both benchmarks
+  (184 outputs); the corpus's 18 packs and both benchmarks' packs built by both with 8 workers, byte for byte the same, and their analysis
+  entries' payloads the same (the key differs: it holds the tool's SHA-256; the 16,000-function benchmark's payload is 1,576,746 bytes).
+- Both benchmarks (`--module`, by hand: the 16,000-function benchmark's packs take minutes with one worker): the 8 outputs the same.
+- CTest `cache`: a warm repack runs no analysis; a pack after one changed word runs it on the given workers and writes the entry a pack with
+  one worker writes.
+- The `manifest`, `discover`, `plan` and `lines` CTests pass unchanged, and the other 16.
+
+#### 5. The warm path and a partial miss
+
+A warm repack with nothing changed reads the analysis from the cache and runs none of it (phase 5b); CTest `cache` now also checks that no
+analysis ran (no `aot: analysis on` line). The analysis cache is keyed by the module's image, its manifest file and the tool, so one changed
+instruction word misses the whole analysis: discovery is a fixed point over the whole module (a word can change a function's walk, its
+summary and through the unions every summary that reads it), and nothing smaller than the module is a sound key for it. What the key
+invalidates, then, is the analysis, which runs again on the workers, and the unit holding the changed function, which compiles again; every
+other unit is a hit. CTest `cache` checks this on fnptr-gcc with one `movz` changed: one unit missed, the analysis missed and run on 4
+threads, its entry byte for byte the one a pack of the same copy with one worker writes. Measured on the 16,000-function benchmark with one
+`movz` changed past the middle of its text (the units of the original in the cache):
+
+| 16,000-function benchmark, 8 workers, seconds | phase 5b: whole pack | its analysis | phase 5c: whole pack | its analysis |
+|---|---:|---:|---:|---:|
+| cold, into a new cache (one run) | 40.97 | 13.18 | 35.12 | 6.20 |
+| warm repack (the analysis read from the cache, every unit a hit) | 0.83 | 0.07 | 0.82 | 0.06 |
+| one `movz` changed (the analysis missed and run again; the changed unit compiled in the first of the three runs, a hit in the other two) | 14.20 (first 14.46) | 13.34 | 7.05 (first 7.19) | 6.44 |
+
+A repack after a small change of the module costs half what it did, nearly all of it the analysis, now on the workers; carried over per
+instruction as below, Monster Hunter Rise's `main` would take its analysis's 2.9 to 4.0 minutes on the reference machine (5.1 to 7.1 in
+phase 5b) plus the warm repack's 27 to 37 seconds, against the warm repack's target of a minute (which the design sets for an unchanged
+module).
+
+#### 6. Gap code at tier C: not done
+
+Left as phase 5b left it, with what this phase found: the game-shaped benchmark has no gap code (all 16,276 functions of the 16,000-function
+one have an FDE; `summary provenance ... gap 0/0`), and neither has the corpus, so nothing here measures it; the change belongs to the units'
+tiers in pack.cpp (`Units`, the tiers by profile), which another change was editing during this phase. Games without FDEs (FINAL FANTASY
+RESONANCE's 94 MB, 95 % without them) are where it matters. Done since: "Phase 5d", 6, "Gap code at tier C" (`gen_bench.py --direct
+--no-fde-percent` as its input, a fix to discovery for functions without an FDE, and the tier measured and made an option, `--gap-tier C`,
+off by default).
+
+#### The analysis and the packs after phase 5c
+
+The analysis alone (`nxaot discover --times` for its steps, `nxaot plan` for discovery and the plan together), best of 3 (one run with one
+thread), phase 5b's binary and this one in the same session on a machine with no other work (the load average, 1.2 to 4.5, is the
+measurements' own); seconds, the process's CPU seconds, its peak memory:
+
+| Seconds | 16,000: phase 5b, 8 workers | phase 5c, 1 thread | phase 5c, 8 threads | 4,000: phase 5b, 8 workers | phase 5c, 1 thread | phase 5c, 8 threads |
+|---|---:|---:|---:|---:|---:|---:|
+| words | 0.13 | 0.14 | 0.16 | 0.11 | 0.08 | 0.10 |
+| walks | 1.82 | 1.99 | 0.38 | 0.41 | 0.41 | 0.14 |
+| jump tables | 2.93 | 18.35 | 2.43 | 0.95 | 4.11 | 0.90 |
+| summaries | 6.71 | 5.53 | 2.64 | 1.88 | 1.73 | 1.53 |
+| sources | 0.98 | 0.79 | 0.52 | 0.18 | 0.15 | 0.14 |
+| windows | 0.22 | 0.21 | 0.03 | 0.05 | 0.05 | 0.02 |
+| names, coverage | 0.01 | 0.03 | 0.03 | 0.01 | 0.01 | 0.01 |
+| discovery, wall (CPU) | 13.39 (30.81) | 27.38 (27.02) | 6.55 (29.62) | 3.67 | 6.63 (6.53) | 2.94 (8.93) |
+| discovery and plan (`nxaot plan`), wall (CPU) | 13.61 (30.86) | 27.55 (27.51) | 6.59 (30.28) | 3.78 (8.72) | 6.73 (6.71) | 2.91 (8.94) |
+| instructions per second (`nxaot plan`) | 159,000 | 78,500 | 328,100 | 141,100 | 79,300 | 183,300 |
+| peak memory (`nxaot plan`) | 359 MiB | 330 MiB | 341 MiB | 136 MiB | 127 MiB | 134 MiB |
+
+Phase 5b's steps are those of its fastest pack below (its `aot: discover seconds` line; `nxaot discover` of phase 5b prints no times). On the
+16,000-function benchmark the analysis is 2.1 times as fast with 8 workers as phase 5b's (6.59 against 13.61 s) and 4.2 times its own one
+thread, for the same CPU seconds (about 30); the jump tables, parallel already, are now one of its two largest steps with the summaries. The
+4,000-function benchmark gains less (1.3 times phase 5b's alone, 1.5 inside the packs below; 2.3 times its one thread): its summaries take
+240 rounds in 504 sweeps (10 rounds per run where the larger one takes 7) over a quarter of the functions, and the rounds' and levels' fixed
+costs (a pass over the stale functions, the unions' prefixes, a wake of the pool) weigh more; they shrink relative to the work as a module
+grows. Peak memory does not grow (the summaries' last inputs per function against phase 5b's per-run bookkeeping).
+
+Whole packs at tier W, no cache, phase 5b's binary and this one interleaved run by run, best of 3 by the whole pack (the 4,000-function
+benchmark with one worker: one run each); seconds; "analysis" is discovery and the plan (wall; this binary's CPU seconds of them in
+parentheses, from `aot: analysis on`), "compile" the units' wall time; peak memory over the three runs:
+
+| Pack | phase 5b: analysis | compile | whole pack | peak memory | phase 5c: analysis (CPU) | compile | whole pack | peak memory |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| 16,000-function benchmark, 8 workers | 13.43 | 27.35 | 41.33 | 445 .. 459 MiB | 6.68 (31.6) | 28.32 | 35.37 | 400 .. 417 MiB |
+| 4,000-function benchmark, 8 workers | 3.70 | 6.74 | 10.60 | 234 .. 242 MiB | 2.40 (8.2) | 6.86 | 9.38 | 228 .. 244 MiB |
+| 4,000-function benchmark, 1 worker | 6.64 | 62.63 | 69.41 | 125 MiB | 6.71 | 61.84 | 68.70 | 126 MiB |
+| switch-gcc, 8 workers | 0.14 | 0.50 | 0.68 | 137 .. 143 MiB | 0.17 (0.19) | 0.52 | 0.72 | 136 .. 141 MiB |
+| fnptr-gcc, 8 workers | 0.08 | 0.10 | 0.19 | 90 .. 91 MiB | 0.08 (0.08) | 0.10 | 0.21 | 90 .. 91 MiB |
+
+The 16,000-function benchmark's pack takes 14 % less (the analysis from a third of it to a fifth), the 4,000-function one's 12 %. The
+compile stage is the same code and the same units (their wall times move by a few percent between interleaved runs). A small NRO pays
+about 0.02 to 0.03 s more for its analysis: two pools of threads made and woken (discovery's and the plan's) for work of a few
+milliseconds (switch-gcc's analysis: 0.14 to 0.18 s in phase 5b, 0.16 to 0.20 now). Peak memory with 8 workers stays where phase 5b had
+it: the 4,000-function benchmark between 228 and 244 MiB in both binaries' runs (phase 5b's table: 232), the 16,000-function one lower
+(400 .. 417 against 445 .. 459 MiB; not looked into).
+
+#### Extrapolation to the games after phase 5c
+
+Phase 5b's model and assumptions (the benchmark's rates per instruction, Mario 8.5 and Monster Hunter Rise 31 million instructions, the
+reference machine's core at r = 0.5 to 0.7 of one of this machine's vCPUs and its 8 threads as 5 of them), with the analysis no longer one
+thread's: its one-thread and 8-thread times on the 16,000-function benchmark (`nxaot plan`, discovery and the plan: 27.55 and 6.59 s; phase
+5b's 28.54, from its one-worker pack, and 13.61) split it into a serial part S and a parallel part P (T1 = S + P, T8 = S + P / 8: S = 3.6 s
+and P = 24.0 s now, 11.5 and 17.1 s in phase 5b, where only the jump tables ran on the workers), and on the reference machine S takes S / r
+and P takes P / (5 r). The compile stage is phase 5b's (its code did not change): 77,700 instructions per second here with 8 workers at tier W,
+132,300 with a profile of 10 % (H) and 90 % (C), 52,800 in the max mode, divided by 5 r / 8 there. Phase 5b's analysis, measured in the same
+session, goes through the same model in the column "after phase 5b" (its figures are within 0.1 to 0.5 minutes of phase 5b's own table, which
+took the 4,000-function benchmark's rates and the whole analysis as one thread's). These are extrapolations, not measurements: no game module
+and no reference machine is here.
+
+| Pack | Mode | This machine, 8 workers | Reference machine (r = 0.7 .. 0.5) | after phase 5b | Target |
+|---|---|---:|---:|---:|---:|
+| Mario `main` and `sdk` | balanced, no profile (tier W) | 2.3 min | 5.0 .. 6.9 min | 5.6 .. 7.8 min | at most 3 min |
+| Mario `main` and `sdk` | balanced with a profile (10 % H, the rest C) | 1.5 min | 3.2 .. 4.5 min | 3.8 .. 5.4 min | at most 3 min |
+| Mario `main` and `sdk` | max (H+) | 3.1 min | 6.9 .. 9.7 min | 7.5 .. 10.5 min | at most 30 min |
+| Monster Hunter Rise `main` | balanced, no profile (tier W) | 8.2 min | 18.1 .. 25.3 min | 20.3 .. 28.4 min | at most 10 min |
+| Monster Hunter Rise `main` | balanced with a profile (10 % H, the rest C) | 5.5 min | 11.8 .. 16.5 min | 14.0 .. 19.6 min | at most 10 min |
+| Monster Hunter Rise `main` | max (H+) | 11.4 min | 25.2 .. 35.3 min | 27.4 .. 38.4 min | at most 30 min |
+
+The analysis on the reference machine falls from 1.4 .. 2.0 to 0.8 .. 1.1 minutes for Mario and from 5.1 .. 7.1 to 2.9 .. 4.0 for Monster Hunter
+Rise; with a profile it is now a quarter of a balanced pack (Mario 47 of 194 s at r = 0.7), where it was more than a third. Still not met:
+the balanced packs (Mario with a profile 1.1 to 1.5 times its 3 minutes, Monster Hunter Rise 1.2 to 1.7 times its 10), now bounded by the
+compile stage at tier C and H (three quarters of the time), and Monster Hunter Rise's max pack at r = 0.5. Met as before: Mario's max pack,
+both warm repacks, and now Monster Hunter Rise's max pack at r = 0.7.
+
+#### What is left
+
+- **The jump tables** are now the analysis's largest part on the workers (their regions lifted and simplified by LLVM: 17 of the
+  16,000-function benchmark's 28 seconds of discovery on one thread); they were parallel already, and their CPU is unchanged.
+- **The summaries' runs**: 24 runs of up to 7 rounds each on the 16,000-function benchmark, every run from the fixed start (a run that
+  started from the last run's summaries could end at another fixed point: the transfer functions are not monotone, 2 above); the memo makes
+  most of a later run's functions lookups.
+- **The memo's memory**: per function up to 8 sets of inputs (2 + 7 words per callee) with their summaries, and now the inputs of each
+  function's last computation; at Monster Hunter Rise's estimated 600,000 functions that is some hundreds of MiB, not measured on a module of
+  that size.
+- **Gap code at tier C** (6 above; done since, "Phase 5d", 6: `--gap-tier C`, off by default), **code generation** at tier W, **the cache across game updates**, **one
+  process per module**, **ThinLTO import, devirtualisation, function ordering, LLVM's sample profile at tier H**: as phase 5b left them (the
+  sample profile done since: "The sample profile at tier H").
+- The runner [tests/run_aot_tests.sh](tests/run_aot_tests.sh) lists its tests by hand and does not run `analysis_threads` yet.
+
+### Phase 5d
+
+The compile stage's rate per core at tiers C and W, the two that the balanced packs compile: with a profile 90 % of the functions are at tier C,
+without one every function is at tier W. In this order: where tier C's time went, FastISel's coverage, fewer IR instructions per
+guest instruction, tier W's passes, the loader's data blocks, and gap code (6: not done in this phase; after "Memory at scale" the discovery
+fix and the option `--gap-tier C`, off by default). Measured
+as phase 5c was, on the same machine and
+benchmarks, with phase 5c's binary (55d53ad) built beside this one and measured in the same sessions; other agents' builds loaded the machine
+at times (the one-minute load average of the runs is given where it mattered; best of 3 unless said). Checked by CTest 23 of 23
+(`corpus_funcdiff_c` new: the per-function differential test with every function at tier C; `corpus_native` runs the corpus at tier C too): the
+vectors at 0 mismatches (179,296; the x86-64-v3 crypto set 9,600; the per-operation NaN mode 20,856), the per-function differential test at 0
+failures of 3,724 runs at tier W and of 3,724 at tier C, every corpus NRO printing its expected output natively in all five configurations,
+`analysis_threads` and `pack_windows` green, and the analysis's outputs byte for byte phase 5c's (5 below).
+
+```sh
+build/aot/nxaot build <module> --shared <lib.so> --tier C --isel-misses   # FastISel's misses by kind and the IR they hand to SelectionDAG
+python3 dm/tools/aot/tests/test_funcdiff.py --nxaot build/aot/nxaot --nxaot-funcdiff build/aot/nxaot_funcdiff --work /tmp/fd --tier C
+python3 dm/tools/aot/tests/gen_bench.py --functions 4000 --data-rows 5000 --nxaot build/aot/nxaot /tmp/bench   # rows/: 5,000 more data rows
+```
+
+`--isel-misses` (no cache: every unit is compiled) logs `aot: fastisel misses <n>, IR instructions to SelectionDAG <m>` and a line per kind
+of miss: `aot: fastisel miss <count> <IR instructions> <kind>`, the kind being the remark's (a call, which SelectionDAG compiles alone; a
+terminator, for which it compiles the whole block; another instruction, for which it compiles the block up to it; a function's arguments)
+and the IR it names without its operands. `--time-passes` now also prints LLVM's other timer groups (SelectionDAG's phases, the
+AsmPrinter's handlers).
+
+#### 1. Where tier C's time went
+
+LLVM's pass timers are no measure of code generation here: with `--time-passes` the 4,000-function benchmark's code generation at tier C took
+32.8 s on one worker, against 16.1 s summed over eight without them, because SelectionDAG times each of its phases per DAG and the
+AsmPrinter each of its handlers per machine instruction, each timer a `getrusage` (the AsmPrinter came out at 33 % of the passes' time, the
+DWARF handlers at half of it, mostly the timers' own system time). The shares below are from a sampling profiler instead (`SIGPROF` every
+millisecond of CPU time, each sample's backtrace symbolised against libLLVM's exported symbols and nxaot's own; a measurement tool, not in the
+repository), each sample counted for the most specific stage its stack names; the passes' timers ordered the IR passes. Phase 5c's binary, the
+4,000-function benchmark, every function at tier C, 8 workers; the compile is everything but the analysis (12,484 samples):
+
+| Stage | Share of the compile | |
+|---|---:|---|
+| SelectionDAG for FastISel's misses | 35.3 % | building, combining, legalising, selecting and scheduling DAGs |
+| FastISel | 1.1 % | |
+| instruction selection's own set-up, arguments | 1.8 % | |
+| InstCombine | 16.1 % | |
+| SROA | 7.7 % | |
+| SimplifyCFG, DCE | 0.8 % | |
+| machine passes (the fast register allocator, frame lowering, the FP stackifier, vzeroupper, ...) | 10.1 % | |
+| AsmPrinter: instructions | 3.4 % | MC encoding |
+| AsmPrinter: DWARF | 1.9 % | line rows, one per guest instruction (`--no-debug-info`: 11 % less compile CPU, 22.92 against 20.38 s) |
+| MC layout and the object | 0.9 % | relaxation, the ELF writer |
+| lifting | 13.3 % | |
+| the verifier | 2.9 % | |
+| the unit's fixed cost | 4.6 % | the code generation pass manager's set-up 2.2 %, the kit and entries 0.6 %, cache keys and line marks 0.7 %, the rest of `CompileUnit` 1.1 % |
+| other | 1.0 % | |
+
+Of the optimisation and code generation, the part the rate per core counts, SelectionDAG was 43 %: tier C was mostly not compiled by FastISel.
+FastISel missed 54,661 times and handed 960,035 of the 1,429,166 IR instructions (67 %) to SelectionDAG; by the IR instructions each kind of
+miss handed over (measured by the instrumented binary with phase 5c's tier C pipeline and no preparation, which gives phase 5c's counts):
+
+| Miss | Count | IR to SelectionDAG | Cause |
+|---|---:|---:|---|
+| terminator: `br i1` | 9,258 | 481,453 | a vector NaN check's compare of `<4 x i1>` as an `i4` (the code generator's ExpandReductions makes it of `vector.reduce.or`), or the next |
+| terminator: `br label` | 6,237 | 142,291 | the returned struct's phi: SimplifyCFG's tail merging joins the returns into `common.ret`, a phi of `{x0, x1, v0..v3}`, which FastISel has no register for; every block that ends in a guest call branches there (its pending check) |
+| terminator: `ret {...}` | 5,334 | 123,615 | a swifttailcc return (X86FastISel takes the C conventions): the block before it went with it |
+| `fptoui double` | 768 | 45,754 | to i64: no x86 instruction before AVX-512 |
+| `load atomic` | 1,673 | 44,604 | the inline caches' slot (unordered): X86FastISel selects no atomic load |
+| `fmul <4 x float>` | 2,077 | 27,755 | a vector constant operand, which FastISel cannot materialise |
+| terminator: `ret i32`, `ret <4 x i32>` | 970, 448 | 16,039, 11,200 | the NaN helpers' bodies (preserve_all), a copy in every unit that used them |
+| `extractelement`, `insertelement`, `store <2 x i64>` (a constant), `switch` | 2,619 | about 40,000 | no selection for vector elements; a constant vector; no switch lowering |
+| calls: the NaN helpers 13,069, the safepoint 3,168, the dispatcher 1,673, `fshl` 1,333 | 19,243 | 19,243 | SelectionDAG compiles the call alone |
+| arguments | 6,014 | 6,014 | swifttailcc arguments (X86FastISel lowers the C convention's only) |
+
+#### 2. FastISel's coverage
+
+After the tier's passes, tier C's IR is rewritten into what FastISel selects ([src/build/pack.cpp](src/build/pack.cpp), "Tier C's code for
+FastISel"), each rewrite the same operation (the same machine code, or SelectionDAG's own expansion of it):
+
+- **The returns split again** (`SplitCommonReturns`): each predecessor of `common.ret` returns its own value; **struct phis scalarised**
+  (`ScalarizeStructPhis`: InstCombine's fold of the same field of two calls' results into a phi of the results; 194 such phis); **a return
+  block split** before its `insertvalue` chain and return, or before a `musttail` call and its return (`SplitReturnBlocks`), so that
+  SelectionDAG compiles those alone and FastISel the stores before them.
+- **The NaN checks' lane masks** (`LaneMasks`): `vector.reduce.or` of `fcmp uno` becomes `cmpunordps` / `cmpunordpd` and `movmskps` /
+  `movmskpd` (the instructions SelectionDAG makes of it; two calls SelectionDAG compiles alone) and a scalar compare; of IsNaN's
+  `icmp ugt (and x, ~sign), c` an add of `SMAX - c`, whose lanes' sign bits are the compare's (the and leaves at most SMAX), then the mask.
+- **`fptoui` to i64** (`ExpandFPToUI`) as SelectionDAG expands it: below 2^63 a signed conversion, else the signed conversion of x - 2^63 (exact
+  there) with the top bit set; to i32 the signed conversion to i64, truncated.
+- **The inline caches' slot and the safepoint flag** (`PlainAtomicLoads`): an unordered or monotonic load of at most 8 naturally aligned bytes
+  becomes a volatile load, one mov either way; neither is removed or moved across another volatile access after the passes. Acquire loads stay.
+- **Vector constants** (`LoadVectorConstants`) loaded from a constant of the unit (SelectionDAG's constant-pool load), in front of the
+  instructions FastISel selects; a mask of `i1` lanes stays a constant.
+- **The NaN helpers once per pack** ([src/lift/lower_fp.cpp](src/lift/lower_fp.cpp), `NaNCall`, `DefineNaNHelpers`): the units declare them
+  and the tables' object defines all 18 (arity 1 to 3; half, single and double precision, scalar and 128-bit vectors); they depend on nothing
+  else. 1,418 copies over the benchmark's 688 units are gone, at every tier (the units' objects 0.78 MB smaller at tier W); a region (the
+  vector harness, the JIT of nxaot_bench) still defines its own.
+- **Rotates and `extr` by a constant as shifts** ([src/lift/lifter.cpp](src/lift/lifter.cpp), `FunnelRight`): dynarmic's `ubfm`, `sbfm` and
+  `bfm` are a rotate by an immediate and a mask, and the `fshr` intrinsic is a call FastISel hands to SelectionDAG (32,304 of them on the
+  benchmark once InstCombine no longer turned them into shifts, 4); InstCombine turns the shifts back into the intrinsic where it is a
+  rotate, so tier W's code is the same (the pack the same size).
+
+Left to SelectionDAG, as single calls or small blocks: swifttailcc calls, returns and arguments (X86FastISel's `fastLowerCall` refuses
+tail-callable conventions, `X86SelectRet` SwiftTail, `fastLowerArguments` takes the C convention only), the preserve_all calls (the NaN
+helpers, the safepoint, the dispatcher), the vector element operations (FastISel has no selection for `insertelement`, `extractelement`,
+`shufflevector`, a select or compare of vectors) and `switch`. On the benchmark at tier C with this phase's binary:
+
+| | phase 5c | phase 5d |
+|---|---:|---:|
+| FastISel's misses | 54,661 | 57,377 (30,688 calls, each compiled alone; 16,733 returns with their `insertvalue` chains; 4,596 functions' arguments) |
+| IR instructions handed to SelectionDAG | 960,035 of 1,429,166 (67 %) | 206,119 of 1,646,552 (12.5 %) |
+| the largest left | `br i1`, 481,453 | `insertelement <4 x i32>` 73,104, returns 38,218, `extractelement` 25,982, vector selects 14,436, `switch` 7,444 |
+| SelectionDAG's share of the compile (the profiler) | 35.3 % | 21.8 % |
+
+#### 3. Fewer IR instructions per guest instruction
+
+| 4,000-function benchmark (533,160 instructions) | phase 5c | phase 5d |
+|---|---:|---:|
+| IR instructions before the passes (`--ir`) | 4,047,934 (7.59 per instruction) | 3,055,859 (5.73) |
+| after tier C's passes (`--ir-opt`) | 1,429,166 (2.68) | 1,646,552 (3.09: InstSimplify in place of InstCombine, and 2's loads) |
+| after tier W's passes | 1,262,033 (2.37) | 1,237,360 (2.32) |
+
+- **The general registers forwarded within a block** ([src/lift/lifter.cpp](src/lift/lifter.cpp), `ForwardGeneralRegisters`, beside the
+  lifter's `ForwardVectorRegisters`): a GetX after a SetX of the register (GetW after SetW, GetSP after SetSP) takes the value written, and a set
+  the block overwrites before reading the register is dead. svc and the exceptions that leave end their block, so nothing inside a block
+  reads the registers' allocas but the gets. Measured on the same binary with and without it: 4,085,375 IR instructions before the passes to
+  3,107,972 (-24 %; loads of the allocas 1,126,641 to 671,511, stores 928,197 to 631,317); after the passes the same (mem2reg did the same
+  forwarding). NZCV is not forwarded ("Known issues", 1).
+- **NZCV made lazily** (`MaterializeNzcv`): a flag-setting operation's flags reach the allocas only when something reads them there (a raw
+  read, a condition its origin does not give, a store of NZCV to the block) or when NZCV is live after its block; a compare that only its own
+  branch or select reads (through its origin) makes none. The 19,750 flag-setting operations made 107,687 instructions and 4 stores each;
+  lazily, 52,113 instructions fewer before the passes (-1.7 %; phase 5b had estimated the unused flags at 3 % of InstCombine's input). Most
+  flags are live after their block: the function's NZCV liveness counts every call, return and exit as a reader (a call stores a dirty NZCV
+  to the block, which holds the whole register file for the callee's safepoints: design 2.3, 6.2).
+- **The polls**: unchanged in what they do (design 6.2: a poll at every function entry that calls and at every backward branch). The hot path is
+  one load (volatile at tier C, 2), a compare and a branch; the cold path stores the registers newer than the block and calls the safepoint
+  through a preserve_all wrapper, which the block's invariant needs. They are 10 % of tier C's text (12.92 MB, 11.68 with `--no-safepoints`);
+  their compile time was not separable from the noise of these runs (load 4 to 7).
+- **The stores at calls and returns**: checked against the summaries. A return stores `dirty & LIVE_AFTER & WRITES` less what it returns
+  (`FnReturn`); after a call only `WRITES(callee)` is reloaded; before a call every dirty register the callee is not passed is stored, which is
+  the block's invariant of design 2.3 (a callee's safepoint, gate or JIT continuation must find the caller's registers there), not something
+  a summary may narrow.
+- **The 32-bit forms**: a GetW after a SetW is forwarded (above); what the builder folds (a truncation of an extension) is never made.
+- **The NaN chains**: the hot path's inline part is the check (2); the cold path calls the pack's helpers (2).
+
+#### 4. Tier W's pipeline
+
+Phase 5b's tier W ran LLVM 18's O1 function simplification pipeline whole. Its passes on this IR, one at a time (the 4,000-function
+benchmark; the passes' seconds from `--time-passes` on one worker, with this phase's lowering; the text of the pack without the pass; int_ops'
+run time natively without it, fastest of 5 runs in each of 3 interleaved rounds, the O1 pipeline 74.42 ms):
+
+| Pass (O1's order) | Seconds | Text without it | int_ops without it |
+|---|---:|---:|---:|
+| SROA (the first) | 2.21 for both | mem2reg in its place: -2,627 bytes | 73.85 ms with mem2reg |
+| EarlyCSE | 1.46 | +55,946 bytes (+0.9 %) | 72.18 ms |
+| SimplifyCFG (four times) | 0.61 for the four | | |
+| InstCombine (four times) | 9.05 for the four | | |
+| LibCallsShrinkWrap, MemCpyOpt, CoroElide, ADCE, the second SROA | 0.45 and the SROA's share | the same pack, byte for byte | 74.29 ms |
+| Reassociate | 0.42 | -30,010 bytes (-0.5 %) | 72.35 ms |
+| the loop passes (LICM twice, LoopRotate, SimpleLoopUnswitch, LoopInstSimplify, LoopSimplifyCFG; LoopIdiomRecognize, IndVarSimplify, LoopDeletion, LoopFullUnroll) | about 1.6 with MemorySSA | -1,275 bytes | 72.40 ms |
+| the second InstCombine | with the third and fourth 5.3 (the first alone 3.75: below) | +80 bytes | 75.41 ms |
+| SCCP, BDCE | 0.91 | +2,204 bytes | 75.57 ms |
+| the third and fourth InstCombine | | +340 bytes | 75.30 ms |
+
+int_ops' run times vary by about 3 % between the rounds; none of the passes left out is outside that, and the loop passes cost it 8 % more
+code (60,159 bytes without them, 65,837 with). The guest's memory accesses are volatile, so LICM, the loop idiom pass and loop deletion move or
+remove nothing that matters. Tier W is now ([src/build/pack.cpp](src/build/pack.cpp), `Optimise`): mem2reg, EarlyCSE (with MemorySSA),
+SimplifyCFG, InstCombine, SimplifyCFG, SCCP, BDCE, SimplifyCFG (O1's SimplifyCFG options). Its passes on the same measure: InstCombine 3.75 s,
+EarlyCSE 1.33, mem2reg 0.70, SCCP 0.54, SimplifyCFG 0.53, BDCE 0.35: 7.2 s and 0.3 s of analyses, against the O1 pipeline's 16.3 s and 0.6 s.
+Measured against O1 on the same lowering:
+
+| 4,000-function benchmark, tier W, 8 workers | O1 function pipeline | phase 5d's |
+|---|---:|---:|
+| optimisation, CPU seconds | 14.34 | 6.54 |
+| code generation, CPU seconds | 34.27 | 34.57 |
+| text | 5,963,951 | 5,936,703 (-0.5 %) |
+| int_ops natively (fastest, 5 rounds of 5) | 75.00 ms | 72.56 ms |
+| the benchmark natively (fastest, 2 rounds of 3; most of it is its 7,818 runs in the JIT fallback) | 1,591.7 ms | 1,575.8 ms |
+| the calls programs (`nxaot_bench --sections calls`, tier W rows) | | within their noise (about 10 %) of each other |
+
+The register allocator's spills and reloads (`--spills`) on five corpus NROs, O1 against phase 5d: fnptr-gcc 372 / 912 against 381 / 1,072,
+switch-gcc 1,385 / 3,110 against 1,309 / 3,011, int_ops-gcc 440 / 1,456 against 390 / 1,427, fp-gcc 447 / 1,289 against 444 / 1,450, simd-gcc
+670 / 3,345 against 564 / 2,467; the text 0.4 to 19 % smaller in each.
+
+Tier C, by the same measure: mem2reg in place of SROA (its optimisation's CPU 3.07 against 1.41 s, the text within 0.2 %), and InstSimplify in
+place of InstCombine (InstCombine was a fifth of tier C's compile, 18.53 against 14.86 s of CPU, for 9 % less code; the builder folds what
+InstSimplify folds already: phase 5b). Tier C's code is code the profile never sampled.
+
+#### 5. The loader's data blocks
+
+[src/module/image.cpp](src/module/image.cpp) (`Image::IndexData`, `InData`): the data blocks are merged into disjoint spans sorted by start
+when the module is loaded, and `InData`, which discovery's `TextCode` and the lifter's code reader ask per word, is a binary search over them
+(it scans the blocks themselves if they changed since). Discovery of the 4,000-function benchmark's behaviour image with 5,000 more data rows
+(`gen_bench.py --data-rows 5000`, 8 threads, fastest of 3): 9.78 s wall and 38.5 s CPU with phase 5c's binary, 2.15 s and 5.7 s now, the TSV
+byte for byte the same; without the rows 2.80 and 2.63 s, the same TSV. `test_analysis_threads.py --baseline` with phase 5c's binary: the
+corpus's 18 NROs, the synthetic modules and the 4,000-function benchmark with packs, the 16,000-function benchmark without (`--no-build`):
+every `discover` and `plan` output the same, which covers the data blocks, the general registers' forwarding (the jump tables' regions are
+lifted) and the rotates.
+
+#### 6. Gap code at tier C
+
+Not done in this phase (no module here had gap code: the benchmarks and the corpus have an FDE for every function); done after "Memory at
+scale" (below). The step's main result is discovery's: on a test input the generator now writes, functions without an FDE were cut in pieces,
+and a fix in discovery's own rule finds every one with its exact bounds and makes the packs of such modules 7 to 10 % faster. Design 9.3's
+"gap code at tier C" was measured and is not taken by default: it is the option `--gap-tier C` (below, "The rule"), because on these modules
+it bought 2 % of a pack's time for a pack 13 to 15 % larger and code that runs slower than tier W's (phase 5d: int_ops-gcc natively 171.7
+ms at tier C, 72.1 at W), and in the games it is for (FINAL
+FANTASY RESONANCE's `main`: 94 MB of text, 95 % of it without FDEs) most of the game would run at tier C in a balanced pack without a profile.
+
+```sh
+python3 dm/tools/aot/tests/gen_bench.py --direct --functions 16000 --seed 2 --no-fde-percent 20 /tmp/d16k   # main.nofde.tsv: their true ranges
+build/aot/nxaot build /tmp/d16k/main.aot.tsv --shared /tmp/d16k.so --tier W --tiers-tsv /tmp/d16k.tiers       # <entry> <tier> <instructions> <gap code>
+build/aot/nxaot build /tmp/d16k/main.aot.tsv --shared /tmp/d16k.so --gap-tier C                               # gap code at tier C (balanced mode)
+```
+
+**The test input.** `gen_bench.py --direct --no-fde-percent Q` ([tests/gen_bench.py](tests/gen_bench.py)): Q % of the statement functions,
+chosen by a generator of their own seeded from `--seed`, have no FDE (`.eh_frame_hdr`'s count and sorted table and `.eh_frame` hold the
+others' only; the drivers and `main` keep theirs) and no symbol (`main` is the module's only one), and no driver calls them: with every
+function called by a driver every one of them would be found by its call and none by the gap sweep. So only the statements' own `bl` (about
+4 per 1,000 instructions, to functions chosen at random), the table of function pointers (DT_RELR) or the gap sweep can find them, as a game's
+code without unwind entries that nothing names; their true ranges go to `main.nofde.tsv`. With Q = 0 (the default) the generator writes
+what it wrote before, byte for byte: the 16,000-function (seed 2) and 150,000-function (seed 4) modules with and without `--no-fde-percent 0`,
+and the 16,000-function one with `--profile-percent 10` (its profile and printed line too), against the base commit's generator.
+
+**What discovery made of them.** Every function without an FDE was found at its entry (none merged into the function before it, none
+missed, coverage 0 uncovered words), but some were cut in pieces: the base commit's nxaot against this one (`nxaot discover --tsv`, 8
+threads; the functions with an FDE were found with their exact bounds by both):
+
+| `--direct` module | functions (without an FDE) | base: functions discovered | base: FDE-less functions in pieces (pieces) | base: `gap` (primary / any) | now: functions discovered | now: exact bounds | now: `gap` |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| 16,000, seed 2, Q = 20 | 16,205 (3,200) | 19,092 | 165 (2,886) | 4,355 / 4,706 | 16,206 | 3,200 | 2,288 / 2,351 |
+| 16,000, seed 2, Q = 50 | 16,128 (8,000) | 22,213 | 357 (6,084) | 10,025 / 10,974 | 16,129 | 8,000 | 5,657 / 6,024 |
+| 150,000, seed 4, Q = 20 | 151,906 (30,000) | 176,614 | 1,424 (24,707) | 36,568 / 39,861 | 151,907 | 30,000 | 19,292 / 19,807 |
+| 150,000, seed 4, Q = 50 | 151,192 (75,000) | 214,656 | 3,604 (63,463) | 91,785 / 102,444 | 151,193 | 75,000 | 47,875 / 50,849 |
+
+(One function more than the module's: the module entry's branch, provenance `start`.) The pieces of the 16,000-function module at Q = 20 by
+their provenance: 2,067 `gap`, 354 `tail`, 288 `jt,gap`, 154 `adr`, 23 `adr,jt`. The cause: the function "whose own range holds" an address
+(`Owner`, [src/analysis/discover.cpp](src/analysis/discover.cpp)) was the one whose FDE's range or symbol's size held it, and a function with
+neither had no range. So code inside such a function that no known edge reached, the cases of a switch discovery did not bound (half the
+switches here then: "the entry address depends on more than one value"), became an entry of its own: first the label the switch's `adr` names at
+its cases' base (`adr`), then at the gap sweep each case (`gap`); each new entry cut the function's limit, so the code after the cases became
+a tail call's target (`tail`) and a bounded table further on had targets outside the cut function (`jt`). With an FDE the same code is a
+speculative root of its function. The fix, in discovery's own rule: a function with neither an FDE nor a symbol owns the span its walk
+reached, `[entry, end)`; code its walk did not reach between instructions it did reach is a speculative root of it, as with an FDE, and code
+past the last instruction it reached is not, so the next function without an FDE is still an entry of its own. Every FDE-less function is
+now found with its exact bounds, and the gap sweep's entries are exactly the functions nothing names. Discovery is faster for it (fewer
+functions to walk and summarise: 2.7 against 4.0 s at 16,000 functions and Q = 20, 23 to 25 against 36 s at 150,000; different loads). The
+inputs with an FDE for every function are unchanged: `test_analysis_threads.py --baseline <the base commit's nxaot>` over the corpus's 18
+NROs, the synthetic modules and the 16,000-function `--direct` module (Q = 0), 22 modules, 220 outputs (`nxaot discover --tsv` with symbols
+as a source and as the oracle, `nxaot plan`, 1 and 8 threads; `nxaot build --cache` with 1 and 8 workers: the analysis cache's payload and the
+pack the same as the base commit's), every one the same; `build_packs.sh` by both binaries, 42 packs (the corpus's, the synthetic modules',
+and all of them as Windows DLLs) the same bytes, and the 16,000-function module's pack at tier W; and with gap code the analysis on threads
+is the one-thread analysis (`test_analysis_threads.py --no-corpus` on CTest `gaps`' module and the 16,000-function one at Q = 20: 10 outputs
+the same). In the oracle mode
+(`--symbols-as-oracle`) the corpus's int_ops-gcc, built without unwind tables, has 7 gap functions of 69, the same before and after; a pack
+takes the symbols as a source, which name them.
+
+By provenance, the functions without an FDE (now):
+
+| `--direct` module | `call` | `reloc` (the table) | `reloc,call` | `gap` (gap code) | `call,gap` |
+|---|---:|---:|---:|---:|---:|
+| 16,000, Q = 20 (3,200) | 463 | 312 | 74 | 2,288 | 63 |
+| 16,000, Q = 50 (8,000) | 1,049 | 728 | 199 | 5,657 | 367 |
+| 150,000, Q = 20 (30,000) | 4,240 | 4,707 | 1,246 | 19,292 | 515 |
+| 150,000, Q = 50 (75,000) | 9,467 | 11,729 | 2,955 | 47,875 | 2,974 |
+
+`call,gap` are functions the gap sweep found in the same round as their only callers, which are gap code themselves (checked on the
+4,000-function module of CTest `gaps`: the callers of its 21 are 20 `gap` functions and one `call,gap`). No jump table here names a function
+(`jt` 0/0 now). The summary line `summary provenance ... gap N/M` counts the sweep's entries, primary and any: the functions found by calls or
+the table are counted there under `call` and `reloc`, never under `gap`.
+
+**The rule** ([src/build/pack.cpp](src/build/pack.cpp), `GapTiers`; [src/analysis/discover.h](src/analysis/discover.h), `IsGapCode`): gap
+code is a function whose provenance is exactly `gap`: no FDE, no symbol, not the module's entry, nothing of the dynamic section, no
+relocation, no `adr`, not a `bl` or `b` target, no landing pad, no jump-table target, no JIT miss. A function the sweep found that another
+source names too (`call,gap`, a `gap,miss` the host ran) is not gap code. By default gap code takes its mode's tier as any other function;
+with `nxaot build --gap-tier C` (`--gap-tier mode` states the default) it is compiled at tier C in the balanced mode whatever `--tier` says, a
+function the profile sampled keeps the profile's tier (H: it ran, so it is hot), and the max mode (`--mode max`, the NSP script's and the
+launcher's max pack) still compiles every function at its mode's tier (H+, or H+ and H with a profile). Neither the NSP script nor the
+launcher passes the option. The tier is the function's entry in the pack's tier map, which `TierOf`, `Units` and each unit's cache key read:
+the unit key ("nxaot-unit 4") holds each function's tier already, and the option changes nothing but the tiers of gap functions, so a
+function whose tier it changes misses the cache and no key version changes; the analysis does not depend on it (the analysis cache's key is
+the same with and without it). A warm repack takes the analysis from the cache, which did not keep discovery's provenance: the analysis
+cache's entry now keeps a gap-code flag per function in the flags word it had (format "nxaot-analysis 2",
+[src/build/analysis_cache.cpp](src/build/analysis_cache.cpp); for a module without gap code the payload's bytes are format 1's). The log,
+always, among the build's notes: `aot: gap code: <n> functions, <i> instructions`, `0 functions` for a module without gap code; with the
+option in the balanced mode ` at tier C` follows (and `; <k> functions, <j> instructions sampled by the profile at tier H` when the profile
+sampled some). `--tiers-tsv <file>` writes each function's tier (`<entry> <tier> <instructions> <gap code: gap or ->`); nothing in a pack
+shows a function's tier.
+
+**Measurements: why the option is off.** The 16,000-function module at Q = 20 (seed 2: 827,122 instructions in functions), tier W, 8
+workers, the rule (what `--gap-tier C` does) against the same binary without it and the base commit's nxaot (which discovers the pieces
+above), interleaved run by run, two runs each, the one-minute load 1.6 to 5.8 (these runs' own); seconds, bytes, MiB:
+
+| 16,000 functions, Q = 20, tier W, 8 workers | `--gap-tier C` | the default | the base commit |
+|---|---:|---:|---:|
+| `aot: tiers` | C 2288 W 13918 H 0 H+ 0 | C 0 W 16206 H 0 H+ 0 | C 0 W 19092 H 0 H+ 0 |
+| whole pack | 14.37, 14.67 | 14.83, 14.91 | 16.01, 16.59 |
+| compile wall | 10.84, 11.15 | 11.53, 11.63 | 11.96, 12.48 |
+| optimise and code generation, CPU | 77.1, 79.4 | 83.2, 83.9 | 86.4, 89.8 |
+| units | 4,709 | 1,704 | 1,763 |
+| text | 14,857,874 | 12,917,471 | 13,407,154 |
+| pack | 23,179,136 | 20,148,160 | 21,316,168 |
+| peak memory | 186 .. 196 | 181 .. 189 | 199 .. 201 |
+
+`aot: gap code: 2288 functions, 108634 instructions at tier C`: 14.1 % of the functions and 13.1 % of the instructions at tier C. The rule
+takes 6 % off the compile's CPU and 2 % off the whole pack (only that 13 % moves to tier C, which compiles 3.5 times as many instructions
+per core as tier W: phase 5d), and makes the pack 15 % larger: tier C's code is about twice tier W's (17.9 bytes of text more
+per gap instruction; phase 5d's 4,000-function benchmark: 12.92 against 5.94 MB). The units take some of it back: a group holds functions of
+one tier, so every change of tier between neighbours ends one, and gap code scattered among the other functions (a fifth of them, chosen at
+random) makes 4,709 units of 1,704. Groups kept per tier across the other tier's functions (an experiment, not kept: below) made 1,703
+units; in the same session, interleaved, the compile's CPU was 77.5 and 77.0 s against the rule's 78.1 and 80.6, the compile's wall 10.86 and
+10.77 against 10.98 and 11.34, the pack 22,340,320 bytes against 23,179,136: a fifth of the CPU the rule saves, and most of what it adds to
+the pack besides its code (the units' own sections). The discovery fix alone (no rule against the base commit) takes 7 to 10 % off the pack's
+time and 1.2 MB off it (the pieces' standard entries and lookup slots: 2,390 and 8,192 against 1,925 and 4,096). The 150,000-function module
+at Q = 20 (7,845,773 instructions), tier W, 8 workers:
+
+| 150,000 functions, Q = 20, tier W, 8 workers | `--gap-tier C`, run 1 (load 1.9) | run 2 (load 7.1: another agent's build) | the default (load 0.9) |
+|---|---:|---:|---:|
+| `aot: tiers` | C 19292 W 132615 H 0 H+ 0 | the same | C 0 W 151907 H 0 H+ 0 |
+| whole pack (analysis) | 132.35 (22.5) | 141.26 (22.5) | 136.66 (22.2) |
+| compile wall | 106.51 | 115.33 | 112.11 |
+| optimise and code generation, CPU | 758.6 | 820.8 | 808.7 |
+| units | 41,994 | 41,994 | 16,276 |
+| text | 140,193,851 | 140,193,851 | 123,439,972 |
+| pack | 220,466,840 | 220,466,840 | 194,239,808 |
+| peak memory | 1,189 | 1,189 | 936 |
+
+`aot: gap code: 19292 functions, 930023 instructions at tier C` (12.7 % of the functions, 11.9 % of the instructions). Within these runs'
+noise the pack takes the same time with and without the rule (a fourth run, without the rule at a load of 10, took 156.41 s), and it is 13.5
+% larger, its peak 27 % higher (the link's objects: 476 against 382 MB).
+
+**CTest `gaps`** ([tests/test_gaps.py](tests/test_gaps.py), 84 s): a 4,000-function module at Q = 25 (seed 1: 1,000 functions
+without an FDE, 3,048 FDEs, `.eh_frame_hdr` sorted and none at a stripped function); discovery finds every function, with and without an FDE,
+with its exact bounds, the FDE-less ones by provenance 138 `call`, 97 `reloc`, 25 `reloc,call`, 719 `gap`, 21 `call,gap`, and the summary
+says `gap 719/740`. `--tier W` logs `aot: gap code: 719 functions, 34372 instructions` (the whole line) and `aot: tiers C 0 W 4049 H 0 H+ 0`,
+and `--tiers-tsv` has every function at W; with `--gap-tier C` the log says `aot: gap code: 719 functions, 34372 instructions at tier C`
+and `aot: tiers C 719 W 3330 H 0 H+ 0`, and `--tiers-tsv` has every gap function at C and every other at W; both mark exactly discovery's
+`gap` functions, and each pack and its tiers are the same with 1 and 4 workers and from a warm cache (the analysis and every unit hit). With
+`--gap-tier C`, a profile sampling one gap function puts it at H and every other function at C (`C 4048 W 0 H 1 H+ 0`), the log counting it
+apart; `--mode max --gap-tier C` puts all 4,049 at H+, its gap line without "at tier C".
+
+**What is open.**
+
+- **Gap code's tier** stays an option until a game measures otherwise: whether a game's gap code is cold (tier C pays) or runs (W keeps its
+  speed) is what a profile answers per function, and the balanced mode with a profile does that already (its unsampled functions are at C,
+  gap code or not).
+- **Units across tiers** (with `--gap-tier C`, or a profile): a group ends where the tier changes, so scattered gap code multiplies the units
+  (4,709 against 1,704 here). Groups per tier, each collecting its tier's functions in address order past the other tier's (measured above:
+  1,703 units, a fifth of the rule's saving back, the pack 3.6 % smaller), are not taken: a group would hold functions that are not
+  neighbours, the code's order in the pack would change, and every pack with a profile, whose C and H functions interleave the same way, would
+  change its units.
+- **Code only gap code calls** (`call,gap`: 63 of 2,351 sweep entries at 16,000 functions and Q = 20, 2,974 of 50,849 at 150,000 and Q = 50)
+  is not gap code; a transitive rule (every caller gap code) is an open question, and would need the callers on a warm repack, which the
+  analysis cache keeps for `bl` only.
+- **FDE-less code** is compiled as code with an FDE is, at the mode's tier or by the profile (gap code too, without the option).
+- **Not measured on a game**: no game module is here; FINAL FANTASY RESONANCE's FDE-less 94 MB is the case to measure, where the share of gap
+  code, its layout (contiguous stretches, not a random fifth) and so the units are the questions. The `--direct` modules do not run, so the
+  FDE-less functions' code with the fix (an unbounded switch's cases compiled as part of their function, as with an FDE) is checked by the
+  analysis's outputs and the packs' building only, not at run time; the corpus, which runs, has no FDE-less function a pack's discovery
+  splits (its packs are the same bytes).
+
+#### The packs after phase 5d
+
+Phase 5c's binary and this one measured in the same sessions (best of 3; the one-worker runs and the 16,000-function benchmark best of 1 and
+2); seconds; "compile CPU" is optimisation and code generation summed over the units, the rate guest instructions per second per core of it:
+
+| Pack | phase 5c: compile wall | compile CPU | rate per core | phase 5d: compile wall | compile CPU | rate per core | peak memory (5c, 5d) | text (5c, 5d) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| benchmark (4,000), tier C, 8 workers | 3.42 | 22.53 | 23,664 | 1.99 | 11.52 | 46,277 | 210..215, 212..216 MiB | 11.45, 12.92 MB |
+| benchmark (4,000), tier C, 1 worker | 29.42 | 24.30 | 21,936 | 17.84 | 12.94 | 41,190 | 127, 127 MiB | |
+| benchmark (4,000), tier W, 8 workers | 6.87 | 49.93 | 10,678 | 5.67 | 40.83 | 13,057 | 242..245, 233..245 MiB | 5.97, 5.94 MB |
+| benchmark (4,000), tier W, 1 worker | 59.88 | 54.45 | 9,791 | 50.91 | 45.75 | 11,652 | 127, 127 MiB | |
+| benchmark (4,000), a profile of 10 % (H 409, C 3,679), 8 workers | 4.03 | 27.32 | 19,518 | 2.62 | 16.49 | 32,328 | 223..230, 220..230 MiB | |
+| benchmark (4,000), the max mode (H+), 8 workers | 10.06 | 66.39 | 8,031 | 9.78 | 65.28 | 8,168 | 478..488, 448..453 MiB | 5.95, 5.95 MB |
+| benchmark (16,000), tier W, 8 workers (load 6 to 8) | 28.18 | 204.70 | 10,570 | 23.20 | 166.56 | 12,991 | 394..419, 379..380 MiB | |
+| benchmark (16,000), a profile of 10 %, 8 workers (load 8) | 16.92 | 114.00 | 18,980 | 11.26 | 70.56 | 30,664 | 369..380, 366..380 MiB | |
+| benchmark (16,000), tier C, 8 workers (load 8) | 14.22 | 93.22 | 23,213 | 8.55 | 48.98 | 44,174 | 364..386, 361..382 MiB | |
+| switch-gcc, tier W, 8 workers | 0.50 | 2.32 | 22,034 | 0.41 | 2.00 | 25,523 | 138..141, 128..129 MiB | |
+| switch-gcc, tier C, 8 workers | 0.20 | 0.98 | 52,300 | 0.15 | 0.50 | 101,383 | | |
+
+Tier C's rate per core doubled (1.96 times with 8 workers, 1.88 with one), tier W's rose by a fifth (1.22 and 1.19); with a profile the
+compile stage is 1.54 times as fast. Tier C's code is 13 % larger and runs slower (int_ops-gcc natively at tier C: 163.6 ms with phase 5c's
+binary, 171.7 ms now; the benchmark, mostly the JIT fallback, 1,477 and 1,615 ms): code the profile never sampled. Tier W's runs as fast (int_ops
+75.3 and 72.1 ms; the benchmark 1,472 and 1,476 ms); the max mode's unchanged within the noise (int_ops 65.1 and 66.7 ms). The profile's samples
+of where tier C's compile goes now (4,000-function benchmark, 8 workers): SelectionDAG 21.8 %, lifting 21.8 %, the machine passes 19.4 %, the
+AsmPrinter 11.3 % (DWARF 3.6 %), the IR passes 7.3 %, the verifier 4.1 %, FastISel 4.3 %, the code generation pass manager's set-up 3.1 %.
+
+#### Extrapolation to the games after phase 5d
+
+Phase 5c's model and assumptions, with phase 5c's analysis (S = 3.6 s and P = 24.0 s per 2,163,759 instructions: this phase changed neither its
+work nor its results) and the compile stage's rates of this phase on the 4,000-function benchmark with 8 workers (the instructions over the
+compile's wall time, as phase 5b and 5c took them): 94,000 instructions per second at tier W (phase 5c's binary in these sessions 77,600),
+203,500 with a profile of 10 % (132,300) and 54,500 in the max mode (53,000). Extrapolations, not measurements:
+
+| Pack | Mode | This machine, 8 workers | Reference machine (r = 0.7 .. 0.5) | after phase 5c | Target |
+|---|---|---:|---:|---:|---:|
+| Mario `main` and `sdk` | balanced, no profile (tier W) | 1.9 min | 4.2 .. 5.9 min | 5.0 .. 6.9 min | at most 3 min |
+| Mario `main` and `sdk` | balanced with a profile (10 % H, the rest C) | 1.1 min | 2.4 .. 3.3 min | 3.2 .. 4.5 min | at most 3 min |
+| Mario `main` and `sdk` | max (H+) | 3.0 min | 6.7 .. 9.4 min | 6.9 .. 9.7 min | at most 30 min |
+| Monster Hunter Rise `main` | balanced, no profile (tier W) | 7.1 min | 15.4 .. 21.6 min | 18.1 .. 25.3 min | at most 10 min |
+| Monster Hunter Rise `main` | balanced with a profile (10 % H, the rest C) | 4.1 min | 8.7 .. 12.1 min | 11.8 .. 16.5 min | at most 10 min |
+| Monster Hunter Rise `main` | max (H+) | 11.1 min | 24.5 .. 34.3 min | 25.2 .. 35.3 min | at most 30 min |
+
+With a profile both balanced packs meet their targets at r = 0.7 (Mario 2.4 minutes against 3, Monster Hunter Rise 8.7 against 10) and miss
+them by a tenth to a fifth at r = 0.5; the analysis is now a third of them (Mario's 47 of 144 s at r = 0.7). Without a profile the balanced
+packs stay 1.4 to 2.2 times their targets: tier W is code generation now (85 % of its compile). The max packs and the warm repacks are as
+phase 5c left them.
+
+#### What is left
+
+- **Tier C's vector element operations** (`insertelement`, `extractelement`, `shufflevector`, selects and compares of vectors: 125,000 of
+  the 206,119 IR instructions SelectionDAG still compiles at tier C on the benchmark, more in games, whose code has more floating point and
+  SIMD). FastISel selects none of them; splitting a block before its first and after its last such operation would leave SelectionDAG only
+  that span (estimated on the IR at an earlier step of this phase: 43 % fewer instructions handed over), at the cost of the fast register
+  allocator's spills at the new block boundaries.
+- **The calling convention at tier C**: swifttailcc's calls, returns and arguments are SelectionDAG's, one at a time (52,017 of tier C's
+  57,377 misses); LLVM 19's preserve_none is the convention to measure again when nxaot.lock moves (phase 1).
+- **Lifting** is now a fifth of tier C's compile, the machine passes another fifth, and the verifier 4 %.
+- **Code generation at tier W** (85 % of its compile): SelectionDAG and the greedy register allocator, as design 9.3 has it.
+- **The analysis** is a third of a balanced pack with a profile; **the cache across game updates**, **one process per module**, **ThinLTO
+  import, devirtualisation, function ordering, LLVM's sample profile at tier H**: as phase 5c left them. Gap code: done since (6 above: the
+  discovery fix; tier C as the option `--gap-tier C`, off by default), with what it leaves open there; the sample profile at tier H too ("The
+  sample profile at tier H"), with what it leaves open.
+
+### Memory at scale
+
+Phases 5a to 5d measured the pack stage on game-shaped benchmarks of 4,000 and 16,000 functions (533,160 and 2,163,759 instructions); the largest
+module the tool must pack is Monster Hunter Rise's `main`, about 31 million instructions in about 600,000 functions, and the reference machine
+has 8 GB (design section 10: "about 4 compile workers of about 1 GB each", "the number of workers bounded by free RAM"). Phase 5c left the
+summaries' memo at that size unmeasured, and nothing had measured the analysis's other tables or the pack's at scale. Here: a benchmark of that
+size, the analysis's and the pack's tables measured per structure, what grew out of proportion contained (every output byte for byte the
+same), the compile's workers counted by the memory left after the analysis, and the reference machine extrapolated. Measured on the same
+machine as phase 5d's tables (8 vCPUs, 11 GiB, Docker image `nxnative-aot`), whose other agents' builds loaded it at times (the one-minute load
+average is given where it mattered); every run's peak resident set taken from outside the process (`ru_maxrss` of its parent) besides its own
+lines, and every run held under 4 GiB (the machine has no room to swap).
+
+```sh
+python3 dm/tools/aot/tests/gen_bench.py --direct --functions 600000 --seed 5 --profile-percent 10 /tmp/d600k   # 15 s: a 147 MB image
+build/aot/nxaot plan /tmp/d600k/main.aot.tsv --memory > /dev/null      # the analysis's tables at their peaks, on standard error
+build/aot/nxaot build /tmp/d150k/main.aot.tsv --shared /tmp/d150k.so --memory
+```
+
+#### 1. A benchmark at scale
+
+clang takes about two and a half minutes for the 16,000-function C program (15.5 MB of C) and would take hours and gigabytes for one of
+600,000; `gen_bench.py --direct` ([tests/gen_bench.py](tests/gen_bench.py)) writes the A64 words of what clang makes of the same statements
+instead (encodings checked with llvm-mc-18): arithmetic on 64-bit constants (movz and three movk), rotates, if / else, loads and stores, struct
+fields and copies (ldp / stp of q registers), loops, switches through byte jump tables, scalar floating point, NEON vectors, byte loops,
+direct calls, calls through the table of function pointers (DT_RELR-relocated: a fifth of the functions address-taken at 150,000 and
+600,000, an eighth at 16,000, as the C program's table makes them), and exclusive read-modify-write loops (ldaxr / stlxr: game code has them,
+the C program has none). Non-leaf functions save x19 to x22 and the frame record as clang's do, drivers call every function, an FDE per
+function, `main` the one exported symbol. The image and its manifest are what `patch_nso.py --aot` writes for an NSO (`main.image.bin`,
+`main.aot.tsv` through patch_nso.py's own `aot_data_rows` and `aot_manifest`); `--profile-percent 10` writes a profile of one sample in a
+tenth of the functions. 600,000 functions take 15 s, 150,000 4 s. The function size follows Monster Hunter Rise's estimate (52 instructions on
+average, against the C program's 133); the statements' weights were set so that the densities per instruction are the C program's, but for
+the drivers' one call per function (`nxaot discover --tsv`'s rows; per 1,000 instructions):
+
+| Module | Functions | Instructions | per function (median) | Distinct words | Blocks | bl | blr | Tables | Unbounded br | Windows |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| C program, 16,000 (seed 2) | 16,276 | 2,163,759 | 133 (40) | 537,702 (24.8 %) | 83.1 | 11.13 | 1.57 | 0.70 | 0.72 | 0 |
+| `--direct`, 16,000 (seed 2) | 16,256 | 828,353 | 51 (26) | 183,201 (22.1 %) | 115.2 | 23.68 | 1.60 | 0.76 | 0.82 | 0.65 |
+| `--direct`, 150,000 (seed 4) | 152,383 | 7,845,818 | 51 (26) | 890,368 (11.3 %) | 114.8 | 23.53 | 1.57 | 0.74 | 0.82 | 0.63 |
+| `--direct`, 600,000 (seed 5) | 609,527 | 31,185,206 | 51 (26) | 1,622,392 (5.2 %) | 114.9 | 23.63 | 1.57 | 0.75 | 0.83 | 0.63 |
+
+The bl column holds the drivers' one call per function (about 19.5 per 1,000 here, 7.4 in the C program): the statements' calls are 4.1 per
+1,000 against the C program's 3.6. Half the switches' brs stayed unbounded then ("the entry address depends on more than one value"), as half of
+the C program's did (none since "Jump tables whose index depends on several values"). One thing the direct module does not follow: its distinct words grow more slowly than its instructions (random 16-bit
+immediates and few registers repeat at scale), 5.2 % at 600,000 functions against the C program's 24.8 %; the instruction cache's tables grow
+with the distinct words, so section 8 carries them over at both ratios.
+
+#### 2. Where the analysis's memory went
+
+`--memory` (`nxaot discover`, `plan` and `build`; [src/analysis/memory.h](src/analysis/memory.h)) notes each table's bytes where it may be at
+its largest (after each round of discovery and each run of the summaries, at the plan's passes, at the pack's stages) and prints every
+table's peak and where it was reached, and the resident set at each stage (with the pages of mapped files apart: the link's). The bytes are
+estimated from the containers' sizes and capacities with glibc's chunk overhead, not counted by an allocator: cheap, off by default, and their
+sum at the peak within about a twentieth of the resident set less the image and the executable's libraries. Phase 5d's binary with that
+instrumentation alone, `nxaot plan` with 8 threads:
+
+| Table at its peak (MiB) | 150,000 functions | 600,000 functions | bytes per instruction at 600,000 |
+|---|---:|---:|---:|
+| discover: the words' classes (an `Insn` of 24 bytes per text word) | 184.0 | 731.6 | 24.6 |
+| instruction cache: Prepare's lists (transient, the first run of the summaries) | 158.7 | 503.1 | 16.9 |
+| discover: functions' blocks and edges (a std::map per function) | 123.0 | 488.9 | 16.4 |
+| discover: functions (the map, their sets, calls, tables, pads, brs) | 118.8 | 475.0 | 16.0 |
+| instruction cache: the distinct words' facts and programs | 165.9 | 328.4 | 11.0 |
+| discover: the summaries' memo | 65.0 | 260.2 | 8.7 |
+| plan: facts per function | 52.3 | 209.1 | 7.0 |
+| plan: passes (orders, the writes, LIVE_AFTER's additions) | 31.9 | 127.6 | 4.3 |
+| instruction cache: an id per text word | 30.7 | 121.9 | 4.1 |
+| discover: the jump-table regions' memo | 28.3 | 112.2 | 3.8 |
+| summaries: the last inputs per function | 25.1 | 100.5 | 3.4 |
+| discover: walk states and counts | 23.3 | 93.0 | 3.1 |
+| summaries: per-function states (summaries, epochs) | 23.3 | 93.0 | 3.1 |
+| discover: queues and sets (pending entries, addresses, FDE starts, gaps) | 20.4 | 81.6 | 2.7 |
+| instruction cache: the distinct words' map | 37.6 | 70.6 | 2.4 |
+| plan: tail-call components (RV) | 15.7 | 62.8 | 2.1 |
+| summaries: call graph and levels | 11.2 | 44.7 | 1.5 |
+| discover: jump-table tries | 6.3 | 24.9 | 0.8 |
+| instruction cache: words outside the text, prepared states | 6.0 | 24.0 | 0.8 |
+| the process's peak resident set | 985.5 | 3,282.1 | 110.4 |
+
+The peak is the analysis's last rounds (the summaries' runs with every table of discovery alive); 3.2 GiB at 600,000 functions against the
+design's budget of about 2 GiB for the analysis. The largest tables grew with the text and the functions, linearly; none grew faster.
+
+#### 3. The causes, and what was changed
+
+Each change keeps every output (section 6): what was dropped or compacted was a function of what is kept, or no later step reads it.
+
+1. **The words' classes** ([discover.cpp](src/analysis/discover.cpp), [insn.h](src/analysis/insn.h)): discovery kept an `Insn` of 24 bytes per text
+   word for its whole run. Only the decoder table's answer is costly to make again (`Decodes`); discovery keeps that, one byte per word, and
+   makes the rest of an `Insn` from the word at each use (`ClassifyWith`): 731.6 → 30.5 MiB.
+2. **Prepare's lists** ([summary.cpp](src/analysis/summary.cpp), `InsnCache::Prepare`): the first run of the summaries prepared every function at
+   once, a pair of words per instruction in per-function lists (transient, but freed heap stays resident). Prepare works in batches of functions
+   in their order (at most 16,384 functions or 262,144 instructions): a batch's new words are those the earlier batches did not have, first seen
+   where the whole list had them first, so the entries are the same: 503.1 → 14.7 MiB.
+3. **The instruction cache** (summary.cpp, `InsnCache::Impl`): an entry was its effects and a `Program` of two vectors (80 bytes and two
+   allocations besides its operations); now the effects in one vector and the programs in two pools (`Code`, 16 bytes), and the distinct
+   words' map, a std::unordered_map (44 bytes per word with its bucket), is a table of open addressing (`WordMap`, 8 bytes per slot, grown at
+   half full). At discovery's end the programs and the map are dropped (`KeepEffects`: the plan reads the effects only; a later interpretation
+   would translate the word again), and the pack drops the whole cache after the plan (the compile never read it): 328.4 + 70.6 → 125.3 + 32.0
+   MiB at the peak, the effects alone (37 MiB) and the ids in the plan.
+4. **The summaries' memo** (summary.cpp, `SummaryMemo`, `Recall`, `Remember`): a remembered input was a vector of 2 + 7 words per callee and
+   its summary a 52-byte struct beside it; now the same facts in 1 + 4 words per callee (a callee's three register sets as x | v << 32, their
+   sp and nzcv bits and its flags in a fourth word; the walk state and the exported flag in one), the records back to back in one vector per
+   function, the summary in five words: 260.2 → 162.9 MiB. Each function's last inputs (their length is fixed within a run) are one array:
+   100.5 → 33.9 MiB.
+5. **The functions' containers** ([discover.h](src/analysis/discover.h), [flat.h](src/analysis/flat.h)): a function's blocks were a std::map
+   (112 bytes per 56-byte block with malloc's header: 3.6 million blocks), and its five sets of roots and three small maps 384 bytes of empty
+   containers. Now sorted vectors in the same order (`FlatMap`, `FlatSet`), the sets and small maps through one pointer, null while empty; a walk
+   builds its function's blocks in address order and fits their vector to them: 488.9 + 475.0 → 334.3 + 245.3 MiB.
+6. **Discovery's tables no later step reads**: the jump tables' tries, the regions' memo, the pending entries, the addresses and the gap
+   candidates are freed before the last run of the summaries; the walks' counts are kept with their states (one map: 93.0 → 55.8 MiB), the
+   FDEs' starts in a sorted vector, the regions' memo keys in 32-bit words (a key with a larger value is not memoised: none in a module under
+   4 GiB; 112.2 → 96.4 MiB).
+7. **The plan** ([plan.cpp](src/build/plan.cpp)): the tail-call components' union-find nodes and LIVE_AFTER's additions of each round were
+   std::maps of every function; now vectors by the function's position (the same nodes in the same order: the same component numbers):
+   62.8 → 6.9 and 127.6 → 102.1 MiB.
+8. **The pack's compile** ([pack.cpp](src/build/pack.cpp)): it kept discovery's whole view of every function for two things, the gate sites
+   (now taken per function before the compile, `Common::sites`) and the call sites' returns (`Common::returns`); discovery's functions are freed
+   before the workers start, and the heap's free pages returned to the system (`malloc_trim`: every worker's malloc arena keeps its own) then,
+   after the compile and before the link. The line table's rows go per function as each unit's results are taken, instead of into one vector of
+   every row (24 to 48 bytes per row) before them.
+
+Looked at and left: the instruction cache's id per text word (4 bytes: 121.9 MiB), the plan's facts per function (209.1 MiB, kept through the
+compile, which reads them), the summaries' states of a run (93.0 MiB: two summaries per function and their epochs), the per-function `Function`
+itself (about 400 bytes with its scalars, its summary and its name).
+
+#### 4. The analysis after
+
+The same tables with this binary (`nxaot plan --memory`, 8 threads; the rows in section 2's order):
+
+| Table at its peak (MiB) | 150,000: before | after | 600,000: before | after | bytes per instruction at 600,000 |
+|---|---:|---:|---:|---:|---:|
+| discover: the words' classes (a byte per text word now) | 184.0 | 7.7 | 731.6 | 30.5 | 1.0 |
+| instruction cache: Prepare's lists (transient) | 158.7 | 14.7 | 503.1 | 14.7 | 0.5 |
+| discover: functions' blocks and edges | 123.0 | 84.1 | 488.9 | 334.3 | 11.2 |
+| discover: functions (the map, their sets, calls, tables, pads, brs) | 118.8 | 61.4 | 475.0 | 245.3 | 8.2 |
+| instruction cache: the distinct words' facts and programs | 165.9 | 59.2 | 328.4 | 125.3 | 4.2 |
+| discover: the summaries' memo | 65.0 | 40.7 | 260.2 | 162.9 | 5.5 |
+| plan: facts per function | 52.3 | 52.3 | 209.1 | 209.1 | 7.0 |
+| plan: passes | 31.9 | 25.5 | 127.6 | 102.1 | 3.4 |
+| instruction cache: an id per text word | 30.7 | 30.7 | 121.9 | 121.9 | 4.1 |
+| discover: the jump-table regions' memo | 28.3 | 24.3 | 112.2 | 96.4 | 3.2 |
+| summaries: the last inputs per function | 25.1 | 8.5 | 100.5 | 33.9 | 1.1 |
+| discover: walk states and counts | 23.3 | 14.0 | 93.0 | 55.8 | 1.9 |
+| summaries: per-function states | 23.3 | 23.3 | 93.0 | 93.0 | 3.1 |
+| discover: queues and sets | 20.4 | 15.1 | 81.6 | 60.4 | 2.0 |
+| instruction cache: the distinct words' map | 37.6 | 16.0 | 70.6 | 32.0 | 1.1 |
+| plan: tail-call components (RV) | 15.7 | 1.7 | 62.8 | 6.9 | 0.2 |
+| summaries: call graph and levels | 11.2 | 11.2 | 44.7 | 44.7 | 1.5 |
+| discover: jump-table tries | 6.3 | 6.3 | 24.9 | 24.9 | 0.8 |
+| instruction cache: words outside the text, prepared states | 6.0 | 6.0 | 24.0 | 24.0 | 0.8 |
+| the process's peak resident set | 985.5 | 540.8 | 3,282.1 | 1,767.8 | 59.4 |
+
+The analysis alone, `nxaot plan` without `--memory` (whose notes cost about a sixth of its time at 600,000 functions), phase 5d's binary and
+this one, best of one run each; seconds and the peak resident set in MiB:
+
+| `nxaot plan` | 150,000, 8 threads | 4 | 2 | 600,000, 8 threads | 4 | 2 |
+|---|---:|---:|---:|---:|---:|---:|
+| phase 5d: seconds | 22.4 | 27.7 | 40.4 | 96.4 | 122.6 | 175.4 |
+| phase 5d: peak | 984 | 962 | 959 | 3,289 | 3,281 | 3,246 |
+| this one: seconds | 18.3 | 23.2 | 33.9 | 81.1 | 103.1 | 151.0 |
+| this one: peak | 537 | 528 | 519 | 1,767 | 1,762 | 1,759 |
+
+The analysis of 31 million instructions now peaks at 1.73 GiB, under the design's budget of about 2 GiB, and the peak hardly depends on the
+threads (the pool's items are each function's own); it is faster too (fewer allocations: the analysis of 600,000 functions 81 against 96
+seconds with 8 threads). Its parts are linear in the module: about 52 bytes per instruction at 600,000 functions, 56 at 150,000 (the image and
+the executable's libraries aside), of which the functions' blocks and their records about 19, the plan's facts 7, the summaries' memo 5.5, and
+the instruction cache 10 (with this module's 5.2 % of distinct words: section 8).
+
+#### 5. The packs at 150,000 functions
+
+`nxaot build` of the 150,000-function module (7.85 million instructions; with its profile, 15,310 functions at H and the rest at C) with 8, 4,
+2 and 1 workers, phase 5d's binary and this one, one run each (the machine's load 2 to 8); seconds (the analysis is discovery and the plan)
+and MiB. "Peak" is the whole process's resident set, the link included (`ru_maxrss` from outside it: until now the build's own line took it
+before the link), with in parentheses the largest anonymous resident set sampled every 0.1 s; with `--memory`, this binary's stages: the
+analysis's peak, what the compile starts from, the compile's peak, and the resident set after the line table:
+
+| Pack | 5d: analysis | compile | whole | peak | now: analysis | compile | whole | analysis's peak | compile from | compile's peak | after the lines | peak (anonymous) |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| tier C, 8 workers | 20.2 | 47.8 | 70.2 | 1,956 | 21.9 | 41.2 | 65.1 | 536 | 195 | 673 | 383 | 1,280 (620) |
+| tier C, 4 workers | 26.6 | 91.8 | 120.9 | 1,915 | 27.0 | 83.3 | 112.7 | 522 | 205 | 663 | 373 | 1,272 (609) |
+| tier C, 2 workers | 39.3 | 189.9 | 231.6 | 1,997 | 37.0 | 169.6 | 209.0 | 524 | 206 | 652 | 384 | 1,274 (571) |
+| tier C, 1 worker | - | - | - | - | 61.6 | 420.0 | 483.9 | 516 | 240 | 589 | 370 | 1,281 (536) |
+| tier W, 8 workers | 20.9 | 123.5 | 146.4 | 1,522 | 22.0 | 113.3 | 137.6 | 540 | 198 | 687 | 441 | 987 (631) |
+| tier W, 4 workers | 26.7 | 242.8 | 271.8 | 1,485 | 26.0 | 222.0 | 250.2 | 529 | 192 | 655 | 406 | 973 (585) |
+| tier W, 2 workers | 39.8 | 481.6 | 523.8 | 1,528 | 36.6 | 449.9 | 488.8 | 522 | 206 | 655 | 410 | 974 (584) |
+| profile of 10 %, 8 workers | 21.3 | 63.9 | 88.3 | 1,798 | 22.8 | 57.6 | 83.7 | 539 | 205 | 709 | 457 | 1,414 (653) |
+| profile of 10 %, 4 workers | 26.8 | 123.3 | 153.1 | 1,836 | 26.1 | 111.6 | 140.9 | 528 | 204 | 672 | 420 | 1,377 (603) |
+| profile of 10 %, 2 workers | 39.6 | 249.9 | 292.8 | 1,878 | 37.1 | 228.1 | 268.4 | 519 | 228 | 680 | 420 | 1,374 (610) |
+| max (H+), 8 workers | 20.8 | 186.1 | 208.3 | 1,814 | 21.5 | 180.1 | 203.0 | 538 | 191 | 1,260 | 377 | 1,260 (1,203) |
+| max (H+), 4 workers | - | - | - | - | 26.4 | 348.5 | 376.1 | 526 | 197 | 1,045 | 353 | 1,045 (988) |
+
+The shared objects are byte for byte phase 5d's (360,449,360 bytes at tier C, 195,120,928 at W, 349,471,624 with the profile, 191,405,680 in
+the max mode); the link takes 0.4 to 1.8 s. The 300,000-function module (15.6 million instructions, seed 6) at tier W with the default
+workers, its pack on a disk: `aot: workers 8 (4236 MiB available, about 64 MiB each, 776 MiB for the tables)`, 281.0 s (the analysis 44.6,
+the compile 231.1, the link 2.5), the analysis's peak 966 MiB, the compile from 318 to 1,218 MiB (at the tables' object's code generation,
+30 MiB of object: about 2,500 bytes per function with the other workers' units beside it), 674 MiB after the line table, the whole process
+1,828 MiB (the link's files; anonymous at most 1,218), a pack of 388,462,248 bytes: every stage about twice the 150,000-function one's.
+
+- **The analysis** peaks at 516 to 540 MiB whatever the workers (section 4); the compile now starts from about 200 MiB (the plan, the image,
+  the libraries), where phase 5d's started from the analysis's whole resident set (about 0.95 GiB here) and peaked at 1.14 to 1.27 GiB (its
+  own line), 1.72 GiB in the max mode.
+- **The compile's peak** (650 to 710 MiB at C, W and with the profile) is the tables' object's, not the workers': with 8, 4 or 2 workers it moves
+  by 20 to 40 MiB. With one worker, which compiles the tables' object alone first: the declarations of every body and standard entry 23 MiB,
+  the function map's and lookup table's rows as LLVM constants 130 MiB, their code generation (the MC layer's fixups and symbols, the 15 MiB
+  object) 197 MiB more at its peak: 349 MiB, 2,401 bytes per function. A worker compiling units of C or W adds about
+  20 MiB to the peak; one compiling H+ shards (up to 64,000 instructions, inlined) about 100 to 160 MiB, its malloc arena's leftovers
+  included: in the max mode the workers are the compile's peak (1,260 MiB with 8, 1,045 with 4, against 1,814 before).
+- **The line table** is built per function as the units' results are taken, and the workers' freed memory is returned first: after it the
+  process holds 350 to 460 MiB (with one vector of every row and the workers' arenas kept, as before, 700 to 850 MiB).
+- **The link** is the whole process's peak at C, W and with the profile: lld maps the units' objects (554, 384 and 594 MB) and writes the
+  shared object through a mapping, here both on tmpfs and so both memory (about 1.3 GiB at C and with the profile, 1.0 GiB at W); its
+  anonymous memory stays near the analysis's. On a disk those pages are the page cache's, which the system can drop (the objects) or write
+  back (the pack).
+
+#### 6. The caches and the pack's tables
+
+The 150,000-function module at tier W with 8 workers into a new cache on a disk (`--cache`), then again warm. Cold: 133.4 s (137.6 without
+the cache), every unit a miss, 352,746,032 bytes of objects written; the cache holds 366,605,782 bytes (16,177 objects, their facts files
+and the analysis), the analysis cache's entry 11,173,940 bytes of it (73 bytes per function; about 45 MB at 600,000 functions, where the
+units' objects would be about 1.5 GB at tier W and 2.2 GB at C). Warm: 6.43 s, every unit a hit (352,746,032 bytes read), the analysis read
+in 0.34 s, the units' keys 3.2 s of CPU on the workers, the tables' object compiled again (about 2.7 s: it is never cached), the line marks
+read back from the cached objects, the link 1.13 s; its peak 943 MiB, 701 MiB of it anonymous (the tables' object and the cached analysis).
+Carried over by four, a warm repack of 600,000 functions would take about 26 s here and 1.0 to 1.4 minutes on the reference machine (phase
+5b's 5 r / 8), against the design's minute: the tables' object and the keys, both linear in the functions, are most of it.
+
+The pack's own tables at 150,000 functions (bytes; `llvm-readelf -S` of the shared objects: the same at every tier but the code and its
+DWARF and unwind tables), each a function of the functions, the standard entries, the call sites or the line marks, so four times as large at
+600,000 functions:
+
+| Section | tier C | tier W | profile of 10 % | per function |
+|---|---:|---:|---:|---:|
+| `.text` | 270,196,004 | 124,710,108 | 255,470,500 | |
+| `.nxaot.lookup` (65,536 slots of 16 bytes for 29,504 standard entries) | 1,048,576 | 1,048,576 | 1,048,576 | 6.9 |
+| `.nxaot.fnmap` (the function map: 16 bytes per function) | 2,438,128 | 2,438,128 | 2,438,128 | 16.0 |
+| `.nxaot.returns` (the call sites' return addresses, 4 bytes each) | 787,760 | 787,760 | 787,760 | 5.2 |
+| `.nxaot.fnlines`, `.nxaot.lines` (the line table: 8 bytes per function, 8 per entry) | 15,445,800 | 15,636,824 | 15,396,720 | 101 |
+| `.data` (the indirect call sites' inline caches) | 196,888 | 196,888 | 196,888 | 1.3 |
+| `.rela.dyn` | 590,880 | 590,880 | 590,880 | 3.9 |
+| `.eh_frame`, `.eh_frame_hdr` | 11,327,480 | 8,739,944 | 11,112,904 | |
+| `.debug_line` | 35,067,524 | 17,580,328 | 34,747,103 | |
+| `.symtab`, `.strtab` | 8,899,237 | 8,899,237 | 9,687,680 | |
+| the shared object | 360,449,360 | 195,120,928 | 349,471,624 | |
+
+The descriptor's tables (lookup table, function map, returns, line table) are 19.7 MB of a 195 to 360 MB pack; the code, its DWARF line table
+and its unwind tables are the rest.
+
+**Identity.** Every output is byte for byte phase 5d's binary's (`test_analysis_threads.py --baseline`, extended to build with the baseline
+too: the shared object, and the analysis cache entry's payload, whose key holds the tool's SHA-256), and the same with 1 and 8 threads: the
+18 corpus NROs and the synthetic game module and host-function module's two (21 modules, 210 outputs), the C program's 4,000- and
+16,000-function benchmarks (20), the 150,000-function module (10: its discovery TSV and lines both ways, its plan, the analysis cache's entry
+and the pack with 1 and 8 workers and phase 5d's), every one identical; and the 600,000-function module's discovery TSV and lines and plan
+with 8 threads, phase 5d's against this binary's: the same (105,132,722, 28,926,269 and 63,397,431 bytes). CTest 25 of 25 (`workers`
+new), and dm/host's `t_aot_host` 44, `t_aot_module` 33 / 34 / 3 + 14, `t_aot_hostfn` 50 + 11, `t_host_program` 17 and `t_garena` 32 with
+the corpus packs of this binary.
+
+#### 7. The workers bounded by memory
+
+`--workers 0` (the default) took one worker per CPU, at most one per 512 MiB of `MemAvailable` read before the analysis, which the analysis
+then filled. Now the analysis runs on one thread per CPU (its memory hardly depends on them: section 4), and the compile's workers are
+counted once it is done, discovery's functions freed and the heap's free pages returned (`CompileWorkers`, [src/build/pack.cpp](src/build/pack.cpp)):
+as many as the memory then available holds (`MemAvailable` on Linux, `GlobalMemoryStatusEx`'s available physical memory on Windows), beside
+the tables' object at the module's size (32 MiB and 2,560 bytes per function: 2,401 measured; 1,024 since its rows go through MC, "The
+tables' object through MC"), at a worker's measured peak at the units'
+tiers (64 MiB at C and W, 192 at H and H+: section 5), at most one per CPU this process may run on and one per unit, at least one;
+`--workers N` takes N. The log says which: `aot: workers 8 (4236 MiB available, about 64 MiB each, 776 MiB for the tables)` (the
+300,000-function pack) or `aot: workers 3 (--workers)`. A build whose module needs more than the memory available for its analysis alone (64
+bytes per text word, the image and 128 MiB besides: section 4) says so in a `[RED]` line, since no number of threads makes the analysis
+smaller.
+`NXAOT_MEM_AVAILABLE_MIB` stands for the available memory (a test switch). CTest `workers` ([tests/test_workers.py](tests/test_workers.py)):
+fnptr-gcc and the synthetic game module with 1 MiB available (one worker), room for three workers and the tables (three), 1 TiB (one per CPU,
+at most one per unit) and `--workers 3`, every pack byte for byte the first one.
+
+#### 8. Extrapolation to the reference machine
+
+Monster Hunter Rise's `main` is about 31 million instructions in about 600,000 functions: the 600,000-function module's size. Its analysis
+was measured whole; its packs were not (their objects and shared object, 3.6 GB at tier C carried over from 150,000 functions, do not fit this
+machine's free disk or memory), so the compile's and the link's parts are the 150,000-function module's, per function and per instruction, by
+four (the 300,000-function pack checks that they are linear: section 5).
+
+**Memory.** The analysis peaks at 1.73 GiB (section 4). Its instruction cache grows with the distinct words, 5.2 % of this module's
+instructions against the C program's 24.8 %: at that ratio (7.7 million distinct words, about 100 bytes each during discovery) it would peak
+at about 2.3 GiB. The compile starts from about 0.5 GiB (the plan's facts 0.2, the image 0.15, the parts, sites and returns, the libraries),
+adds the tables' object (2,401 bytes per function: 1.4 GiB) and its workers (about 20 MiB each at C and W, 100 to 160 at H+: section 5):
+about 2.2 GiB with 8 workers at C or W (1.2 GiB at 300,000 functions, 0.69 at 150,000), 2.9 GiB in the max mode. The line table then
+takes about 1.2 GiB. The link maps the units' objects
+(2.2 GB at tier C, 1.5 at W, 1.3 in the max mode) and writes the shared object (1.4, 0.8 and 0.5 GB) through a mapping: file pages, which on a
+disk the system can drop or write back, besides lld's own few hundred MiB. So on the reference machine's 8 GB both the balanced packs and the
+max pack fit with every one of its 8 threads as a worker, their peak the compile (2.2 GiB, 2.9 in the max mode) or the analysis (1.7 GiB, up
+to 2.3 with more distinct words), 4 to 5 GiB below 8 with a gigabyte for the system; `CompileWorkers` gives them 8 ((available - 1.5 GiB of
+tables) / 64 or 192 MiB is far above 8). The design's "about 4 compile workers of about 1 GB each" was a constraint it assumed, not one the
+measurements show.
+
+**Time.** Phase 5d's model, with this module's own rates: the analysis's serial and parallel parts from the 600,000-function module with 8 and
+2 threads (81.1 and 151.0 s: S = 57.8 s, P = 186.4 s; 103.1 s with 4 threads, the model's 104.4), on the reference machine S / r + P / (5 r);
+the compile at the 150,000-function module's rate with 8 workers (tier C 190,500 instructions per second, W 69,300, a profile of 10 %
+136,300, the max mode 43,600), divided by 5 r / 8 there; the link by four, divided by r. This module compiles more slowly per instruction
+than the 4,000-function C program phase 5d took its rates from (115 blocks per 1,000 instructions against 83, functions of 52 instructions
+against 133: tier W 69,300 against 94,000, the profile 136,300 against 203,500), so the minutes are above phase 5d's:
+
+| Pack | Mode | This machine, 8 workers | Reference machine (r = 0.7 .. 0.5), 8 workers | after phase 5d | Target |
+|---|---|---:|---:|---:|---:|
+| Monster Hunter Rise `main` | balanced, no profile (tier W) | 8.9 min | 19.5 .. 27.3 min | 15.4 .. 21.6 min | at most 10 min |
+| Monster Hunter Rise `main` | balanced with a profile (10 % H, the rest C) | 5.3 min | 11.1 .. 15.6 min | 8.7 .. 12.1 min | at most 10 min |
+| Monster Hunter Rise `main` | every function at tier C | 4.1 min | 8.6 .. 12.0 min | - | - |
+| Monster Hunter Rise `main` | max (H+) | 13.3 min | 29.6 .. 41.4 min | 24.5 .. 34.3 min | at most 30 min |
+
+Memory sets no bound on the workers here, so these are the CPU's times: with a profile the balanced pack misses its 10 minutes by a tenth to a
+half on this module's rates (it met them at r = 0.7 on phase 5d's), and the analysis, 2.3 to 3.2 minutes there, is a fifth of it.
+
+#### 9. What is left
+
+- **The tables' object** (2,401 bytes per function, a whole worker's worth at 150,000 functions and about 1.4 GiB at 600,000): the function map's
+  and lookup table's rows are LLVM constants with a relocation each (a GEP, two ptrtoint, a sub and a trunc per row), then the MC layer's
+  fixups and symbols. Done in "The tables' object through MC" below: the rows written by the MC layer directly, the object and the pack byte
+  for byte the same, 750 to 860 bytes per function at its peak and a sixth to an eighth of its time.
+- **The instruction cache per distinct word** (about 100 bytes during discovery: the effects 24, the program's `Code` 16 and its operations,
+  the map's slots): a module with the C program's ratio of distinct words would add about 0.6 GiB to the analysis at 31 million
+  instructions (section 8). Operations of 6 bytes instead of 12 and a 12-byte `Code` would take a fifth of it.
+- **The functions' blocks** (11 bytes per instruction: 56 bytes per block and their successors' vectors) and the `Function` records (about 400
+  bytes each, their summary and name included), and the plan's facts (7 bytes per instruction), which the compile keeps.
+- **The link**: lld maps every unit's object and writes the shared object through a mapping; on tmpfs (here) both are memory. Not changed.
+- **The 600,000-function module's packs** were not built here (their objects and shared object would not fit this machine's disk or memory);
+  the 300,000-function one's at tier W was.
+
+### The tables' object through MC
+
+The tables' object ([src/build/pack.cpp](src/build/pack.cpp), `CompileTables`) is the one object of a pack that every unit shares, compiled
+first on one worker in every pack and every warm repack (it is not cached). It holds code: the NaN chains' helpers the units call
+(`lift::DefineNaNHelpers`), the slow paths' wrappers (`nxaot.dispatch`, `nxaot.cntpct`, `nxaot.safepoint`, and `nxaot.gate` in a module with gate
+sites), `nxaot.jit_entry` and `nxaot.enter`, with their DWARF; and data: the module's base (`nxaot.base`, `.bss`), the empty inline-cache
+descriptor, the lookup table (`.nxaot.lookup`, a 16-byte row per slot, twice the standard entries rounded up to a power of two: {offset, the
+entry's address less the field's, `NXAOT_LOOKUP_SP_KEPT`}), the function map (`.nxaot.fnmap`, a 16-byte row per function: {offset, the body's
+address less the field's, size}), the returns (`.nxaot.returns`, 4 bytes per call site), the gate sites (`.nxaot.gates`, 16 bytes each), the
+tool's string and the descriptor `nxaot_module` (`.data.rel.ro`, ABI 3, with the line table's two symbols, which lines.o defines). Of all its
+rows only the lookup table's and the function map's address fields name a symbol: a body or a standard entry, hidden, defined by another
+unit, so their difference from the field is a relocation (R_X86_64_PC32, addend 0) whatever the layout; keys, sizes, flags, returns and gate
+rows are numbers, and the descriptor's dozen pointers are R_X86_64_64 relocations. Those two tables were LLVM constants, each address field
+`trunc (sub (ptrtoint body), (ptrtoint (gep table, 0, i, 1)))` beside a declaration of every body and standard entry, which code generation
+lowered to an MCExpr tree of five nodes per row: 2,401 bytes per function ("Memory at scale", section 5), 349 MiB at 150,000 functions, about
+1.4 GiB at 600,000 as extrapolated there (1.29 GiB measured below), and 3.2 s at 150,000.
+
+**The emission** ([src/build/tables.cpp](src/build/tables.cpp), [tables.h](src/build/tables.h)). The module keeps the two tables as
+placeholders: the same globals (name, type, internal linkage, constant, section, alignment 16) with a zero initializer, and no declaration of
+the bodies. Code generation is `addPassesToEmitFile`'s (the same TargetPassConfig, AsmPrinter, assembler backend, code emitter and ELF object
+writer), with one difference: the object streamer is `RowStreamer`, an `MCELFStreamer`, which is the streamer LLVM 18 makes for an x86-64
+ELF object (`Target::createMCObjectStreamer`: X86's MC library defines an object streamer of its own for COFF only, `createX86WinCOFFStreamer`,
+and its object target streamer is COFF's). The
+AsmPrinter emits a placeholder as it emitted the table, `.type`, the section, the alignment, the label, then its initializer, which for zeros
+is one `emitZeros(size)`: there, in the table's section and at its size, `RowStreamer::emitFill` writes the rows instead, and the AsmPrinter
+goes on with `.size`. A plain field is the `emitIntValue` the AsmPrinter made of a `ConstantInt`. An address field took `emitValue` of
+`(body - table) + (-offset)`: `MCObjectStreamer::emitValueImpl` registered the symbols, took a data fragment, placed pending labels and a
+`.loc`'s line entry, and added a 4-byte data fixup, which the assembler, finding the subtracted symbol in the fixup's own section, turned into
+R_X86_64_PC32 against the body with addend 0; `RowStreamer::Rel32` takes the same steps with a 4-byte pc-relative fixup of the symbol itself
+(one `MCSymbolRefExpr` per row), which gives the same relocation, and hides the symbol as the AsmPrinter's `.hidden` of the declaration did.
+What had to stay the same for the object to be the same bytes:
+
+- **the order of sections**: a section's place in the object is when it is first entered, and the placeholders are emitted where the tables
+  were (the AsmPrinter's globals, in the module's order);
+- **the order of symbols**: LLVM 18's ELF writer writes them in the order the assembler registered them, not by name (the lookup table's
+  entries in slot order, then the bodies the function map adds, in offset order), so each symbol is registered at its row, where
+  `visitUsedExpr` registered it;
+- **the symbols' attributes**: undefined, global (used in a relocation), hidden (the declarations' `.hidden`, emitted after the globals, by
+  then registered), no type;
+- **the sections' kind**: a constant zero-initialised global with an explicit section is `ReadOnly` (`SHF_ALLOC`, `PROGBITS`, no entry size)
+  as the relocated one was: not BSS (an explicit section), not mergeable (no `unnamed_addr`; at tiers H and H+, whose module pipeline runs
+  GlobalOpt over the tables' object, both keep their address significant, the descriptor holding it);
+- **the relocations**: R_X86_64_PC32, the same offsets and symbols, addend 0, in the order of the fixups.
+
+The object writer writes into the result itself (a `raw_pwrite_stream` over the string, where Finish copied a SmallVector's: 15 MiB at
+150,000 functions). The rows go through MC for x86-64 ELF objects with LLVM 18 (`RowsThroughMC`: another LLVM may give x86 ELF a streamer
+of its own, which `RowStreamer` would then have to derive from; `nxaot.lock` pins 18.1.3), unless `--ir`, `--ir-opt` or `--asm` asks for a listing of the module, whose rows would otherwise be
+zeros; then, and with the test switch `NXAOT_TABLES_IR`, the rows are LLVM constants as before (`TablesThroughMC`), the object the same. A
+Windows pack's tables' object is the same ELF object (its units are compiled for the Linux triple; "Windows packs"), which coff.cpp converts
+with the rest: nothing there changed. The build logs `aot: tables' object: 152383 function map rows and 65536 lookup slots through MC, 0.660 s
+(lift 0.055, optimise 0.004, codegen 0.600), 15756256 bytes` (beside 7 workers; or `as LLVM constants`), and `--memory` notes `pack: the tables' object (its rows in
+MC, the object)`, an estimate from the counts of rows, relocations and symbols (`RowStats::Estimate`: 124.7 MiB at 150,000 functions, where
+122 to 125 were measured below). `--workers 0` reserves 1,024 bytes per
+function for it (2,560 on the IR path: section 7).
+
+**Measured** on the 150,000-function module of section 1 (`gen_bench.py --direct --functions 150000 --seed 4`), the 300,000 (seed 6) and the
+600,000 (seed 5); the tables' object alone (`--workers 1`, the first job, the build stopped once it is compiled), its peak taken inside the
+process (VmHWM reset by `clear_refs` before it and read after it, a measurement build), at a load of 2 to 5 from other agents' builds:
+
+| Module (functions) | as LLVM constants (HEAD's code, `NXAOT_TABLES_IR`): peak growth, seconds | through MC | memory | time |
+|---|---:|---:|---:|---:|
+| 150,000 (152,383), first run | 343.6 MiB (2,364 bytes per function), 3.26 s | 121.8 MiB (838 bytes per function), 0.48 s | 2.8 × less | 6.8 × less |
+| 150,000, second run | 343.4 MiB (2,363), 3.84 s | 124.5 MiB (857), 0.49 s | 2.8 × | 7.8 × |
+| 300,000 (304,766) | 673.9 MiB (2,319), 7.46 s | 218.9 MiB (753), 1.00 s | 3.1 × | 7.5 × |
+| 600,000 (609,527) | 1,323.2 MiB (2,276), 15.52 s | 468.7 MiB (806), 2.35 s | 2.8 × | 6.6 × |
+
+The lines (`TMP` the measurement build's; the 600,000-function module, constants then MC):
+
+```
+  287.60 TMP: tables' object: rss before 837000 KiB, VmHWM during 2191916 KiB, growth 1354916 KiB, 15.519 s
+  276.56 TMP: tables' object: rss before 849316 KiB, VmHWM during 1329292 KiB, growth 479976 KiB, 2.348 s
+```
+
+HEAD's own binary shows the same through its `--memory` lines (150,000 functions, one worker): from `resident 242.9 MiB ... at before the
+compile` through `264.9 MiB ... every body and standard entry declared`, `392.9 MiB ... its tables made` to `peak so far 590.6 MiB, at the
+tables' object: code generated (15 MiB)`, 3.3 s: 348 MiB, as the IR path of this binary; through MC the same stages read `249.2 MiB
+... its kit (no declarations: the rows go through MC)`, `250.4 MiB ... its module made (the rows' placeholders)`, `373.2 MiB ... code
+generated (15 MiB)`, 0.5 s. Of the 122 MiB that remain (a measurement build that noted the resident set at each table's end): the lookup
+table's rows and the code before them 18 MiB, the function map's rows 35 MiB (a symbol per body: the `MCSymbolELF` and its name in the
+MCContext's three string maps, about 200 bytes; a fixup, an `MCSymbolRefExpr`), the ELF object writer 66 MiB (its relocation entries, 48 bytes
+each, its symbol data and string table builder, and the 15 MiB object), all of them what any object with a relocation per row against a
+symbol of its own takes in LLVM's MC layer. At 600,000 functions the tables' object had been the compile's peak and the process's before the
+link (2,141 MiB against the analysis's 1,748); through MC it adds 469 MiB to the 830 MiB the compile starts from.
+
+The whole packs of the 150,000-function module at tier W, HEAD's binary and this one back to back, `--memory` (but the cache's), their
+outputs on tmpfs; seconds (compile wall in parentheses), the process's peak from outside (the link's: lld maps the units' objects and writes
+the pack through a mapping, both memory on tmpfs), the compile stage's peak (`peak so far` at the compile's last line; HEAD's is the tables'
+object's, this one's never passes the analysis's 540 MiB, the tables' object leaving 375 MiB resident), and the largest anonymous resident set
+sampled every 0.1 s. Other agents' builds loaded the machine (the one-minute load at each start), so the whole packs' seconds move by more
+than the tables' object's 3 s of one worker:
+
+| Pack | load | HEAD: seconds | peak | compile's peak | anonymous | load | this one: seconds | peak | compile's peak | anonymous |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 8 workers | 2.0 | 141.4 (117.2) | 949 | 684 | 614 | 7.7 | 217.0 (192.8) | 976 | 538 (the analysis's) | 494 |
+| 8 workers, again | 6.5 | 155.5 (129.8) | 950 | 685 | 629 | 8.8 | 143.7 (118.2) | 947 | 540 (the analysis's) | 495 |
+| 2 workers | 8.7 | 497.3 (456.3) | 934 | 664 | 609 | 2.3 | 503.6 (462.6) | 964 | 522 (the analysis's) | 477 |
+| 8 workers, cold cache | 8.6 | 190.2 (164.1) | 948 | - | 633 | 9.9 | 153.8 (132.1) | 947 | - | 491 |
+| 8 workers, warm cache | 10.4 | 7.21 (4.54) | 948 | - | 694 | 9.4 | 3.92 (1.46) | 947 | - | 376 |
+
+Every one of the ten shared objects is the same 195,120,944 bytes (SHA-256 `b494414c93d2db1f...`). The warm repack, whose units and analysis
+come from the cache, took 7.21 s and 3.92 s:
+
+```
+aot: seconds discover 0.354 plan 0.000 lift 2.226 verify 0.490 optimise 0.020 codegen 0.889 link 1.222; compile wall 4.543 with 8 workers; total 7.207; peak memory 948 MiB
+aot: tables' object: 152383 function map rows and 65536 lookup slots through MC, 0.781 s (lift 0.084, optimise 0.022, codegen 0.675), 15756256 bytes
+aot: seconds discover 0.331 plan 0.000 lift 0.083 verify 0.001 optimise 0.022 codegen 0.675 link 1.043; compile wall 1.460 with 8 workers; total 3.919; peak memory 947 MiB
+```
+
+(its lift, verify, optimise and codegen are the tables' object's alone: 3.6 s of CPU before, 0.8 s now; the units' keys took 3.3 and 3.6 s of
+CPU on the other workers). Carried over by four, a warm repack of 600,000 functions here would take about 16 s, against "Memory at scale"'s 26.
+
+**Identity.** HEAD's binary is 7586d90's, built in the same image. The tables' object itself, through MC and as LLVM constants
+(`NXAOT_TABLES_IR`, `NXAOT_TABLES_OBJECT`): the same bytes in every case of CTest `tables` ([tests/test_tables.py](tests/test_tables.py): fnptr-gcc
+at tiers W, C and H+, with ghccc, as a relocatable object and as a DLL; switch-clang at W and with ghccc at C; the synthetic game module at W
+and H+ and as a DLL; a 3,000-function `--direct` module at W and C, as a relocatable object and as a DLL; and `--ir`, which takes the IR path
+by itself), at 16,000 functions (1,553,688 bytes) and at 150,000 (15,756,256 bytes). The packs against HEAD's binary's:
+
+- the corpus packs of [tests/build_packs.sh](tests/build_packs.sh) (18 NROs, the synthetic game module and the host-function module's two,
+  for Linux and in `win64`): 42 of 42 the same bytes;
+- `test_analysis_threads.py --baseline <HEAD's nxaot> --module <the 16,000-function module>`: `analysis on threads: 22 modules, 220 outputs
+  compared, 0 differ` (each module's discovery both ways, plan, analysis cache entry and pack with 1 and 8 workers, and HEAD's);
+- the 16,000-function module (seed 2): its shared object at tier W (20,230,360 bytes) and at tier C (37,466,832), and its DLL
+  (`--target windows`, 20,095,488 bytes), the same bytes; the 150,000-function module (seed 4): its shared object at tier W the same in the
+  ten builds above (195,120,944 bytes) and at tier C (360,449,376 bytes, `113bb7d6a04f4279...`);
+- the relocatable objects (`-o`) of both modules: every section the same but the units' line marks (`.nxaot_pcs` and `.rela.nxaot_pcs`,
+  the same words in another order), as two runs of HEAD's binary differ from each other (16,000 functions: 300,644 and 376,721 bytes
+  differ against this binary, 300,032 and 376,087 between HEAD's two runs; "What is left").
+
+CTest: `100% tests passed, 0 tests failed out of 27` (`tables` new, 33 s; the run 948 s beside other agents' builds); dm/host's tests with
+this binary's corpus packs (the Linux build, `-DNXAOT_PACKS`): `t_aot_host` 44 checks, `t_aot_module` 33 / 34 / 3 + 14, `t_aot_hostfn` 50 +
+11, `t_host_program` 17 and `t_garena` 32, 5 of 5 passed.
+
+**Not cached.** The tables' object is still compiled in every pack, warm or not: 0.5 to 0.8 s at 150,000 functions on one worker, beside the
+units' keys and reads on the others (the warm repack's compile wall 1.46 s), about 2.3 s alone at 600,000. A cache entry would need a key over
+every input of `CompileTables`: each function's offset, size, standard entry and `writes.sp`, the convention's facts that decide whether a body
+is its own standard entry, the returns, the gate sites, the image's identity, the options and the toolchain; a missed input would give a
+wrong pack with no symptom at pack time. For at most 0.8 s of a 3.9 s warm repack (a fifth, less once the keys and reads are the critical
+path) that risk was not taken: the units' objects and the analysis stay the cache's only entries.
+
+**What is left.**
+
+- **The MC layer's own share** (750 to 860 bytes per function): a symbol per body and per standard entry in the MCContext, a fixup and a
+  relocation entry per row, the ELF writer's symbol table and string table builder, and the object. Less would need the rows' section, its
+  relocations and its symbols written outside LLVM's assembler, an ELF writer of nxaot's own whose object could not be LLVM's byte for byte,
+  or a second object, which would change the pack's layout; not done.
+- **A body that is its own standard entry** (ghccc, a body that takes every passable register and returns the fixed signature's): the
+  lookup table then names the body's symbol, which `HasStdEntry` decides as `StdEntry` did; no input of the tests has one (fnptr-gcc,
+  int_ops-clang and switch-clang, the synthetic game module and the 3,000-function module, with `--cc ghc`, `--correctness` and
+  `--all-entries`: every lookup row names a `.std` symbol), so that branch is not exercised.
+- **The relocatable object (-o) is not deterministic**, before and after this change: two runs of one binary differ in the units' line marks
+  (`.nxaot_pcs`: the same words in another order, and its relocations), because LLVM's `AsmPrinter::emitPCSections` walks a DenseMap keyed by
+  the metadata nodes' addresses. The shared objects and DLLs, which drop that section, and the line table, which nxaot builds from the marks'
+  relocations, are deterministic; CTest `tables` compares a relocatable object's other sections.
+
+### The sample profile at tier H
+
+Design 9.3's tier H is "O2, inlining within the shard, the sample profile". Until this, a profile chose the tiers only ("Tiers by profile"): a
+function holding a sample at H (H+ in the max mode), the others at C, and the O2 / O3 pipelines ran on the sampled functions with LLVM's static
+guesses of which branches are taken. Now, with `--profile`, the samples' positions inside each function at H and H+ weigh its lifted code
+before the tier's pipeline ([src/build/pack.cpp](src/build/pack.cpp), "The sample profile at tiers H and H+", `WeighFunction`):
+
+- **The blocks' counts.** The lifter tells which basic block each guest block of the function starts in, and its guest range
+  (`lift::Lifted::guest_blocks`). A guest block's count is its samples per instruction (times 1,024): the samples at offsets in its own range
+  over that range's length, its own range ending where the next block starts. dynarmic translates a block on to its terminal whatever starts
+  inside it, so a loop whose head is in the middle of a straight run is a block of its own and a copy inside the run's block: counting a
+  sample for every block that holds it made a function's first block as hot as the loop after it (int_ops-gcc's CRC loop, below).
+- **The flow.** profi, the profile inference of LLVM's own sample loader (`llvm::applyFlowInference`, `Transforms/Utils/SampleProfileInference.h`,
+  with its tuned costs), makes of these counts at the guest blocks' heads a flow over every basic block of the function, consistent at every
+  branch and join: the blocks the lowering adds (a conditional branch's `if_then` / `if_else`, safepoint polls, call sequences, slow paths)
+  are unknown; the light side of a branch the lowering weighed itself (a poll's call, an inline cache's miss, a call's pending check) and a
+  block that ends in `unreachable` are kept out of the flow unless nothing else can carry it.
+- **What LLVM is given.** Every branch and switch between guest blocks gets `!prof branch_weights` from the flow along its edges, plus 1 so
+  that no edge is zero (a branch is between guest blocks when its successors, followed through unconditional branches and the likely side of
+  the lowering's weighted ones, reach different guest blocks or leave the function; the lowering's own branches inside an instruction, and those
+  it weighed, keep what they have). The function gets its entry count (the flow at its entry) and every call its block's flow as its count:
+  with a sampled profile, LLVM's ProfileSummaryInfo reads a call site's hotness from its own count and takes a call without one, in a function
+  with an entry count, for a cold one. The unit gets a ProfileSummary of kind sample over its weighed functions' guest instructions (each its
+  block's flow), from which ProfileSummaryInfo takes its hot and cold thresholds (99 % and 99.9999 % of the counts). The weighed functions are
+  placed in `.text` explicitly: with a summary, CodeGenPrepare would move a function it finds hot or cold to `.text.hot.` or `.text.unlikely.`,
+  and a split function's parts must lie in one section (`JoinParts`); ordering functions by heat stays H+'s open item ("Phase 5b", 6). No `hot`
+  or `cold` attribute is set: the entry counts and the summary already class the functions, and an attribute on another unit's declaration
+  would make that unit's code depend on this one's samples.
+- **What is not weighed.** A function whose samples are all at its entry: the form the host's sampler wrote before it had positions, and
+  still writes for a function with samples at none of its instructions (all of them in its host calls and SVCs, or a pack without positions:
+  [dm/host/aot_profile.c](../../host/aot_profile.c), "The sampler's positions" below), which has no positions. Given
+  to profi, its other blocks known to have no samples, the whole flow goes along the cheapest path out of the function and the branch weights
+  are guesses that override LLVM's own (switch-gcc 149 µs without them, 150 to 151 with); an entry count with the blocks' counts spread by
+  LLVM's static estimate (BlockFrequencyInfo) measured no gain either (switch-gcc 149 and 149 µs, switch-clang 109 and 111; both measured
+  unpinned beside another agent's builds, fastest of 2,000), so such a function keeps the
+  tiers' code and the tiers' cache key, and a new profile of the host's keeps its units cached. The functions at C get nothing (their
+  pipeline reads no weights), nor do those at H in the max mode (the profile did not sample them).
+
+The log: `aot: profile weights: <f> functions, <b> branches weighted, <e> entry counts, <c> call counts; <x> functions sampled at their entry
+only, not weighed; <z> with samples profi found no flow for, not weighed` (int_ops-gcc with the fixture below: `26 functions, 55 branches
+weighted, 26 entry counts, 160 call counts; 4 functions sampled at their entry only, not weighed; 0 with samples profi found no flow for`; with
+the interim fixture the measurements below used, `28 functions, 53 branches weighted, 28 entry counts, 160 call counts; 3 functions sampled at
+their entry only`; a part of a split function counts as one); with the test switch `NXAOT_PROFILE_WEIGHTS=0`, `aot: profile weights: off (NXAOT_PROFILE_WEIGHTS=0):
+the profile chooses the tiers only`, and the pack is the one the tiers alone give, byte for byte HEAD's.
+
+**The cache key.** A unit's object depends on its own functions' samples only (the summary is the unit's, not the pack's), so a weighed
+function's key (`UnitKey`) holds its samples, the `(offset, count)` pairs in `[entry, limit)`, as a field `samples`; a function that is not
+weighed (no profile, `NXAOT_PROFILE_WEIGHTS=0`, tier C, sampled at its entry only) has no such field, so its key's content is as before and the
+key format stays `nxaot-unit 4`. A shard's key holds its functions' keys: a profile that changes outside a unit's functions keeps the unit,
+one that changes a sample inside them misses it (CTest `profile_weights`).
+
+**Recording profiles with positions.** The host's sampler records them ("The sampler's positions" below). The fixture of CTest
+`profile_weights` ([tests/profile_weights.tsv](tests/profile_weights.tsv)) is a profile it wrote: int_ops-gcc on its tier W pack
+([tests/build_packs.sh](tests/build_packs.sh)) run by dm/host's `t_aot_host --run <packs>/int_ops-gcc.so int_ops-gcc.nro --set
+int_ops_rounds=20000 --positions` with `DM_AOT_PROFILE` (1,000 Hz of CPU time, 7.2 s): 7,193 samples, 6,938 at 284 guest instructions in 30
+functions, 1 at the entry of a function with none at an instruction, 254 in code with no instruction (line 0) left out; its hottest rows
+`0x2268 988`, `0x2258 980`, `0x2264 647`, `0x2260 398` (ref_crc's inner loop). The profiles measured below, and the fixture before it, were
+recorded natively on the corpus's tier W packs (ffa2f80's binary, no profile) run by `nxaot_host`, with an interim sampler preloaded into it
+(not part of the repository): a `CLOCK_MONOTONIC` timer signal 10,000 times per second on the thread that runs the guest, the interrupted rip
+stored when it lies in the pack's code, and at exit each address mapped to its guest offset through the pack's DWARF line table (line = guest
+offset, the innermost inlined frame's; `llvm-symbolizer`); 3 to 16 % of the samples land on line 0 and are dropped. int_ops-gcc with
+`int_ops_rounds = 2000` (0.82 s): 7,214 samples in the pack's code, 6,966 kept at 296 offsets in 31 functions (`0x2268 994`, `0x2258 936`,
+`0x2264 711`, `0x2260 417`: the host's sampler finds the same instructions in the same proportions). The host's fixture is a run ten times as
+long at 1,000 Hz rather than `DM_AOT_PROFILE_HZ=10000`: a Linux CPU-time timer is checked at the kernel's tick and a late expiry comes as one
+signal weighing its overrun (aot_profile.c), so 10,000 Hz over `int_ops_rounds = 2000` (0.73 s) gave 7,276 samples at only 143 instructions.
+
+**Measured.** HEAD's binary (ffa2f80, built in the same image) and this one; the packs at tier H with a profile recorded as above, weights off
+(`NXAOT_PROFILE_WEIGHTS=0`, byte for byte HEAD's pack with the same profile in every case) and on; each run pinned to one CPU (`taskset -c 3`),
+the fastest of N runs of `nxaot_host --repeat N`, 6 rounds alternating the two packs (the median, and the minimum to maximum of the 6 in
+parentheses), the machine's one-minute load 5 to 7 (another agent's tests); text is the units' `.text`:
+
+| Program (fastest of N) | profile: samples, offsets | weights off | weights on | change | text off → on (bytes) |
+|---|---:|---:|---:|---:|---:|
+| int_ops-gcc, `int_ops_rounds = 200` (10) | 6,966, 296 | 68.07 ms (67.72 .. 69.62) | 68.40 ms (68.10 .. 68.76) | +0.5 % | 130,154 → 130,513 |
+| int_ops-clang, `int_ops_rounds = 200` (10) | 6,831, 383 | 71.13 ms (70.92 .. 75.29) | 71.68 ms (71.37 .. 72.66) | +0.8 % | 106,169 → 106,584 |
+| switch-gcc (2,000) | 7,571, 1,863 | 149 µs (149 .. 149) | 133 µs (133 .. 133) | −10.7 % | 394,957 → 394,309 |
+| switch-clang (2,000) | 5,281, 678 | 109 µs (109 .. 110) | 99 µs (99 .. 99) | −9.2 % | 99,217 → 111,697 |
+| simd-gcc (5,000) | 4,519, 854 | 42 µs (42 .. 42) | 41 µs (41 .. 42) | −2.4 % (1 µs resolution) | 154,931 → 156,953 |
+| except-gcc (50) | 29,061, 474 | 25.12 ms (24.82 .. 25.96) | 25.03 ms (24.79 .. 25.40) | −0.4 % (most of it outside the pack) | 102,344 → 105,374 |
+| fnptr-gcc (20,000) | 646, 142 | 6 µs (6 .. 6) | 6 µs (4 .. 6) | 0 (1 µs resolution) | 79,815 → 79,901 |
+| benchmark, 4,000 functions (3; 3 rounds) | 1,068, 761 | 1,512.8 ms (1,505.1 .. 1,551.7) | 1,505.6 ms (1,502.0 .. 1,510.0) | −0.5 % (98 % of it is the JIT fallback) | 11,488,155 → 11,496,212 |
+
+The benchmark's 98 % in the JIT fallback was the tail-call bug of "Tail calls and the native frame's return": with it fixed, its tier W pack
+runs 189.8 ms against 1,529 ms (fastest of 3), and dm/host's runner samples 377 to 387 of about 450 in the JIT, about 200 of them the JIT's
+first use; its profile then samples compiled code, which this table's row did not weigh.
+
+An earlier session, at a load of 1.4 to 2.4 and with the call-graph profile still on (below), gave int_ops-gcc 70.04 and 70.10 ms, int_ops-clang
+73.56 and 73.01, switch-gcc 149 and 133 µs, switch-clang 109 and 98, simd-gcc 42 and 41, except-gcc 25.07 and 24.95 ms, the benchmark 1,502.6
+and 1,494.3. The layout moves int_ops by itself: the same pack under eight file names (the soname's length shifts the code by a few bytes),
+3 rounds each, int_ops-gcc's medians run 69.7 to 70.7 ms with the weights off and 69.6 to 70.5 on (means 70.05 and 69.93, −0.2 %),
+int_ops-clang's 72.3 to 73.9 and 72.1 to 73.3 (means 72.88 and 72.69, −0.3 %); switch-gcc's 148 to 149 µs off and 133 to 136 µs on, a gain
+in every layout (means −9.1 %). So int_ops, simd, except and fnptr are within the noise and switch gains 9 to 11 %. Where it comes from
+(switch, `NXAOT_PROFILE_WEIGHTS` variants of a measurement build): the branch weights alone 136 µs (gcc) and 106 µs (clang), the entry and
+call counts with the summary alone 150 and 105 µs, both 133 and 98 µs: block placement from the weights, and with the counts block placement's
+and the inliner's profile mode (a function with an entry count is laid out with the profile's thresholds; switch-clang's text grows by 13 %,
+8 more of the 112 guest call sites its optimised IR keeps without weights inlined; switch-gcc's keeps its 144).
+
+What was found on the way:
+
+- **Overlapping blocks.** With every sample counted for every block that holds it (above), int_ops-gcc's CRC function had its entry block as
+  hot as the loop after it, profi carried the loop's flow through the function's entry and out of the loop at each pass (the inner loop's back
+  edge at 49 %), and int_ops-gcc ran 1.1 % slower on average over the eight layouts and up to 3.5 % in three of them; with each block's own
+  range the back edge is at 96.6 % (its true share seven in eight) and int_ops is within the noise.
+- **The call-graph profile.** With entry counts, the O2 / O3 module pipelines' CGProfilePass writes a `.llvm.call-graph-profile` section, by
+  which lld orders the units' code; a Windows pack's conversion to COFF stopped on it (`ELF to COFF: a REL section`). Measured without it:
+  switch-gcc 133 µs either way, switch-clang 98 and 99, int_ops-gcc 68.97 and 69.14 ms; so it is off (`PipelineTuningOptions::CallGraphProfile`,
+  which writes nothing without entry counts), the units keep their order, and a Windows pack with a profile builds.
+- **Functions profi gives no flow.** 54 of the benchmark's 223 functions sampled away from their entry (2 of switch-gcc's, 5 of except-gcc's),
+  with 1 to 10 samples each (38 at most): their sampled blocks are reached only through blocks with none, and keeping a block that drew no
+  sample at zero costs profi less than raising a path to it, so it takes them for noise. They are not weighed (logged: `<z> with samples profi
+  found no flow for, not weighed`).
+
+**Pack time.** The benchmark (4,088 functions: 438 at H, 3,650 at C), 8 workers, the median of 3 alternated runs, a load of 4.5 to 8: lifting
+3.63 → 3.70 s (CPU, profi included), optimisation 5.76 → 5.88 s, code generation 15.87 → 16.19 s, the compile's wall 3.32 → 3.37 s, the whole
+pack 5.92 → 5.96 s (+0.7 %); switch-gcc (31 functions at H) 0.99 → 1.02 s. The compile's CPU grows by 2 %, all of it in the units at H
+(profi, and more code inlined at hot call sites): the C units are the same objects as HEAD's (below).
+
+**Identity.** HEAD's binary is ffa2f80's, built from a clean checkout in the same image. Without a profile: the corpus packs of
+[tests/build_packs.sh](tests/build_packs.sh) (18 NROs, the synthetic game module and the host-function module's two, for Linux and in `win64`)
+42 of 42 the same bytes; the 18 NROs in the max mode (tier H+) 18 of 18; the 16,000-function `--direct` module (seed 2) at tier W (20,230,360
+bytes), at tier C (37,466,832) and as a DLL (20,095,488) the same bytes. With a profile: `NXAOT_PROFILE_WEIGHTS=0` gives HEAD's pack for every
+program measured above; the profiles t_aot_module's runs wrote through the host's sampler, in its form before positions (`0x1ec 399` in one,
+`0x1ec 398` and `0x1dc 1` in another: synth_hot and synth_cut) give the synthetic module's pack HEAD's binary gives, with the weights on (`2 functions sampled at their
+entry only, not weighed`); and the unit objects of the benchmark
+and of switch-gcc with their profiles, packed into a cache by HEAD's binary and this one (the line marks' section aside, which LLVM writes in an
+order of its own: "The tables' object through MC"): every object at tier C the same bytes (836 of 931 objects the same, the 95 that differ
+each holding functions at H only; switch-gcc 14 of 43, the 29 others at H). The weighted packs are the same bytes with 1, 4 and 8 workers and
+in two runs (the benchmark, switch-gcc, switch-clang, int_ops-gcc), and print their expected output natively in the balanced and the max mode
+(int_ops, switch, simd, except, fnptr). CTest `profile_weights` ([tests/test_profile_weights.py](tests/test_profile_weights.py)) checks
+int_ops-gcc's fixture: the log against the IR (entry counts on the functions sampled away from their entry, the branch weights besides the
+lowering's own, a summary of kind sample in each unit with an entry count, nothing on the functions at C), the same pack with 1 and 4
+workers and twice, `NXAOT_PROFILE_WEIGHTS=0` adding no metadata and giving the pack of the host sampler's form of the same profile, the
+cache (a sample outside every function, or at an entry-only function's entry, hits every unit; a sample changed in a weighed function misses
+its unit only), and the packs' output. dm/host's tests with this binary's corpus packs (the Linux build, `-DNXAOT_PACKS`):
+`t_aot_host` 45 checks, `t_aot_module` 33 / 34 / 3 + 14, `t_aot_hostfn` 50 + 11, `t_host_program` 17 and `t_garena` 32, 5 of 5 passed.
+
+**What is left.**
+
+- **Positions from the host's sampler**: done since ("The sampler's positions" below).
+- **LLVM's sample loader** (`SampleProfileLoaderPass` with a profile file, design 12's "an LLVM sample profile"): not taken, as the direct
+  metadata measured a gain where the code branches and none to lose elsewhere; it would add a profile file per unit, guest offsets as line
+  offsets from each function's line, and its inline replay, which a profile of guest code has no inline frames for.
+- **The hot indirect targets** of design 12: recorded and used since ("Hot indirect targets" below).
+- **The entry block's samples** include those of the prologue (its instructions carry the entry's line): a short function's entry block
+  looks hotter than its body; small, and left.
+- **Function ordering by heat** (`.text.hot`): every function stays in `.text` (above), H+'s open item.
+
+#### The sampler's positions
+
+The catch above, resolved: the host's sampler records design 12's sampled instruction offsets. Each sample's interrupted pc in compiled code
+counts for its function, as before, and at the guest instruction whose code holds it ([dm/host/aot_profile.c](../../host/aot_profile.c)
+`count_pc`, [dm/host/aot_arena.c](../../host/aot_arena.c) `dm_aot_offset_of_code`), through a table the pack carries:
+
+- **The table.** `nxaot_positions`, exported beside the descriptor and outside it ([include/nxaot/aot_module.h](include/nxaot/aot_module.h),
+  "The sampler's positions"), so the descriptor's ABI (3) is unchanged: a pack without it (`--no-debug-info`, an nxaot before it) loads and its
+  samples count per function at their entries, with a `[RED]` line when `DM_AOT_PROFILE` is set; one of another version is used for nothing,
+  with the same line. Per function of the descriptor's map, a run of rows `{native address from the body, guest offset}`, each holding to the
+  next row; every 64 rows a mark in full (12 bytes), the rows between as deltas from the row before: one byte for a native step of 1 to 16 and
+  an offset step of −4 to +3 instructions, two bytes for up to 256 and −24 to +37, LEB128 beyond; a run's first 64 rows have no mark, its
+  first row counts from the function's entry. The host's lookup (`nxaot_position_at`, the header's own code, the same in nxaot's check) is a
+  binary search of the run's marks and at most 63 rows decoded: no allocation, no lock, safe in the signal handler and while the Windows
+  sampler holds a thread suspended. The host reads the table where the library maps it (no copy, nothing at the load but a pointer and a
+  check that the function map is in module-offset order, which the runs' index needs).
+- **What a row names.** nxaot writes the rows (positions.o: `ReadPositions`, `EncodeRun`, `CompilePositions` in
+  [src/build/pack.cpp](src/build/pack.cpp)) from each unit's DWARF line table (line = guest offset), from a fresh or a cached object alike, on
+  the workers: a range's guest instruction is its line; in code inlined into the function (tiers H and H+) the line of the call the inlining
+  replaced (the top-level `DW_TAG_inlined_subroutine`'s `DW_AT_call_line`), so that a sample never counts at another function's instruction;
+  none for line 0 (code LLVM merged from several instructions, or gave no location), for a standard entry's code and for what follows a body's
+  or a part's end (a terminator row), and none, counted, for a line outside the function's `[entry, entry + size)` (none seen). The log:
+  `aot: positions: <r> rows for <f> functions in <b> bytes (<b/r> per row), from <d> DWARF ranges: <i> in inlined code (the call's line), <z>
+  with no line, <x> outside their function (none); encoded in <s> s` (switch-gcc in the max mode: 51,122 rows from 51,196 ranges, 74 inlined,
+  587 with no line, 3 outside). Checked against `llvm-symbolizer`: every row of int_ops-gcc, switch-gcc and simd-clang at W, int_ops-gcc at H
+  with the fixture and switch-gcc in the max mode (inlining), decoded by an independent reader at its first address and its middle, names the
+  outermost frame's line the symbolizer gives, but for 2 ranges of switch-gcc's split function 0x6e20 that are its standard entry's (none by
+  design).
+- **Why this table.** (a) The line table `.nxaot.lines` for every instruction: its rows are 8 bytes and name the innermost frame (a fault
+  report needs the faulting access's own instruction; the sampler needs the outermost, or a sample in inlined code counts for another
+  function); with a row per change of location, switch-gcc's 50,497 rows would be 404 KB (+60 % of its pack) and the benchmark's 628,539 rows
+  5.0 MB (+25 %), and marking every instruction with `!pcsections` asks code generation to keep a node per instruction it drops at will
+  ("loosing !pcsections metadata"). (c) The pack's DWARF read by the host: no pack bytes, but DWARF 5's line program and, for the inlined
+  ranges, `.debug_info`, `.debug_abbrev`, `.debug_addr` and `.debug_rnglists` parsed in C at every load (on Windows from the DLL's sections),
+  and either a decoded table kept (8 bytes a row: 5 MB for the benchmark, hundreds of MB for a large game) or a unit's whole line program
+  decoded at every sample. (b), taken: a table for the sampler alone, 1.4 to 1.8 bytes a row.
+- **The cost.** The corpus packs ([tests/build_packs.sh](tests/build_packs.sh)): 21 shared objects 2,689,816 → 2,845,472 bytes (+5.8 %),
+  21 DLLs 2,744,832 → 2,892,800 (+5.4 %); int_ops-gcc 109,040 → 114,232 (+4.8 %), switch-gcc 670,392 → 733,024 (+9.3 %: 50,497 rows of its
+  jump-table code in 72 KB). The 16,000-function benchmark (`gen_bench.py --direct --functions 16000 --seed 2`, tier W): 20,230,360 →
+  21,341,456 bytes (+5.5 %), its table 628,539 rows in 1,110,466 bytes (1.77 a row: runs 195,072, marks 51,876, rows 863,518; 387,603 rows in
+  one byte, 155,170 in two, 24,821 longer, 56,622 without a position). Pack time, the benchmark with 8 workers, 3 rounds alternating HEAD's
+  binary and this one: whole pack 14.77, 14.47, 14.89 s and 14.48, 14.89, 14.54 s, compile wall 12.04, 11.67, 12.00 and 11.76, 12.01, 11.65 s:
+  within the noise (the DWARF read and the rows encoded on the workers, 0.06 s of CPU in all); peak memory 161 to 166 MiB and 163 to 165 MiB
+  (a unit's rows are encoded as soon as it is compiled: kept whole to the end as read, 24 bytes each, they made it 193 to 204 MiB). The host,
+  with `DM_AOT_PROFILE` only: a 32-bit count per guest instruction of a pack's text (calloc'd at the load; only the pages of sampled code are
+  touched).
+- **The file.** A row per sampled instruction, and a row at its entry only for a function with samples at none of its instructions (all in its
+  host calls and SVCs, or in code with no position, or in a pack without positions): its tier, as before. A function with samples at its
+  instructions has no entry row with its total: with one, the entry block weighs as much as the whole function, and int_ops-gcc's ref_crc
+  (the fixture plus each function's total at its entry) gets its inner back edge at 70 % instead of 97 % and its outer one at 1.2 % instead of
+  46 % (`!prof` of its `b.ne`s in `--ir`). nxaot's tiers need no entry row: `TiersFromProfile` makes a function hot for a sample anywhere in
+  `[entry, limit)` (before 471bf37 too). The samples of host calls and SVCs stay at no instruction: their time says nothing of how often
+  their block runs. The header counts what is left out. Each sampled function's rows follow its line `# function 0x<entry> <samples> <rows>`
+  (its samples all of them: its rows' sum plus those at no instruction, the total the entry form wrote; its rows the lines after it), the
+  functions by samples and each function's rows by samples, most first; a line `# functions: ...` in the header says so. nxaot skips the
+  lines as comments (`TiersFromProfile` cuts every line at `#`). The launch file's `samples` row and the launcher's "a better pack is
+  possible" (dm/launcher/launcher_model.h, "The second pack") count the sampled functions by these lines, nxaot's tier H: the rows, one per
+  sampled instruction, grow with a session's length inside the same functions and would offer a repack after every longer session; a file
+  without the lines (the entry form, or written by hand) counts its rows, which are then functions' entries. Each session writes the file
+  anew (the misses file alone merges sessions).
+- **Tests.** dm/host's `t_aot_host` (int_ops-gcc and int_ops-clang, `int_ops_rounds = 2000` under `DM_AOT_PROFILE`): every byte of the pack's
+  compiled code through the positions (none outside its function), every sampled function with a row inside it and one function line (the
+  sampler's count for it, then as many rows as it says, each inside it), ref_crc the hottest function
+  with most of its samples inside its loops and away from its entry (int_ops-gcc: `0x2268 107; 0x2258 95; 0x2264 72; 0x2260 50`), and with
+  `--nxaot` / `NXAOT` the round trip (`nxaot build --profile` weighs functions, `NXAOT_PROFILE_WEIGHTS=0` gives the pack of the entry form);
+  `t_aot_module`: synth_hot's samples in its loop. Windows: the sampler thread's path calls the same lookup on the suspended thread's `Rip`
+  and the DLL exports the table (`/export:nxaot_positions`); not run here.
+
+### Hot indirect targets
+
+Design 12's profile holds "hot indirect targets" beside the sampled offsets, and section 4 gives them their use: a hot indirect site with a dominant
+target gets a guarded direct call. An indirect call through the inline cache costs two loads, a compare and an indirect call, and LLVM cannot inline
+across it; one that always reaches the same function (a vtable slot with one implementation, a callback, a pointer set once) becomes a compare with a
+constant and a direct call, which LLVM may inline when the target is in the same unit. Done for tiers H and H+, from what the host records.
+
+- **What a cache holds, and what is recorded.** A site's inline cache is one slot (a global of its function's unit, `nxaot.ic.<function>.<site>`:
+  [src/lift/lower_calls.cpp](src/lift/lower_calls.cpp) `FnDispatch`) pointing at an immutable `{guest, native}` descriptor, and nothing else: no
+  count of hits, which stay in the pack's code. The host sees the misses: `nxaot_rt_dispatch(st, target, slot, site)` with the site's module offset
+  ([dm/host/aot_run.c](../../host/aot_run.c)), once whenever the slot's descriptor is not the target's. Under `DM_AOT_PROFILE` each miss is noted
+  ([dm/host/aot_targets.c](../../host/aot_targets.c) `dm_aot_target_note`: a table of pack, site, target and kind under one lock, on the miss path
+  only), and the number written is the binds: how many times the dispatcher bound the site's cache to that target. That is 1 per cache for a site
+  that only ever reaches one target, and for a site with several one per switch back to it (the targets A, B, A, A give A 2, B 1): switches, not
+  calls. A count of calls needs a counter on the hit path, an increment at every indirect call of every pack (and a pack format that holds the
+  counters); none was added, as nothing measured it free. So the rule's 90 % below acts on switches: in practice a site is guarded when its cache
+  was only ever bound to one target, or to one far more often than to the others.
+- **The file.** At exit, beside the profile, `<folder>/<module>.targets.tsv` per module whose caches were bound to its own functions: the header of
+  the profile's and the misses file's (`# module <name>, build ID <id>, image SHA-256 <hex>`, the pack, the totals), then `0x<site> 0x<target>
+  <binds>` by site and target (module offsets). Not written, counted in the log's `aot: targets: this session <p> (site, target) pairs bound <b> times
+  in their own module's code, <f> files; not written: <x> misses bound to another pack's code, <y> handed to another pack of another signature, <h> to
+  host functions, <j> to addresses with no compiled entry (the misses file)`: a target in another pack (bound, but its offset is another module's), a
+  host function (the host-function page, the stub page), an address with no compiled entry (the misses file has it). The file is merged across
+  sessions of the same image, as the misses file is: a guarded pack's hits never reach the dispatcher, so a session recorded on it binds none of its
+  guarded targets, and a file rewritten per session would take the guards away from the pack after it; another image's file is replaced. Written by
+  an atexit handler registered at the first note, or earlier by `dm_aot_targets_write` (hle_lifecycle.c's graceful exit, beside
+  `dm_aot_profile_write`, as `_exit` runs no atexit handler). fnptr-gcc's rows from one run of its corpus pack under `DM_AOT_PROFILE` (dm/host's
+  `t_aot_targets`; 11 sites, 26 rows, 40 binds, the dispatcher's 40 misses; the fixture below, written by hand before any build, has the same 26
+  rows): `0x1a64 0x1820 1`, `0x1a7c 0x1820 1`, `0x1a90 0x1820 1` (with_cleanup's three calls through `work_ptr`, all to `work`), `0x434 0x1840 1`
+  (main's call through `hidden_ptr`), `0x1608 0x1ae0 1` (rt_exit's fini array), `0x1984 0x1690 2`, `0x1984 0x16d0 1`, `0x1984 0x1720 2`
+  (shape_total's area slot over rect, tri, sq, rect, sq), `0x1a2c 0x1780 3` and five more (apply_op's tail call over the six operations).
+  fnptr-clang: 10 sites, 23 rows, 37 binds (clang specializes `fold` per callback, `fold.specialized.1` to `.3`, with the callback inlined: no
+  site there).
+- **The rule.** With `--profile <folder>/<module>.tsv`, nxaot reads `<folder>/<module>.targets.tsv` beside it when it is there (no option, no
+  packer change; [src/build/pack.cpp](src/build/pack.cpp) `TargetsFromProfile`). A site gets a guard when it lies in a function at tier H or H+
+  (with a profile, a sampled function; in the max mode every function), one target has at least 90 % of the site's counts (the only one, or
+  `10 × count ≥ 9 × total`; a tie goes to the lower offset), the site's word is a `blr` (a call) or a `br` other than `br x30` (a tail call; the two
+  the inline cache serves), and the target is a function of the module that, for a call, returns. The log: `aot: profile targets: <s> sites, <g>
+  guarded, <m> with several targets, not guarded, <o> outside tier H; <x> whose target is no function of the module or a call's that does not
+  return, <n> at no blr or br, <u> planned that no lifted code reaches (<file>)`, g counted by the lifter (cached units' from their facts); `aot:
+  profile targets: none (no <file>): no guarded calls` without a file, `aot: profile targets: off (NXAOT_PROFILE_TARGETS=0): no guarded calls` with
+  the test switch, which reads none.
+- **The code.** A guarded call ([src/lift/lower_calls.cpp](src/lift/lower_calls.cpp) `FnCallGuarded`): `icmp eq` of the computed address with
+  `base + target`, a branch with the inline cache's own weights (2^16 : 1) to `guard_hit_<site>_`, which calls the target's body as `bl` does (its
+  own signature, what it takes in host registers, its exact writes reloaded after it, the same pending check and resume points), or to
+  `guard_miss_<site>_`, the inline cache's call as before; both join before the block goes on. The successors' dirty sets were computed with the
+  indirect call's (FnDataflow), so the direct path then stores what it keeps newer than the block beyond what the indirect call keeps (a register
+  the target does not write but the union of indirect targets may), and FnDataflow counts those stores in what the function may leave in the block
+  (`restore_block`). A guarded tail call (`FnTailIndirect`): the same compare, then `musttail` of the target's body as `b` makes it, or the
+  inline cache's tail call; nothing joins. Gates, safepoint polls, the calling convention, the return table and the descriptor are unchanged: the
+  call site, its return address and its cache slot are the same.
+- **The cache key.** A function with guarded sites gets a `targets` field (each site, its target, the target's convention facts: what the direct
+  call depends on); the others none, so the keys of a pack without a targets file, with `NXAOT_PROFILE_TARGETS=0`, and of the functions without a
+  guarded site are as before (format still `nxaot-unit 4`). A unit's facts gain `guarded` only when it has some.
+- **Tests.** CTest `profile_targets` ([tests/test_profile_targets.py](tests/test_profile_targets.py), the fixture
+  [tests/profile_targets.tsv](tests/profile_targets.tsv) and [tests/profile_targets.targets.tsv](tests/profile_targets.targets.tsv): fnptr-gcc's
+  sites in the host's form, checked against the NRO's words and discovery; its rows are the host's own from a run, above), 31 checks: the log
+  against the rule (11 sites: 5 guarded at `0x434`, `0x1608`, `0x1a64`, `0x1a7c`, `0x1a90`, 5 with several targets, 1 in rt_init at tier C), the
+  guards in `--ir`, the same pack with 1 and 4 workers and twice, `NXAOT_PROFILE_TARGETS=0` the pack of the profile alone, the 90 % boundary (18
+  of 20 guarded, 17 of 19 not), the cache (cold 22 units; targets changed outside every guarded function hit all 22, a guarded site's target
+  changed or a second target added misses its unit only, 21 hits and 1 miss), and the guarded packs (balanced, max, ghccc, and guards that miss
+  on some calls) printing `fnptr.out` natively. dm/host's `t_aot_targets` ([dm/host/tests/t_aot_targets.c](../../host/tests/t_aot_targets.c)),
+  10 checks: fnptr-gcc and fnptr-clang from their corpus packs under `DM_AOT_PROFILE`, the rows the program's source implies, the binds adding up
+  to the dispatcher's misses (40 and 37), a second session doubling them (`merged with an earlier session's`), a host function's target giving no
+  row, and with `NXAOT` the round trip (`aot: profile targets: 11 sites, 5 guarded, 6 with several targets` for gcc, `10 sites, 5 guarded, 5 with
+  several targets` for clang, every site sampled; the guarded pack printing `fnptr.out` and binding nothing at its guarded sites, the others as
+  before).
+- **The rule on sites with several targets.** A site's binds count switches, so one that alternates between two targets has about as many of each
+  and is never guarded: fnptr-gcc's fixture with main's site given two targets of 5 binds each (`0x434 0x1840 5`, `0x434 0x1820 5`) logs `11
+  sites, 4 guarded, 6 with several targets` and its IR has no `guard_hit_434_`; shape_total's area site (`0x1984`: rect 2, tri 1, sq 2, the best
+  40 %) and apply_op's tail call (best 3 of 14) stay unguarded in every run above.
+- **Identity.** With no targets file beside the profile, and with no profile, the packs are the base's bytes: build_packs.sh's 42 corpus packs
+  (`.so` and `.dll`) from this binary and from 361d769's, the same SHA-256 every one; int_ops-gcc with `--profile tests/profile_weights.tsv` (`aot:
+  profile targets: none`) the same bytes; fnptr-gcc with the fixture's profile and `NXAOT_PROFILE_TARGETS=0` the bytes 361d769's binary gives
+  with the same profile.
+- **Measured.** [tests/measure_packs.py](tests/measure_packs.py) in the image, the build tree on tmpfs: A the guards (the targets file beside the
+  profile), B `NXAOT_PROFILE_TARGETS=0` (the same profile without them), 6 rounds, 4 layouts, pinned to CPU 3, the machine's load 3 to 9 (other
+  agents' builds). fnptr's profiles: the host's targets file of one run and a sample at each of its sites (the program runs 7 µs, too short for the
+  sampler; the pair t_aot_targets's round trip writes), fastest of 20,000; fnptr has no rounds symbol and nxaot_host prints its times to the
+  microsecond, so a change under about 15 % cannot show:
+
+  | Program | A | B | change | layout spread A / B | rounds spread | .text A -> B | bytes A -> B | pack time A -> B | pack peak MiB A -> B |
+  |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+  | fnptr-gcc | 7.0 us | 7.0 us | +0.00 % | 0.00 / 0.00 % | 28.57 % | 123,012 -> 121,476 | 182,128 -> 180,600 | 0.20 -> 0.22 s | 88 -> 87 |
+  | fnptr-clang | 6.5 us | 7.0 us | +7.69 % | 7.69 / 7.14 % | 36.26 % | 103,712 -> 101,824 | 158,736 -> 156,736 | 0.20 -> 0.21 s | 85 -> 84 |
+
+  Both "within noise"; over the 24 samples of each variant, fnptr-gcc 23 at 7 µs with the guards and 20 without, fnptr-clang 10 at 6 µs with them
+  and 5 without (the rest 7 µs, and 1 to 5 outliers at 11 µs). The 4,000-function benchmark (`gen_bench.py --functions 4000`, seed 1), recorded
+  by dm/host's runner on its tier W pack (`t_aot_targets --run <pack> bench.nro --write` under `DM_AOT_PROFILE`): 2,007 samples, 1,853 of them in
+  the JIT fallback (its misses file: 5,124 addresses of non-local transfers to continuations with no native frame, 131 indirect) and 3 in
+  compiled code, at the entries of 2 functions; 140 sites, 394 rows, 394 binds, 53 sites with one target (a pack built with `--misses` from it
+  still ran 1,738 of 1,860 samples in the JIT fallback; both were the tail-call bug of "Tail calls and the native frame's return", the
+  `nonlocal` rows returns of calls the JIT made: fixed, the session samples 377 to 387 of about 450 in the JIT, about 200 of them its first use,
+  and its misses file is 339 `indirect` rows, 12 after two repacks). With that profile (2 functions at H, 4,086 at C) every site lies outside tier H:
+  `140 sites, 0 guarded`, and the packs are the same bytes (17,261,688; not run). In the max mode (every function at H or H+) `140 sites, 53
+  guarded, 87 with several targets`, fastest of 3:
+
+  | Program | A | B | change | layout spread A / B | rounds spread | .text A -> B | bytes A -> B | pack time A -> B | pack peak MiB A -> B |
+  |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+  | bench (max mode) | 1.505 s | 1.505 s | +0.06 % | 0.97 / 1.37 % | 3.86 % | 5,960,496 -> 5,946,032 | 9,261,696 -> 9,243,800 | 21.90 -> 21.62 s | 272 -> 268 |
+
+  "within noise" (most of its time was the JIT fallback, before the tail-call fix). A pack with guards is 0.2 to 1.9 % larger in `.text` (both paths of each guarded call
+  are kept); its pack time is within the noise (fnptr 0.20 s against 0.21 and 0.22 s, the benchmark in the max mode 21.90 s against 21.62 s).
+- **The default.** No program measured is slower with the guards beyond the noise, so they stay on whenever a targets file lies beside the
+  profile, and `NXAOT_PROFILE_TARGETS=0` stays a test switch. What the numbers do not show is a gain: no program here spends its time in compiled
+  code behind a hot single-target indirect site (fnptr runs 7 µs, the benchmark's time is the JIT fallback's). That needs a game's profile, or a
+  corpus program with a rounds symbol around such calls.
+- **Not done here.** Windows: the recorder and the writer are the same C (`aot_targets.c`, `MoveFileExA` for the replace) and `t_aot_targets`
+  uses `_popen`, not run (no Windows runner here). The launcher and the packer know the file since: the packer's `made targets` and `targets <module>
+  <sites> <digest>` rows (the sites with a dominant target by this rule, the digest of their `<site>:<target>` pairs; the pairs in the pack's key), the
+  launcher's "better pack" rule on a site with a dominant target the packs were made without, at least 10 % more of them
+  ([launcher_model.h](../../launcher/launcher_model.h), "The second pack"); the rule is stated three times (`TargetsFromProfile`, the packer's
+  `targets_summary`, the launcher's `read_targets`), the last two tested on one fixture.
+
+## The lock file
+
+[nxaot.lock](nxaot.lock) names the LLVM release (`18.1.3`) and the dynarmic commit. The configure step stops when the LLVM package differs, or when
+[VENDOR.md](../../third_party/dynarmic/VENDOR.md) names another commit; the lifter checks `LLVM_VERSION_STRING` against it at compile time. The hashes
+of the prebuilt `nxaot` binaries go there later (design section 13).
+
+## Boost
+
+dynarmic includes `boost/icl/interval_map.hpp`, `interval_set.hpp`, `boost/variant.hpp` and `variant/get.hpp` (headers only). The decision was a vendored
+header-only subset made with `bcp`. **Temporary deviation, for the lead to record:** the subset `bcp` makes of those four headers from Boost 1.83
+(Ubuntu 24.04's `libboost-tools-dev`) is 21 MB, over the 15 MB allowed (preprocessor 9.6 MB, mpl 4.7 MB, type_traits 1.3 MB, intrusive 0.96 MB,
+icl 0.8 MB, the rest under 0.7 MB each; `bcp` follows every `#include` of every configuration), so the image installs the distribution's Boost headers
+(`libboost-dev`, in a layer of its own), and nxaot takes those. An option measured for the decision: the headers this build actually
+includes (`clang -M` over every compile command) are 795 files, 4.2 MB (mpl 224, type_traits 157, preprocessor 110, icl 97, variant 31, range 31);
+such a list is specific to the compilers and configurations it was taken with.
+
+dm/host's JIT fallback (`NXHOST_JIT`, the same dynarmic) needs the same headers: the Linux images' `libboost-dev` (docker/Dockerfile.build has it too),
+and where CMake finds no Boost, [dm/third_party/boost](../../third_party/boost/VENDOR.md), that list made for both compilers the host is built with
+(clang 18 with libstdc++, llvm-mingw's clang 23 with libc++ for Windows: 795 and 794 headers, the same but for `boost/config`'s platform and library files) with all
+of `boost/config`: 869 files, 4.5 MB. The Windows cross-build takes it (the llvm-mingw image has no Boost), so the Windows host has the JIT fallback too.
+
+## Lifter coverage
+
+`nxaot opcodes` lists the 725 opcodes of dynarmic's IR: 589 lowered and 136 that never appear in an A64 block: 133 of the AArch32 frontend (its own;
+the packed, `ssat` / `usat`, GE, carry and overflow opcodes only it emits; and 34 floating-point and SIMD ones: the widening multiply pseudo-operations
+`VectorSignedMultiply` / `VectorUnsignedMultiply` with `GetUpperFromOp` / `GetLowerFromOp`, the 64-bit lane integer max / min / multiply / reduce /
+sign extension, `VectorEqual128`, VTBL's `VectorTableLookup64`, the 16-bit fixed-point and the vector half-precision conversions of VCVT, and
+`SignedSaturatedAddWithFlag32` / `SubWithFlag32`) and 3 dynarmic-internal ones (`Breakpoint`, `CallHostFunction`, `GetNZFromOp`). `nxaot opcodes
+--reach --check` (CTest `opcodes_reach`) proves the split: it translates 655,956 words filled from every entry of dynarmic's A64 decoder table
+under four FPCR values, finds the 576 opcodes the A64 frontend emits, and fails when one is not lowered. The vectors exercise 587 of the 588 lowered
+opcodes other than `Void` (`nxaot_vec` prints the list after each run); the one left is `Identity`, which the identity-removal pass leaves unused before
+the lifter looks. Apart from those two, an opcode is in the lowered set only when a passing vector reaches it. CRC32C is `crc32` (SSE4.2);
+CRC32 (IEEE) is a 256-entry table a byte at a time (a PCLMULQDQ form is an optimisation for later). `dmb` of every kind is `fence seq_cst`.
+
+Vectors per file of the committed set (all pass; `nxaot_vec` prints them per class): `fp.tsv.gz` 14,856 (with `fma_invalid` 456),
+`simd_same.tsv.gz` 42,000, `simd_misc.tsv.gz` 39,000, `simd_shift.tsv.gz` 15,600, `simd_perm.tsv.gz` 13,800, `crypto.tsv.gz` 9,600,
+`simd_ldst.tsv.gz` 14,040, `fp_seq.tsv.gz` 6,000, `fp_est.tsv.gz` 3,756; the integer `.tsv` files 24,800 (`dp_imm` 4,200, `dp_reg` 7,400, `branch`
+2,200, `loadstore` 4,900, `exclusive` 2,200 with `excl_same` 400, `system` 2,100, `sequence` 1,400, `undefined` 400).
+
+### Store-exclusives whose status register is a data register
+
+`stxr` / `stlxr` / `stxp` / `stlxp` with Rs equal to Rt (or to Rt2 of a pair) is CONSTRAINED UNPREDICTABLE in the Arm ARM, and compilers emit it:
+`stlxr wzr, xzr, [x8]` (`c81ffd1f`) is a compare-and-swap to zero whose result nothing reads, both registers the zero register (Mario vs. Donkey
+Kong 1.0.0, `main+0x6a0f98` and `main+0x68a7d0`, in its audio framework's voice lists: `ldaxr x9, [x8]`; `cmp x9, x19`; `b.ne`; `stlxr wzr, xzr,
+[x8]`). The game ships with it, so the console's CPU runs it, and the store of zero is what its code needs. dynarmic's translator refuses it unless its option `define_unpredictable_behaviour` is set (the
+only place of its A64 frontend the option reaches: `frontend/A64/translate/impl/load_store_exclusive.cpp`), and the option was clear here as in
+dynarmic's defaults, so the instruction was compiled as a trap and the game ended with `[RED] aot: an undefined or unpredictable instruction at
+main+0x6a0f98` and status 7 the first time the audio thread took that path (once in four skips of a new file's world intro).
+
+The option is now set everywhere the frontend is used: the lifter's decoder ([src/decode/translate.cpp](src/decode/translate.cpp)), the JIT
+fallback (`src/rt/jit.cpp`), the vector harness's reference (`src/vec/reference.cpp`), `nxaot_run` and the function comparison
+(`src/rt/funcdiff.cpp`), as the emulators that ran this console's games on dynarmic set it. The instruction is then the store of the data
+register's value as read before the store, with the status written to Rs after it (nothing for the zero register). A status register equal to the
+base register (Rs == Rn, Rn not SP) and a load pair with Rt == Rt2 stay traps: dynarmic defines nothing for them. The class `excl_same` of
+`exclusive.tsv` (400 vectors: single stores with Rs == Rt of every size, half of them the zero register, with and without the exclusive load;
+pairs with Rs equal to either data register; the game's sequence with the expected value equal and different) passes against dynarmic with 0
+mismatches, every vector ending normally. Of the 5,931 exclusive stores in the code of that game's three modules, the two named are the only ones
+of the form, and none has Rs == Rn. Unit key format 15.
+
+## Known issues
+
+Places where dynarmic, the reference, departs from the Arm ARM or from what the harness can compare. Each is handled as said; none is patched in the
+vendored copy.
+
+1. **`msr nzcv` then `mrs nzcv` in one block.** dynarmic's `A64GetSetElimination` pass forwards the whole written register to the read
+   (`ir/opt/a64_get_set_elimination_pass.cpp:67`), where NZCV bits 27:0 read as 0. Encoding: `d51b4200 d53b4201` (`msr nzcv, x0; mrs x1, nzcv`):
+   with the pass, 56 of the 300 `msr_mrs` vectors differed (x1 = 0xfe947a5a from the reference, 0xf0000000 lifted, for x0 = 0xfe947a5a).
+   The reference runs without that pass (`src/vec/reference.cpp`); the JIT fallback (design section 11) must too, or the pass be fixed upstream.
+   The lifter forwards the vector and the general registers and SP, not NZCV, in passes of its own (`ForwardVectorRegisters`,
+   `ForwardGeneralRegisters`).
+2. **`dc zva` at an unaligned address.** With `hook_data_cache_operations` off, dynarmic's `A64CallbackConfigPass` zeroes 64 bytes from the address
+   itself (`ir/opt/a64_callback_config_pass.cpp:32`), not from the aligned block that holds it (read in the code, not run). Encoding: `d50b7420`
+   with an unaligned `x0`. The reference takes the hook and zeroes the aligned block, as the Arm ARM's `dc zva` does.
+3. **FPSR after a block lookup.** dynarmic's dispatcher compiles a block it misses with the guest's MXCSR loaded (`backend/x64/block_of_code.cpp:370`,
+   `:449`), so its own floating point (hash-map load factors) can leave IXC in the guest's cumulative flags: the first vector, `94000001` (`bl +4`),
+   ended with FPSR 0x10, and `d65f03c0` (`ret x30`) after another `ret` to a different target did again. The harness now runs every vector twice
+   on the reference and compares the second run, which finds every block of its path compiled (`src/vec/reference.cpp`, `Reference::Run`), and
+   compares the whole final FPSR; `--ignore-fpsr-flags` compares QC alone, should the issue come back. The JIT fallback inherits the issue.
+4. **FPCR bits.** `msr fpcr` keeps the bits dynarmic keeps (`FPCR_MASK = 0x07C89F00`, `backend/x64/a64_jitstate.cpp:51`), which include FZ16 and the
+   trap enables a Cortex-A57 does not implement [A: the A57 reads them as 0]. The lifter uses the same mask (`kFpcrMask`), so both differ from the A57
+   alike; FPSR keeps QC and the cumulative flags (0x0800009F) on both. The trap enables reach neither executor's floating point: code is compiled
+   for the mode bits only, and dynarmic's software operations, which assert on an enabled trap, get the same (the helpers here too).
+5. **Branch targets.** dynarmic's location descriptors keep 56-bit PCs, sign-extended from bit 55 (`frontend/A64/a64_location_descriptor.h:28`), so a
+   `br` to a non-canonical address leaves the reference at another pc than the lifted code: `d61f0020` (`br x1`) with x1 = 0x123456789abcdef0 ends at
+   0x003456789abcdef0 in the reference and at x1 in the lifted code. That is the Arm ARM's result when top-byte-ignore is on for EL0 (BranchAddr), not
+   when it is off. The vectors branch to canonical addresses; what the recompiler does with tagged branch targets is an open question of the design.
+6. **Hints.** dynarmic's A64 JIT passes only two translation options (`backend/x64/a64_interface.cpp:274`), so `yield`, `wfe`, `wfi`, `sev` and
+   `sevl` always raise `ExceptionRaised`, whatever `hook_hint_instructions` says. The reference treats them as hints and goes on; the lifter emits
+   `pause` for the first three.
+7. **What dynarmic leaves to an interpreter.** `mrs xN, cntvct_el0` (dynarmic translates `cntpct_el0` only): the decoder glue translates it and the
+   reference's interpreter callback does the same. LSE atomics, `ldapr`, `hvc` / `smc` and `msr` immediate end a block as untranslated on both sides.
+
+The issues below are FPSR only: dynarmic's x86-64 backend raises other cumulative exception bits than the Arm ARM's pseudocode for some
+operations, and the lowering follows the Arm ARM. The lifter notes the issues a region meets in the forms dynarmic takes them
+(`lift::DynarmicIssue`, `Lifted::dynarmic_issues`), and nxaot_vec relaxes only those FPSR bits, only in the direction listed, for such a vector,
+and only when the FPSR is all that differs (`src/vec/main.cpp`, `KnownIssues`; it prints the vectors per issue; `--no-filters` turns it off).
+Values, QC and the other registers are compared exactly in every case.
+
+8. **FRINTN / FRINTP / FRINTM / FRINTZ / FRINTI raise Inexact.** dynarmic's native path is `roundss` / `roundps` with the rounding immediate but
+   without the precision-suppression bit (`backend/x64/constants.h:162`), so an inexact result raises PE, IXC. The Arm ARM's `FPRoundInt` with
+   `exact` FALSE raises no Inexact; only FRINTX does. Example: `1e644020` (`frintn d0, d1`) with d1 = 1.5: reference FPSR 0x10, Arm and lifted 0.
+   Reference-only IXC.
+9. **Conversions to integer and fixed point, dynarmic's native forms** (FCVTNS / NU / PS / PU / MS / MU / ZS / ZU, scalar and vector, and the
+   fixed-point FCVTZS / FCVTZU; `backend/x64/emit_x64_floating_point.cpp:1623`, `emit_x64_vector_floating_point.cpp:2012`). They
+   clamp with `minsd` / `maxsd` or compare-and-select before `cvttsd2si`, so a saturated result raises no Invalid Operation (positive overflow of
+   the signed forms, negative values to the unsigned ones, a quiet NaN zeroed by a quiet compare); unsigned 64-bit conversions convert the operand
+   with the signed `cvttsd2si` too, which raises Invalid Operation for values in [2^63, 2^64) that convert exactly; negative values to unsigned
+   are clamped to 0 before rounding, so Inexact is lost or IXC appears where Arm raises IOC; and the fixed-point forms scale by 2^fbits in the
+   source precision, which overflows (OFC, IXC) for large operands where Arm scales exactly. Examples: `9e581ccd` (`fcvtzs x13, d6, #57`) with
+   d6 = 0x43efffffffffffff saturates: Arm IOC, reference nothing; `9e390100` (`fcvtzu x0, s8`) with s8 = 0x5f7ffffe (1.8e19, exact):
+   reference IOC, Arm nothing. Reference-only IOC / IXC / OFC, lifted-only IOC / IXC.
+10. **Conversions dynarmic does in software** (FCVTAS / FCVTAU, the half-precision ones): its `FPToFixed` (`common/fp/op/FPToFixed.cpp:41`)
+    raises Invalid Operation for any negative nonzero operand of an unsigned conversion, also one that rounds to 0, where the Arm ARM's
+    `FPToFixed` rounds first (0, no overflow) and raises Inexact. Example: `9e250196` (`fcvtau x22, s12`) with s12 = 0x9be5733f (-3.8e-22):
+    reference IOC, Arm IXC. Reference-only IOC, lifted-only IXC.
+11. **FMADD / FMSUB / FNMADD / FNMSUB with DN = 0.** When the native result is a NaN, dynarmic's NaN path multiplies the two factors
+    (`vmuls`, `emit_x64_floating_point.cpp:745`) to test for infinity times zero; the product's Inexact, Overflow and Underflow reach the flags,
+    which the Arm ARM's `FPMulAdd` (a NaN addend is the result) does not raise. Example: `1f020c20` (`fmadd s0, s1, s2, s3`) with s1 = s2 =
+    1.1 and s3 a quiet NaN: reference IXC. Reference-only IXC / OFC / UFC.
+12. **No Input Denormal under FZ.** dynarmic's native operations flush denormal operands through MXCSR.DAZ, which raises nothing; the Arm ARM's
+    `FPUnpack` raises Input Denormal (IDC) for each operand it flushes. With FZ specialised (nxaot_vec `--fz-specialised`) the lowering raises IDC as
+    Arm does (`FunctionLifter::InputDenormal`), as dynarmic's own software paths also do; with FZ a run-time state, as packs are built, the operations
+    dynarmic computes natively raise none either (`NativeInputDenormal`: [FZ as a run-time state](#fz-as-a-run-time-state)), the same as the JIT. Example: `1e222820` (`fadd s0, s1, s2`) with s1 = 0x00000001 under FZ: Arm IDC, reference nothing.
+    Lifted-only IDC.
+13. **FMAX / FMIN / FMAXNM / FMINNM of vectors raise Invalid Operation for quiet NaNs.** dynarmic computes `maxps` / `minps` on every lane,
+    which signal for any NaN operand (`emit_x64_vector_floating_point.cpp:950`); the Arm ARM signals for signalling NaNs only (the scalar
+    forms are right: they test with `ucomiss` first). Example: `4e22f420` (`fmax v0.4s, v1.4s, v2.4s`) with a quiet NaN lane in v1: reference IOC.
+    Reference-only IOC.
+14. **FRSQRTE (single, double).** dynarmic's native estimate truncates the operand and computes `1 / sqrt` with `sqrtss` / `divss`
+    (`emit_x64_floating_point.cpp:1182`), which raises Inexact; its truncation turns +infinity into a signalling NaN that its `ucomiss` test then
+    signals (Invalid Operation); and its `rsqrtss` path for zero, negative, denormal (FZ) and NaN operands raises nothing where the Arm ARM raises
+    Divide by Zero, Invalid Operation or Input Denormal. Values agree. Examples: `7ea1d9f6` (`frsqrte s22, s15`) with s15 = +inf: reference IOC,
+    Arm nothing; `7ea1d817` with s0 = 0x0000000b under FZ: Arm IDC and DZC, reference nothing. Reference-only IXC / IOC, lifted-only IOC / DZC /
+    IDC.
+15. **FDIV / FRECPE / FRSQRTE of 64-bit vectors (2S).** dynarmic computes all four lanes, and the zero upper lanes the frontend's `GetD` supplies
+    give 0 / 0 (Invalid Operation) and estimates of 0 (Divide by Zero). The Arm ARM computes two lanes; the lowering computes the upper lanes
+    on 1.0 (division) or not at all (estimates) when the result's only uses keep the low 64 bits (`FunctionLifter::LowHalfOnly`). Example:
+    `2e22fc20` (`fdiv v0.2s, v1.2s, v2.2s`): reference IOC always. Reference-only IOC / DZC.
+16. **A quiet NaN addend with infinity times zero.** The Arm ARM's `FPMulAdd` returns the default NaN and raises Invalid Operation; x86's FMA returns
+    the quiet NaN and raises nothing. dynarmic's vector NaN correction sets the default NaN without the flag
+    (`emit_x64_vector_floating_point.cpp:1299`), and with DN = 1 its scalar and vector forms are `vfmadd` alone (`emit_x64_floating_point.cpp:638`,
+    `emit_x64_vector_floating_point.cpp:1326`); its scalar forms with DN = 0 raise it through the multiply that tests for infinity times zero
+    (`vmuls`, `emit_x64_floating_point.cpp:745`, issue 11). The lowering raises IOC in every form (`FunctionLifter::MulAddInvalid`; with DN a chain
+    that holds an FMA takes the cold block instead of the default-NaN select when the flags are modelled). Examples:
+    `4ea5cc81` (`fmls v1.4s, v4.4s, v5.4s`) with quiet NaN addends, v4 = 0, v5 = +inf: Arm IOC, reference nothing; `1f450881`
+    (`fmadd d1, d4, d5, d2`) with d2 a quiet NaN, d4 = 0, d5 = +inf under DN: the same. Found by the big sweep (`fp_seq`, `fmadd` with DN = 0
+    under FPCR.RZ: the lifted run raised nothing and the reference IOC, a lowering bug, now fixed); the committed class `fma_invalid` (in
+    `fp.tsv.gz`) covers every form. Lifted-only IOC.
+17. **Single to half with DN on AVX-512 hosts.** The Arm ARM's `FPConvert` raises Invalid Operation for a signalling NaN input whatever FPCR.DN
+    says (DN only chooses the default NaN as the result). dynarmic's F16C path for `FPSingleToHalf` (`fcvt h, s`, and `fcvtn` / `fcvtn2` of
+    single lanes, which its A64 frontend converts lane by lane) forces the default NaN before `vcvtps2ph` (`ForceToDefaultNaN`,
+    `backend/x64/emit_x64_floating_point.cpp:142`): on a host with AVX-512 F, VL and DQ through `vfpclassss` and a masked blend, which raise
+    nothing, so the signalling NaN never reaches an instruction that signals; on other hosts through `vcmpunordss`, which raises Invalid
+    Operation for it. So the reference agrees with the Arm ARM here and not on AVX-512 runners: found by the aot workflow on GitHub (an
+    icelake-server CPU), `4e216a04` (`fcvtn2 v4.8h, v16.4s`, FPCR 0x2000000, v16.s[0] = 0x7fbfffff) gave FPSR 0x14 from the reference and 0x15
+    lifted, and `0e2169b8` (`fcvtn v24.4h, v13.4s`, FPCR 0x3400000, v13.s[3] = 0xffa00000) 0x10 and 0x11 (simd_misc.17828 and .17877; the lanes are
+    the seed's, recomputed from `src/vec/vectors.cpp`). The lowering (`vcvtps2ph` on the operand, which signals) is right; the filter relaxes
+    lifted-only IOC for regions with a single-to-half conversion under DN only when the reference host has those AVX-512 features
+    (`KnownIssue::host`), so that on other hosts the bit is still compared exactly. The JIT fallback inherits the issue on such hosts. Lifted-only
+    IOC (AVX-512 hosts).
+
+Shared with dynarmic, not filtered, and open: x86 detects tininess after rounding and the Arm ARM before, so a result that rounds up to the
+smallest normal raises UFC on Arm and not here (FZ = 0); with FZ = 1, x86 flushes after rounding and Arm before, so add, subtract, multiply,
+divide and square root of such a result give the smallest normal here and zero on Arm (design 7.2, row 13). The brief of phase 2 asks the
+FZ handling to follow dynarmic's: fused multiply-add gets the software slow path dynarmic has (`FPMulAdd` for a result of +-smallest normal), the
+other operations take x86's FTZ as dynarmic does. Random vectors do not hit these boundaries; a slow path for them is a later, measured change.
+
+Also shared with dynarmic, not filtered (the two agree, so no vector differs), and open: FRECPS and FRSQRTS of infinity times zero. The Arm ARM's
+`FPRecipStepFused` and `FPRSqrtStepFused` return 2.0 and 1.5 for it and raise nothing; dynarmic computes the native FMA before its software step and
+the lowering before its blend ([the estimates and steps inline](#the-estimates-and-steps-inline)), and x86's FMA raises Invalid Operation for
+infinity times zero, so both set IOC where Arm sets nothing. The values are Arm's. A guest that reads the FPSR after such a step sees the bit; the
+fix here would be a test of the operands before the FMA (measured against the audio limiter that runs this case once a sample), with a filter for
+the reference.
+
+## What is not done yet
+
+The phases of design section 14, and where this folder stands:
+
+| Phase | Content | Here |
+|---|---|---|
+| 0. Census | the numbers per module | `nxaot census` over raw code; NROs and behaviour images are read (`nxaot module`) and FDE coverage, LSDA counts and the address-taken set come out of `nxaot discover`, not yet as census keys; NSO decompression (LZ4) and setjmp imports are not done |
+| 1. Skeleton | decoding, discovery, lifting of integer / memory / branch / call code, state block, dispatcher, SVC path, vector harness, calling-convention benchmarks | **done** except what follows: the lifter (0 mismatches over 24,400 integer vectors), the module loader, discovery, the summaries; function mode with the convention of 2.3 in two LLVM mappings (swifttailcc, the default by the measurements, and ghccc for preserve_none, which LLVM 18.1 lacks), calls, returns checked against lr, tail calls, `pending` propagation with resume points at setjmp continuations and landing pads, the correctness mode; jump tables as switches, inline caches, standard entries, the lookup table, the miss path; `nxaot build` (tiers C, W, H, H+; the balanced and max modes; an object with the lookup table, function map and line table, a shared object by lld); `nxaot_host` (the arena below 2^39, the SVC path, the counter, faults through the line table); the corpus natively in both conventions and the correctness mode, equal to dynarmic and to the expected output; nxaot_funcdiff on every corpus function; the measurements ("Measurements"). Not done: the corpus natively on ARM64 hardware (an Apple-silicon Mac), one tier per function and profiles (phase 5), ThinLTO, functions split for size, the oracle-T / J / W comparisons, the pack throughput targets of section 10 (not met: "Pack throughput") |
+| 2. FP and SIMD | every FP, NEON and crypto lowering, NaN chains | every opcode the A64 frontend emits lowered; 0 mismatches over the committed vectors and 7,000,000 random floating-point and SIMD ones (10^6 per class for seven of the eight classes, `fp_seq` not completed; not the 10^8 of the acceptance); the chain checks measured. Not done: the row-13 FZ slow path for the basic operations, inline estimates, combined escape checks, the run-time helpers in the host |
+| 3. Control flow and JIT | resume points, `pending`, safepoints, dynarmic integration | **done** except what follows: the JIT fallback on dynarmic unmodified (`dm_jit_create` / `dm_jit_run` / `dm_jit_halt`, design 11's configuration, the stops at compiled entries and call sites' returns through the code reader, the hand-over measured), every case of section 11 handed to it (the dispatcher's misses, branches to no entry, FPCR away from the specialisation, untranslated encodings, code that runs into no entry, refused functions, continuations with no native frame), the driver that calls compiled entries natively and propagates non-local transfers; C++ exceptions through LSDA landing pads with a personality-free unwinder, fibers and a return past the caller in the corpus; guest threads with the thread and synchronization SVCs, per-thread state blocks, native stacks and JIT instances, the shared monitor; safepoint polls and the pause protocol with the pause test; the three JIT modes, the threads and the pause test in CTest. The acceptance: the exception, longjmp and thread corpus passes natively, in the JIT and with no JIT where none is needed; `--jit-all` and the compiled runs print the same lines; the pause test passes (CTest `corpus_jit`, `corpus_threads`, `safepoints`). dm/host's side done for the corpus (`dm/host/aot_*.c`, CTest `t_aot_host`; its open items are in the list at the end of "Threads and safepoints"). Not done: the exactness of a JIT target's callee-saved registers is assumed (a compiled caller keeps what the union of address-taken functions preserves across an indirect call); the corpus has no untranslated encoding, no refused function and no run-off into a non-entry (those hand-overs are built and not run); priority and core of threads (FIFO order, no affinity), Horizon's other synchronization objects in this run time (events, condition variables: SignalProcessWideKey / WaitProcessWideKeyAtomic; dm/host's thread layer has them); the discovery gap except-gcc shows (a halfword jump table whose base is set before its loop) |
+| 4. to 6. | games on the Intel Mac, performance, breadth | phase 5's first half, pack throughput, done ("Pack throughput": the stages measured and logged, the analysis's causes fixed, compile units on workers, the per-function cache; section 10's targets extrapolated and not met; then phase 5b (the compile stage's rate, functions split for size, groups of functions, the analysis cache, tiers by profile) and phase 5c (the analysis on the workers, byte for byte the one-thread analysis): "Phase 5b", "Phase 5c"); the rest not started. Prepared for phase 4: the host's run time of packs (dm/host/aot_*.c; Linux checked by `t_aot_host`, Windows written and not run (the packs it loads, DLLs, are made: "Windows packs"), the Intel Mac not built: the aot files are CMake's, and aot_fault.c reads Linux's signal context). Phase 4's first half, without a game ("A game module in the host"): `patch_nso.py --aot` with its manifest checked against nxaot's reader and discovery, the loader's game-module path (manifest, image, gates, packs), NSO decompression on that path (the rewriter's, as for Apple: nothing in the host), host functions and unimplemented imports bound into a module's GOT, `be_guest_map` / `be_guest_unmap` from the memory SVCs; CTest `t_aot_module` and `t_guest_map`. Done since, in nxaot (ABI 3): the lifter's calls of the observation gates and spin waits (design 1.1; the descriptor's gate sites, checked by the host against the manifest's rows), the frame step's aux region lifted as code of the functions that branch into it, the standard entries' common signature (calls between packs bound in inline caches, no JIT hand-over), the line table nxaot's own and read correctly by both readers (CTest `lines`). Still to come for a first game module: NROs on the game-module path, thunks for hle_table.c's libc passthrough, main.c's start sequence through `dm_guest_call`, a host program for x86-64, Boost in the host's image for the JIT fallback (some of these are the host's and done since there: docs/design/migration-status.md) |
+
+### Measuring two packs
+
+[tests/measure_packs.py](tests/measure_packs.py) measures two variants of the same programs' packs the one way every optimisation here is
+measured ("The sample profile at tier H"): two `nxaot` binaries (`--a-nxaot`, `--b-nxaot`), or one with an environment switch for its build
+(`--b-env NXAOT_PROFILE_WEIGHTS=0`) or other build arguments (`--a-args`, `--b-args`, `--args` for both; a value that starts with `-` takes
+`=`). For each program (a corpus name or a path to an NRO or a manifest) it builds both packs under `--layouts` file names of different
+lengths (the soname is the file name, and its length moves the code by a few bytes: the layout spread), in folders `a/` and `b/` under the
+same names, and skips the runs when A's and B's packs are the same bytes; then runs them through `nxaot_host` pinned to one CPU (`taskset -c`;
+without it, said), in `--rounds` alternating rounds (per round and layout, A then B), each sample the fastest of `--repeats` (`nxaot_host
+--repeat N`, or N processes with `--repeat-mode process`); a variant's time is the median over the layouts of its medians over the rounds.
+Both variants must exit 0 and print the same guest output, else an error naming the program. It prints a Markdown table (A, B, change, the
+layout spread of each, the rounds' spread, `.text`, bytes, pack time and peak memory A → B), a verdict per program and the load at start and
+end, and writes `samples.tsv` (every run), `builds.tsv` and `results.md` into `--work`. The verdict: the noise is the largest of the two layout
+spreads ((max − min) / median of a variant's per-layout medians) and the rounds' spread (the median over variants and layouts of (max − min) /
+median of the rounds); "faster" or "slower" when the change is beyond the noise and B is faster (slower) in every layout, else "within noise".
+`--dry-run` prints the commands. The weights against the tiers alone on the fixture's program, in the image with the build tree on tmpfs:
+
+```sh
+docker run --rm --user "$(id -u):$(id -g)" -e HOME=/tmp -v "$(pwd):/src" -w /src --tmpfs /src/build:exec,uid=$(id -u),gid=$(id -g) nxnative-aot sh -c \
+  'cmake -S dm/tools/aot -B build/aot -G Ninja -DCMAKE_BUILD_TYPE=Release && cmake --build build/aot -j4 --target nxaot nxaot_host &&
+   python3 dm/tools/aot/tests/measure_packs.py --a-nxaot build/aot/nxaot --b-env NXAOT_PROFILE_WEIGHTS=0 \
+     --args="--profile dm/tools/aot/tests/profile_weights.tsv" --host build/aot/nxaot_host --set int_ops-gcc:int_ops_rounds=200 \
+     --rounds 6 --repeats 10 --layouts 4 --cpu 3 --work build/measure int_ops-gcc'
+```
+
+Its unit test, with stand-in `nxaot` and `nxaot_host` scripts and no build: `python3 -m unittest dm/tools/aot/tests/test_measure_packs.py`.

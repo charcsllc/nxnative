@@ -4,6 +4,13 @@
 #include "hle.h"
 #include <stdatomic.h>
 #include <time.h>
+// A call of the SDK's own code (guest code) is GUEST_CALL: the plain call where the guest's code is native, aot.h DM_GUEST_CALL on the x86-64 engine
+#if DM_NATIVE_EXEC || defined(DM_TEST_GUEST_C)
+#define GUEST_CALL(f, ...) f(__VA_ARGS__)
+#else
+#include "aot.h"
+#define GUEST_CALL DM_GUEST_CALL
+#endif
 
 typedef struct { int16_t year; int8_t month, day, hour, minute, second; int8_t pad; } CalendarTime;
 typedef struct { uint32_t wday, yday; char tzname[8]; uint32_t dst; int32_t offset; } CalendarAdditionalInfo;
@@ -23,7 +30,7 @@ static void write_steady_point(uint8_t *out, int64_t seconds) {
     memcpy(out, &seconds, 8); memcpy(out + 8, "dmhost-steady-01", 16);
 }
 HLE_FORCE("_ZN2nn4time19StandardSteadyClock19GetCurrentTimePointEPNS0_20SteadyClockTimePointE", "steady clock → host monotonic clock (seconds), fixed source ID", Result, h_time_SteadyNow, uint8_t *out) {
-    write_steady_point(out, (int64_t)(clock_gettime_nsec_np(CLOCK_MONOTONIC) / ns_per_second));
+    write_steady_point(out, (int64_t)(plat_boot_ns() / ns_per_second));   // the boot clock (Apple: CLOCK_MONOTONIC, which counts sleep)
     return RES_OK;
 }
 HLE_FORCE("_ZN2nn4time38GetStandardSteadyClockCurrentTimePointEPNS0_20SteadyClockTimePointE", "steady clock (the free function form, SDK 20) → host monotonic clock", Result, h_time_SteadyNowFn, uint8_t *out) { return h_time_SteadyNow(out); }
@@ -65,6 +72,13 @@ static int h_time_mono_timespec(int64_t *ts) {
     struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); ts[0] = t.tv_sec; ts[1] = t.tv_nsec; return 0;
 }
 HLE_FORCE("_ZN2nn4time37GetStandardSteadyClockCurrentTimespecEP8timespec", "C library monotonic clock from the steady clock → host monotonic time", int, h_time_MonoTimespec, int64_t *ts) { return h_time_mono_timespec(ts); }
+#if !defined(__APPLE__) && !defined(clock_gettime_nsec_np)
+// Apple's clock_gettime_nsec_np. Its CLOCK_MONOTONIC counts the time the machine slept, which is the boot clock elsewhere (plat_boot_ns, as the steady clock above); CLOCK_REALTIME is POSIX's
+static uint64_t clock_gettime_nsec_np(clockid_t c) {
+    if (c == CLOCK_MONOTONIC) return plat_boot_ns();
+    struct timespec ts; clock_gettime(c, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+}
+#endif
 typedef struct { int64_t wall_ns, steady_ns; } TimeSample;
 static TimeSample sample_clocks(void) {
     int64_t before = clock_gettime_nsec_np(CLOCK_MONOTONIC);
@@ -109,6 +123,21 @@ HLE_FORCE("_ZN2nn4time23StandardUserSystemClock3nowEv", "user clock → host tim
     int64_t ft = fixed_time(); return ft >= 0 ? ft : time(NULL); }
 HLE_FORCE("_ZN2nn4time23StandardUserSystemClock9to_time_tERKNSt3__16chrono10time_pointINS0_17SystemClockTraitsENS3_8durationIlNS2_5ratioILl1ELl1EEEEEEE",
           "the SDK implementation pairs with now(), taken over with it", int64_t, h_time_to_time_t, const int64_t *tp) { return *tp; }
+// The zone name and UTC offset of a local time: struct tm's tm_zone / tm_gmtoff (Apple, glibc); Windows' C runtime has neither, so the offset is the local fields read as UTC less t
+static const char *tm_zone_of(const struct tm *tm) {
+#if defined(_WIN32)
+    (void)tm; return NULL;
+#else
+    return tm->tm_zone;
+#endif
+}
+static long tm_offset_of(const struct tm *tm, time_t t) {
+#if defined(_WIN32)
+    struct tm c = *tm; return (long)(timegm(&c) - t);
+#else
+    (void)t; return tm->tm_gmtoff;
+#endif
+}
 // The network clock's now(), as the user clock's: the SDK's never calls GetCurrentTime, it reads the time service once its own initialized flag is set, which the host's Initialize
 // take-over never sets, and returns 0 (1970) otherwise (Ocarina of Time's sdk+0x5d8490; its main imports it). Its to_time_t only reads the time point and needs nothing
 HLE_FORCE("_ZN2nn4time26StandardNetworkSystemClock3nowEv", "network clock → host time(), as the user clock", int64_t, h_time_net_now, void) { return h_time_now(); }
@@ -133,10 +162,11 @@ HLE_FORCE("_ZN2nn4time46GetAdjustableNetworkSystemClockCurrentTimespecEP8timespe
 HLE_FORCE("_ZN2nn4time14ToCalendarTimeEPNS0_12CalendarTimeEPNS0_22CalendarAdditionalInfoERKNS0_9PosixTimeE",
           "time zone rules of the time service; uses the host localtime_r instead", Result, h_time_ToCalendarTime, CalendarTime *ct, CalendarAdditionalInfo *ai, const int64_t *pt) {
     time_t t = *pt; struct tm tm; localtime_r(&t, &tm);
-    static int once; if (!once++) LOG("ToCalendarTime: first conversion %lld → %04d-%02d-%02d %02d:%02d (time zone %s, offset %ld s)", (long long)t, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, tm.tm_zone ? tm.tm_zone : "?", (long)tm.tm_gmtoff);
+    const char *zone = tm_zone_of(&tm); long off = tm_offset_of(&tm, t);
+    static int once; if (!once++) LOG("ToCalendarTime: first conversion %lld → %04d-%02d-%02d %02d:%02d (time zone %s, offset %ld s)", (long long)t, tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday, tm.tm_hour, tm.tm_min, zone ? zone : "?", off);
     if (ct) *ct = (CalendarTime){(int16_t)(tm.tm_year + 1900), (int8_t)(tm.tm_mon + 1), (int8_t)tm.tm_mday, (int8_t)tm.tm_hour, (int8_t)tm.tm_min, (int8_t)tm.tm_sec, 0};
-    if (ai) { memset(ai, 0, sizeof *ai); ai->wday = tm.tm_wday; ai->yday = tm.tm_yday; strlcpy(ai->tzname, tm.tm_zone ? tm.tm_zone : "UTC", sizeof ai->tzname);
-              ai->dst = tm.tm_isdst > 0; ai->offset = (int32_t)tm.tm_gmtoff; }
+    if (ai) { memset(ai, 0, sizeof *ai); ai->wday = tm.tm_wday; ai->yday = tm.tm_yday; strlcpy(ai->tzname, zone ? zone : "UTC", sizeof ai->tzname);
+              ai->dst = tm.tm_isdst > 0; ai->offset = (int32_t)off; }
     return RES_OK;
 }
 // Explicit time zone rules (Monster Hunter Rise, SDK 11): LoadTimeZoneRule reads the rule from the time service; the host keeps the game's rule buffer untouched and converts with localtime_r as above
@@ -204,7 +234,7 @@ HLE_FORCE("_ZN2nn4time39ClaimPeriodicBenefitWithUserSystemClockEPNS0_27PeriodicB
     static uint64_t (*impl)(void *, const uint8_t *, const int64_t *, const int64_t *, const void *);
     if (!impl && !(impl = guest_sym("_ZN2nn4time6detail39ClaimPeriodicBenefitWithUserSystemClockEPNS0_27PeriodicBenefitClaimContextERKNS0_13ClockSnapshotERKNS_8TimeSpanES9_PKNS0_25CheckCalendarTimeCallbackE")))
         die("time: the sdk has ClaimPeriodicBenefitWithUserSystemClock but not its detail:: implementation");
-    uint64_t r = impl(ctx, snap, max_penalty, acceptable, callback);
+    uint64_t r = GUEST_CALL(impl, ctx, snap, max_penalty, acceptable, callback);
     LOG("time: periodic benefit claim → %u", (unsigned)r);
     return r;
 }

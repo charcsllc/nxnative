@@ -1,13 +1,21 @@
 """The rewriter's spin wait search (patch_nso.py "Spin waits") on hand-assembled AArch64 loops, without game files."""
 import ast
+import importlib.util
 from pathlib import Path
 import re
 import struct
 import sys
 import unittest
 
-from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
-from capstone.arm64 import ARM64_OP_IMM, ARM64_OP_MEM, ARM64_OP_REG
+# The search decodes with Capstone (the CI installs it, tests.yml)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+import capstone_version  # noqa: E402
+# Without capstone, or with one the rewriter refuses (capstone_version.py: an older one decodes differently), the tests skip with the reason; the rest of the file still loads
+NO_CAPSTONE = capstone_version.unusable()
+HAVE_CAPSTONE = not NO_CAPSTONE
+if HAVE_CAPSTONE:
+    from capstone import Cs, CS_ARCH_ARM64, CS_MODE_ARM
+    from capstone.arm64 import ARM64_OP_IMM, ARM64_OP_MEM, ARM64_OP_REG
 
 TOOLS = Path(__file__).resolve().parents[1]
 # patch_nso.py is a command-line program whose top level loads and rewrites an image: compile only the spin wait search and its constants
@@ -51,6 +59,7 @@ def patched(**at):
     return w
 
 
+@unittest.skipUnless(HAVE_CAPSTONE, NO_CAPSTONE)
 class SpinWaits(unittest.TestCase):
     def test_lock_poll_without_clrex(self):
         # The same poll as Breath of the Wild 1.6.0's compiler writes it (main+0x12c0e48): the acquire's failed test and the release's failed compare go straight back to

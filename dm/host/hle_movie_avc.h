@@ -1,4 +1,6 @@
-// H.264 (AVC) decoding for the movie decoder (hle_movie.c), on Apple's VideoToolbox; see hle_movie_avc.c
+// H.264 (AVC) decoding for the movie decoder (hle_movie.c): on Apple's VideoToolbox and, elsewhere, the black-picture stopgap (hle_movie_avc.c); on Windows Media Foundation's
+// H.264 transform (hle_movie_win32.c). Every call but mavc_param_sets, mavc_avcc and mavc_drop (which come from guest threads and touch only the decoder's own state) is made on
+// the movie decoder's host thread (hle_movie.c md_worker)
 #pragma once
 #include <stdint.h>
 #include <stddef.h>
@@ -18,3 +20,4 @@ int mavc_ready(const mavc *a);   // a picture would come out without flush: code
 int mavc_bt709(const mavc *a, int h);   // the stream's colour matrix is BT.709: as its SPS declares; undeclared (or no SPS yet), from 720 lines up
 void mavc_set_rgba(mavc *a);   // pictures come out as 4-byte RGBA (stride w * 4) instead of NV12: the native texture mode
 void mavc_drop(mavc *a);   // a flush / seek: queued pictures are discarded
+int mavc_constant(const mavc *a);   // 1: every picture it hands out is the same (the port's stopgap, opaque black; Windows without a decoder), so a texture that holds one needs no rewrite; 0 on Apple

@@ -202,8 +202,8 @@ class Reader(unittest.TestCase):
         self.out = 'package 0 a.nsp\n'
         with self.assertRaisesRegex(nsp.BuildError, 'listed 1 of 2 packages'): self.reader().contents([self.tmp / 'a.nsp', self.tmp / 'b.nsp'])
 
-    def test_nx_extract_that_does_not_start_says_so(self):
-        with mock.patch.object(nsp, 'NX_EXTRACT', 'dm/tools/nx_extract_bin/missing'), nsp.package_reader(REPO, self.keys, {}) as r:
+    def test_nx_extract_that_does_not_start_says_so(self):   # the committed executable, a Mac program, which find_nx_extract takes on macOS (elsewhere the port's: build_nx_extract)
+        with mock.patch.object(nsp.sys, 'platform', 'darwin'), mock.patch.object(nsp, 'NX_EXTRACT', 'dm/tools/nx_extract_bin/missing'), nsp.package_reader(REPO, self.keys, {}) as r:
             with self.assertRaisesRegex(nsp.BuildError, r'nx_extract does not start'): r.contents([self.tmp / 'Game.nsp'])
 
     def test_keys_too_old_stop_before_the_packages_are_read(self):   # nx_extract --keys: every package once, a merged one too; its red line becomes the stop, other failures are left to later steps

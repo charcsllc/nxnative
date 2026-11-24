@@ -2,17 +2,51 @@
 // The host has no nvdrv: the SDK aborts when the decoder thread opens the device. Extractor::SetDataSource returns 0x1000 (the same code the SDK returns when it has no implementation object); Engage's Unity demuxes WebM itself and does not use it.
 // The host takes over Decoder (below; VP8 / VP9 are decoded with libvpx, H.264 with VideoToolbox in hle_movie_avc.c, Vorbis audio with stb_vorbis): Engage's movies are 103 VP9 WebM files under RomFS/Data/StreamingAssets/Movie (2.7 GB, no audio track), and the game does not go on until the opening movie S01F has played.
 #include "hle.h"
+// A guest function this file calls (docs/design/aot-recompiler.md 2.4): the plain call where the guest's code runs natively (Apple), or where a unit test supplies it
+// as a C function (DM_TEST_GUEST_C); on the x86-64 engine a guest call on the calling thread (aot.h DM_GUEST_CALL: nested inside the host call it is answering)
+// What such a call is handed is guest memory (docs/design/aot-recompiler.md 5.2; aot.h, "Host memory the guest sees"): the input buffers the client writes its packets
+// into (GUEST_MALLOC / GUEST_FREE), the keys of the SDK's MediaData (GUEST_STR: an arena copy made once), and the key and result of a MediaData lookup (GUEST_FIND_I32,
+// GUEST_FIND_BUF: copied through the calling thread's scoped region around the call, md_find_* below). On Apple each is the plain form
+#if DM_NATIVE_EXEC || defined(DM_TEST_GUEST_C)
+#define GUEST_CALL(f, ...) f(__VA_ARGS__)
+#define GUEST_MALLOC(n) malloc(n)
+#define GUEST_FREE(p) free(p)
+#define GUEST_STR(s) s
+#define GUEST_FIND_I32(md, k, v) GUEST_CALL(G.find_i32, md, k, v)
+#define GUEST_FIND_BUF(md, k, b) GUEST_CALL(G.find_buf, md, k, b)
+#else
+#include "aot.h"
+#define GUEST_CALL DM_GUEST_CALL
+#define GUEST_MALLOC(n) dm_garena_malloc((n), 16)
+#define GUEST_FREE(p) dm_garena_free(p)
+#define GUEST_STR(s) dm_garena_literal(s)
+#define GUEST_FIND_I32(md, k, v) md_find_i32(md, k, v)
+#define GUEST_FIND_BUF(md, k, b) md_find_buf(md, k, b)
+#endif
+#if defined(__ARM_NEON)
 #include <arm_neon.h>
-#include <mach/mach.h>
+#endif
 #include <pthread.h>
 #include <stdatomic.h>
 #include <unistd.h>
 #include "vpx/vpx_decoder.h"
 #include "vpx/vp8dx.h"
-#include "hle_movie_avc.h"   // H.264 on VideoToolbox
+#include "hle_movie_avc.h"   // H.264 on VideoToolbox (Windows: Media Foundation, hle_movie_win32.c)
 #include "hle_movie_vt.h"
 #include "hle_movie_yuv.h"   // md_nv12 / md_rgba, shared with hle_codec_video.c
+#if defined(__APPLE__)
 #include <AudioToolbox/AudioToolbox.h>   // AAC
+#else
+// No AAC decoder on Linux yet: a declared stopgap until Phase 1 brings one; md_aac reports it once with a red line and gives each packet's frame as silence. On Windows the AAC goes
+// through Media Foundation (hle_movie_aac.h, hle_movie_win32.c); the AudioToolbox names below only keep the shared code compiling
+typedef void *AudioConverterRef; typedef uint32_t UInt32; typedef struct { int64_t mStartOffset; uint32_t mVariableFramesInPacket, mDataByteSize; } AudioStreamPacketDescription;
+static int AudioConverterDispose(AudioConverterRef c) { (void)c; return 0; }   // never reached: no converter is made
+typedef int32_t OSStatus;
+static OSStatus AudioConverterReset(AudioConverterRef c) { (void)c; return 0; }   // the same (md_reset)
+#if defined(_WIN32)
+#include "hle_movie_aac.h"
+#endif
+#endif
 // Vorbis (movie audio tracks, Link's Awakening): stb_vorbis, built into this file (dm/third_party/stb_vorbis); only its push-data API, floats out
 #define STB_VORBIS_NO_STDIO
 #define STB_VORBIS_NO_PULLDATA_API
@@ -89,6 +123,7 @@ typedef struct {
                                                  // end-of-stream flag and the packet's time (drain_pts)
     movie_vt_control vt;
     int avc_due;                                 // H.264: a picture that is next in presentation order waits for a free slot (md_pump); a released slot pumps again
+    uint64_t held[8]; int nheld;                 // native-texture mode with a decoder whose pictures are all the same (mavc_constant): the serials of the textures that hold one
     vpx_codec_ctx_t vpx; int vpx_on, red_dec, red_img;
     int vpx_cs, vpx_full;   // the colour matrix (vpx_color_space_t) and range of the last VP8 / VP9 picture, for md_format
     uint8_t *bgra; size_t bgra_cap;              // native-texture mode: the picture with red and blue swapped, for a BGRA8 / BGRX8 client texture (md_out_tex)
@@ -97,6 +132,9 @@ typedef struct {
     int16_t *hold; size_t hold_n, hold_cap; int vb_prev;   // decoded samples (interleaved values) not handed out yet, and the last packet's blocksize, 0 at a stream's start (md_vorbis)
     // AAC (Monster Hunter Rise's movies): AudioToolbox's converter, opened at the first packet from the AudioSpecificConfig (Configure's csd-0, kept in vhdr[0]); the packet being fed
     AudioConverterRef aac; const uint8_t *aac_pkt; UInt32 aac_pkt_n; AudioStreamPacketDescription aac_desc;
+#if defined(_WIN32)
+    maac *maac; int maac_none;   // Windows: Media Foundation's AAC transform (hle_movie_win32.c), made at the first packet; maac_none: it cannot be made, silence
+#endif
     uint64_t dec_n, dec_ns, dec_max;            // decode timing (on the host thread, per packet)
     unsigned long ncall[24];
 } mdec_t;
@@ -219,22 +257,40 @@ static void md_syms(void) {
     G.native_color_keys = movie && movie->movie_native_color_keys;
     G.signal = msym("_ZN2nn2os11SignalEventEPNS0_9EventTypeE");
 }
+#if !DM_NATIVE_EXEC && !defined(DM_TEST_GUEST_C)
+// MediaData::FindInt32 / FindBuffer with the key and the result in the arena: the key copied into the calling thread's scoped region (a host stack array on Apple, "csd-0"),
+// the result word there too, read back after the call
+static int md_find_i32(const void *md, const char *k, int *v) {
+    const size_t kn = strlen(k) + 1;
+    DM_GLOCAL(char, gk, kn); memcpy(gk, k, kn);
+    DM_GLOCAL(int, gv, 1); *gv = *v;
+    int r = DM_GUEST_CALL(G.find_i32, md, gk, gv);
+    *v = *gv; return r;
+}
+static int md_find_buf(const void *md, const char *k, void **b) {
+    const size_t kn = strlen(k) + 1;
+    DM_GLOCAL(char, gk, kn); memcpy(gk, k, kn);
+    DM_GLOCAL(void *, gb, 1); *gb = *b;
+    int r = DM_GUEST_CALL(G.find_buf, md, gk, gb);
+    *b = *gb; return r;
+}
+#endif
 static mdec_t *md_of(void **self) { return self ? (mdec_t *)self[1] : NULL; }
 // An EventType pointer that can be signalled: 8-byte aligned and readable (vm_read_overwrite fails instead of faulting)
 static int ev_ok(const void *p) {
-    uint64_t w; vm_size_t got = 0; uintptr_t a = (uintptr_t)p;
-    return a >= 0x100000000ull && !(a & 7) && vm_read_overwrite(mach_task_self(), (vm_address_t)a, sizeof w, (vm_address_t)&w, &got) == KERN_SUCCESS && got == sizeof w;
+    uint64_t w; size_t got = 0; uintptr_t a = (uintptr_t)p;
+    return a >= 0x100000000ull && !(a & 7) && !plat_mem_read(a, &w, sizeof w, &got) && got == sizeof w;
 }
 // The SDK keeps only the pointer to the client's struct (DecoderImpl::RegisterClientEvents: str x1, [x0, #0xd0]) and reads the entry each time it signals, skipping a null one
 // (SendOutputBufferEventAvailableToClient and the others, subsdk0+0x1feb0 in DRAGON QUEST XI S). That game's movie player registers its struct before it fills it (main+0x39edab0, right after
 // the Decoder constructor: leftover values such as 0xe00000010, sometimes 0 or a stray pointer), so the entry is read at signal time; when it is not an event (any longer), the event it held
 // at registration is used, if any
 static void md_event(mdec_t *d, int i) {   // 0 input 1 output 2 format 3 error
-    void *p = NULL; vm_size_t got = 0;
-    if (d->evc && (vm_read_overwrite(mach_task_self(), (vm_address_t)&d->evc[i], sizeof p, (vm_address_t)&p, &got) != KERN_SUCCESS || got != sizeof p)) p = NULL;
+    void *p = NULL; size_t got = 0;
+    if (d->evc && (plat_mem_read((uint64_t)(uintptr_t)&d->evc[i], &p, sizeof p, &got) || got != sizeof p)) p = NULL;
     void *live = p;
     if (!p || !ev_ok(p)) p = d->ev[i];
-    if (p) G.signal(p);
+    if (p) GUEST_CALL(G.signal, p);
     else if (live) { static _Atomic int red; if (red++ < 8) LOG("[RED] movie: decoder %p event %d not delivered: the client's entry %p is not an event", (void *)d, i, live); }
 }
 // Deferred events: "input available" after Start / Flush. The SDK's decoder signals it asynchronously from its own codec thread; Metroid Dread calls InitializeMultiWaitHolder before RegisterClientEvents
@@ -243,19 +299,25 @@ static void md_event(mdec_t *d, int i) {   // 0 input 1 output 2 format 3 error
 // The movie player's dispatcher and worker must also finish their requests before the posting thread continues; the shared SVC wake handoff supplies that ordering (hle_thread.c).
 // g_dfmu and each decoder's dmu are held while guest code signals events, so guest threads take them with dm_host_lock: a thread waiting for one counts as blocked, and the
 // signaller's handoff does not wait for it (Kirby and the Forgotten Land froze at its first guide movie: the handoff waited for the input thread, which waited for dmu)
+// Under DM_DETCLOCK the deferred events and the withheld inputs (MD_STALE_NS) count on the guest clock (md_now), and the deferred thread runs on it (hle_thread.c
+// dm_detclock_pace_thread): it sleeps there until the next due time or a new entry (dm_detclock_paced_sleep / paced_wake) and holds the clock while it signals. It waited 2 ms of
+// wall time before, so the game's movie threads woke at a guest time the host's pace chose, and Mario vs. Donkey Kong's frame after its opening movie took 1 ms more in one run
+// (docs/reference/threads.md, "Two runs under DM_DETCLOCK part from the boot")
 void *dm_guest_thread_spawn(void (*fn)(void *), void *arg, int prio, size_t stack_size);
+static uint64_t md_now(void) { return dm_detclock_enabled() ? guest_ns() : now_ns(); }
 static pthread_mutex_t g_dfmu = PTHREAD_MUTEX_INITIALIZER; static pthread_cond_t g_dfcv = PTHREAD_COND_INITIALIZER;
-static struct { void *d; int ev; uint64_t due; } g_dfq[64]; static int g_ndfq, g_dfthr;
+static struct { void *d; int ev; uint64_t due; } g_dfq[64]; static int g_ndfq, g_dfthr, g_dfdet; static void *g_dftt;   // g_dfdet: the thread is on the guest clock
 static void md_defer_body(void *arg);
 static void md_defer_at(void *d, int ev, uint64_t due) {
     dm_host_lock(&g_dfmu);
-    if (!g_dfthr) { g_dfthr = 1; dm_guest_thread_spawn(md_defer_body, NULL, 16, 64 << 10); }
+    if (!g_dfthr) { g_dfthr = 1; g_dftt = dm_guest_thread_spawn(md_defer_body, NULL, 16, 64 << 10); g_dfdet = dm_detclock_pace_thread(g_dftt, 0); }
     for (int i = 0; i < g_ndfq; i++) if (g_dfq[i].d == d && g_dfq[i].ev == ev && g_dfq[i].due <= due) { pthread_mutex_unlock(&g_dfmu); return; }   // already due by then
     if (g_ndfq < 64) g_dfq[g_ndfq++] = (__typeof__(g_dfq[0])){d, ev, due};
     else LOG("[RED] movie: deferred event queue full, dropping one");
-    pthread_cond_signal(&g_dfcv); pthread_mutex_unlock(&g_dfmu);
+    pthread_cond_signal(&g_dfcv); if (g_dfdet) dm_detclock_paced_wake(g_dftt);
+    pthread_mutex_unlock(&g_dfmu);
 }
-static void md_defer(void *d, int ev) { md_defer_at(d, ev, now_ns() + 2000000); }
+static void md_defer(void *d, int ev) { md_defer_at(d, ev, md_now() + 2000000); }
 static void md_defer_drop(void *d) {
     dm_host_lock(&g_dfmu);
     int n = 0; for (int i = 0; i < g_ndfq; i++) if (g_dfq[i].d != d) g_dfq[n++] = g_dfq[i];
@@ -266,7 +328,7 @@ static void md_defer_body(void *arg) {
     (void)arg;
     dm_host_lock(&g_dfmu);
     for (;;) {
-        uint64_t now = now_ns(), next = 0; int k = -1;
+        uint64_t now = md_now(), next = 0; int k = -1;
         for (int i = 0; i < g_ndfq && k < 0; i++) { if (g_dfq[i].due <= now) k = i; else if (!next || g_dfq[i].due < next) next = g_dfq[i].due; }
         if (k >= 0) {
             mdec_t *d = g_dfq[k].d; int e = g_dfq[k].ev;
@@ -279,8 +341,14 @@ static void md_defer_body(void *arg) {
             if (ready) md_event(d, e);
             continue;
         }
+        if (g_dfdet) { pthread_mutex_unlock(&g_dfmu); dm_detclock_paced_sleep(next); dm_host_lock(&g_dfmu); continue; }   // DM_DETCLOCK (above)
         if (!next) pthread_cond_wait(&g_dfcv, &g_dfmu);
+#if defined(__APPLE__)
         else { uint64_t w = next - now; struct timespec ts = { (time_t)(w / 1000000000u), (long)(w % 1000000000u) }; pthread_cond_timedwait_relative_np(&g_dfcv, &g_dfmu, &ts); }
+#else   // no relative wait outside Apple: the same wait as an absolute real-time deadline
+        else { uint64_t w = next - now; struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += (time_t)(w / 1000000000u); ts.tv_nsec += (long)(w % 1000000000u);
+               if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; } pthread_cond_timedwait(&g_dfcv, &g_dfmu, &ts); }
+#endif
     }
 }
 // log the first 12 calls one by one, then every 2^k-th (DM_MOVIE_TRACE=1: every call, with the calling thread and the decoder: Unity drives a movie's audio and video decoders from one thread)
@@ -320,7 +388,7 @@ static void md_dims(const mdec_t *d, int *w, int *h, int *stride, int *slice) {
 
 // ---------- Host decoding thread ----------
 enum { MDJ_NONE, MDJ_DECODE, MDJ_CLOSE, MDJ_QUIT, MDJ_TAKE };
-static int md_threads(void) { long n = sysconf(_SC_NPROCESSORS_ONLN); return n >= 8 ? 4 : 2; }
+static int md_threads(void) { long n = plat_cpu_count(); return n >= 8 ? 4 : 2; }
 vpx_codec_err_t md_vpx_open(vpx_codec_ctx_t *ctx, int vp9, unsigned w, unsigned h) {
     vpx_codec_dec_cfg_t cfg = { .threads = (unsigned)md_threads(), .w = w, .h = h };
     vpx_codec_err_t e = vpx_codec_dec_init(ctx, vp9 ? vpx_codec_vp9_dx() : vpx_codec_vp8_dx(), &cfg, 0);
@@ -337,7 +405,9 @@ void md_nv12(const vpx_image_t *im, uint8_t *dst, int w, int h) {
         const uint8_t *u = im->planes[1] + (size_t)y * im->stride[1], *v = im->planes[2] + (size_t)y * im->stride[2];
         uint8_t *o = dst + (size_t)w * h + (size_t)y * w;
         int x = 0;
+#if defined(__ARM_NEON)
         for (; x + 16 <= cw2; x += 16) { uint8x16x2_t t = { { vld1q_u8(u + x), vld1q_u8(v + x) } }; vst2q_u8(o + 2 * x, t); }
+#endif   // elsewhere the loop below interleaves every pair (compilers vectorize it on x86-64)
         for (; x < cw2 && 2 * x + 1 < w; x++) { o[2 * x] = u[x]; o[2 * x + 1] = v[x]; }
     }
 }
@@ -460,6 +530,27 @@ static int md_vorbis(mdec_t *d, const uint8_t *p, int n, int slot) {
 // ---------- AAC ----------
 // The demuxer hands over raw AAC frames (1024 samples each) and the AudioSpecificConfig in csd-0. AudioToolbox takes the configuration as an MPEG-4 ES descriptor (the magic cookie built
 // here as FFmpeg's AudioToolbox decoder builds it); without csd-0 an AAC-LC configuration is made from the sample rate and channel count
+// An AAC frame's samples per channel: 1024, 2048 with SBR (object type 5 or 29 in the AudioSpecificConfig, csd-0)
+static int aac_frame_samples(const mdec_t *d) {
+    int sbr = d->vhdr_n[0] > 0 && ((d->vhdr[0][0] >> 3) == 5 || (d->vhdr[0][0] >> 3) == 29);
+    return sbr ? 2048 : 1024;
+}
+#if !defined(__APPLE__)
+// Without a decoder (Linux until Phase 1 brings one; Windows where Media Foundation has none, an N edition without the Media Feature Pack): each packet gives the silence of
+// its frame, as the H.264 stopgap gives a black picture per access unit. A player sizes its AudioOut buffers by the frame, appends each output whole and advances its audio
+// clock by it (h_movie_OutSize): with no output at all, the movie's own AudioOut got no buffer for the length of the movie (every callback of it an underrun) and that clock
+// stood still; with silence it is fed at the stream's pace, as a decoder feeds it
+static int md_aac_silence(mdec_t *d, int n, int slot) {
+    if (n <= 0) return 0;
+    if (d->ch <= 0) { int cc = d->vhdr_n[0] >= 2 ? d->vhdr[0][1] >> 3 & 15 : 0; d->ch = cc == 7 ? 8 : cc && cc < 7 ? cc : 2; }   // the configuration's channels, as md_aac_open reads them
+    if (d->out[slot].cap < MD_PCM_CAP) { free(d->out[slot].frm); d->out[slot].frm = malloc(MD_PCM_CAP); d->out[slot].cap = MD_PCM_CAP; }
+    size_t bytes = (size_t)aac_frame_samples(d) * 2 * (size_t)d->ch;
+    memset(d->out[slot].frm, 0, bytes); d->out[slot].bytes = bytes;
+    return 1;
+}
+#endif
+
+#if defined(__APPLE__)
 static uint8_t *esds_descr(uint8_t *p, int tag, unsigned n) { *p++ = (uint8_t)tag; for (int i = 3; i > 0; i--) *p++ = (uint8_t)(n >> (7 * i) | 0x80); *p++ = (uint8_t)(n & 0x7f); return p; }
 static OSStatus aac_feed(AudioConverterRef c, UInt32 *np, AudioBufferList *bl, AudioStreamPacketDescription **pd, void *ud) {
     (void)c; mdec_t *d = ud;
@@ -506,6 +597,25 @@ static int md_aac(mdec_t *d, const uint8_t *p, int n, int slot) {
     d->out[slot].bytes = (size_t)frames * 2 * d->ch;
     return frames > 0;
 }
+#elif defined(_WIN32)
+// one packet → PCM16 interleaved in the slot through Media Foundation's AAC transform, made at the first packet from the AudioSpecificConfig (csd-0) and the MediaData's
+// channels and rate; where it cannot be made (an N edition without the Media Feature Pack), silence, as on Linux
+static int md_aac(mdec_t *d, const uint8_t *p, int n, int slot) {
+    if (!d->maac && !d->maac_none) { int ch = d->ch, rate = d->rate; if ((d->maac = maac_new(d->vhdr[0], d->vhdr_n[0], &ch, &rate))) { d->ch = ch; d->rate = rate; } else d->maac_none = 1; }
+    if (!d->maac) return md_aac_silence(d, n, slot);
+    if (n <= 0) return 0;
+    if (d->out[slot].cap < MD_PCM_CAP) { free(d->out[slot].frm); d->out[slot].frm = malloc(MD_PCM_CAP); d->out[slot].cap = MD_PCM_CAP; }
+    int fr = maac_decode(d->maac, p, n, (int16_t *)d->out[slot].frm, (int)(MD_PCM_CAP / (2 * d->ch)));
+    d->out[slot].bytes = fr > 0 ? (size_t)fr * 2 * d->ch : 0;
+    return fr > 0;
+}
+#else
+static int md_aac(mdec_t *d, const uint8_t *p, int n, int slot) {   // the stopgap of the top of the file: the movie plays with silence for its AAC sound
+    (void)p;
+    if (!d->red_vb++) LOG("[RED] movie: no AAC decoder on this platform yet (Phase 1), outputting silence");
+    return md_aac_silence(d, n, slot);
+}
+#endif
 // The H.264 decoder, made by Configure (when the stream's parameter sets come with it) or by the first packet; RGBA pictures in the native texture mode either way.
 // Absolum's movies bring csd-0 / csd-1 to Configure, and a decoder made there used to stay NV12: the frames' bytes went into the RGBA texture as they were
 static void md_avc_open(mdec_t *d) { if (!d->avc) { d->avc = mavc_new(&d->vt); if (d->fmt == MD_FMT_ABGR) mavc_set_rgba(d->avc); } }
@@ -518,12 +628,16 @@ static int md_avc(mdec_t *d, const uint8_t *p, int n, int slot, int take_only) {
     if (d->out[slot].cap < need) { free(d->out[slot].frm); d->out[slot].frm = malloc(need); d->out[slot].cap = need; }
     return mavc_take(d->avc, d->jflush, d->out[slot].frm, d->w, d->h, &d->jpts_out);
 }
-static void md_close(mdec_t *d) { if (d->vpx_on) { vpx_codec_destroy(&d->vpx); d->vpx_on = 0; } if (d->vb) { stb_vorbis_close(d->vb); d->vb = NULL; } if (d->aac) { AudioConverterDispose(d->aac); d->aac = NULL; } if (d->avc) { mavc_free(d->avc); d->avc = NULL; } }
-void dm_host_helper_qos(qos_class_t q);   // hle_thread.c
+static void md_close(mdec_t *d) {
+#if defined(_WIN32)
+    if (d->maac) { maac_free(d->maac); d->maac = NULL; } d->maac_none = 0;
+#endif
+    if (d->vpx_on) { vpx_codec_destroy(&d->vpx); d->vpx_on = 0; } if (d->vb) { stb_vorbis_close(d->vb); d->vb = NULL; } if (d->aac) { AudioConverterDispose(d->aac); d->aac = NULL; } if (d->avc) { mavc_free(d->avc); d->avc = NULL; } }
+void dm_host_helper_qos(plat_qos_t q);   // hle_thread.c
 static void *md_worker(void *arg) {
     mdec_t *d = arg;
-    pthread_setname_np("dm movie decoder");
-    dm_host_helper_qos(QOS_CLASS_USER_INITIATED);   // under DM_QOS_MAP: decodes ahead of playback, not on the frame's critical path
+    plat_thread_set_name("dm movie decoder");
+    dm_host_helper_qos(PLAT_QOS_USER_INITIATED);   // under DM_QOS_MAP: decodes ahead of playback, not on the frame's critical path
     dm_host_mutex_lock(&d->wmu);
     for (;;) {
         while (d->job == MDJ_NONE) pthread_cond_wait(&d->wcv, &d->wmu);
@@ -563,7 +677,7 @@ static void md_pump_ev(mdec_t *d, int ev) { if (MD_AUDIO(d)) md_event(d, ev); el
 static void md_pump(mdec_t *d);
 static void *md_pump_thread(void *arg) {
     mdec_t *d = arg;
-    pthread_setname_np("dm movie pump");
+    plat_thread_set_name("dm movie pump");
     pthread_mutex_lock(&d->pkm);
     for (;;) {
         while (!d->pk_go && !d->pk_quit) pthread_cond_wait(&d->pkc, &d->pkm);
@@ -668,7 +782,7 @@ HLE_FORCE("_ZN5movie7DecoderC1ENS_11DecoderTypeENS_19DecoderOutputFormatENS_11De
     // audio behind the next video packet, whose clock the player follows, ran dry: 86 pictures in 25 s, a black screen with a loading icon. With 16 (or 32) all 1,960 play at 30 fps.
     // A video slot is allocated when first used, so the 8 more cost a greedy player 24 MB of NV12 at 1080p (64 MB as RGBA)
     d->nout = !audio ? MD_NOUT_VIDEO : type == MD_TYPE_AAC ? MD_NOUT_AAC : MD_NOUT;
-    for (int i = 0; i < MD_NIN; i++) { d->in[i] = malloc(MD_INCAP); d->infree[i] = i; }
+    for (int i = 0; i < MD_NIN; i++) { d->in[i] = GUEST_MALLOC(MD_INCAP); d->infree[i] = i; }
     d->ninfree = MD_NIN;
     pthread_mutex_init(&d->pkm, NULL); pthread_cond_init(&d->pkc, NULL);
     if (!audio) { if (pthread_create(&d->pk, NULL, md_pump_thread, d)) die("movie: failed to create the decoder's thread"); d->pk_on = 1; }
@@ -711,7 +825,7 @@ static void md_free(void **self) {
         (unsigned long long)d->dec_n, d->dec_n ? d->dec_ns / 1e6 / d->dec_n : 0.0, d->dec_max / 1e6);
     dm_host_lock(&d->dmu); md_job(d, MDJ_QUIT); pthread_mutex_unlock(&d->dmu);
     pthread_join(d->wk, NULL);
-    for (int i = 0; i < MD_NIN; i++) free(d->in[i]);
+    for (int i = 0; i < MD_NIN; i++) GUEST_FREE(d->in[i]);
     for (int k = 0; k < MD_NOUT; k++) free(d->out[k].frm);
     free(d->bgra); free(d->vhdr[0]); free(d->vhdr[1]); free(d->hold);
     pthread_mutex_destroy(&d->pkm); pthread_cond_destroy(&d->pkc);
@@ -725,15 +839,15 @@ HLE_FORCE("_ZN5movie7DecoderD1Ev", "movie decoder destructor (complete object): 
 HLE_FORCE("_ZN5movie7DecoderD0Ev", "movie decoder deleting destructor: frees the host object, then the object with operator delete", void, h_movie_DecD0, void **self) {
     md_free(self);
     static void (*del)(void *); if (!del) del = (void (*)(void *))guest_sym("_ZdlPv");
-    if (del) del(self); else LOG("[RED] movie: no operator delete in the game; the decoder object is not freed");
+    if (del) GUEST_CALL(del, self); else LOG("[RED] movie: no operator delete in the game; the decoder object is not freed");
 }
 
 HLE_FORCE("_ZN5movie7Decoder9ConfigureEPNS_9MediaDataE", "movie decoder configure", int, h_movie_Configure, void **self, void *md) {
     mdec_t *d = md_of(self); if (!d) return 0x1000;
     if (MD_AUDIO(d)) {   // codec-specific data as Android's MediaCodec takes it: Vorbis csd-0 = identification header, csd-1 = setup header; AAC csd-0 = AudioSpecificConfig
         for (int k = 0; k < 2 && md; k++) { void *b = NULL; char key[8]; snprintf(key, sizeof key, "csd-%d", k);
-            if (G.find_buf(md, key, &b) && b && G.data(b) && G.size(b)) { size_t n = G.size(b); free(d->vhdr[k]); d->vhdr[k] = malloc(n); memcpy(d->vhdr[k], G.data(b), n); d->vhdr_n[k] = (int)n; } }
-        int ch = 0, rate = 0; if (md) { G.find_i32(md, "channel-count", &ch); G.find_i32(md, "sample-rate", &rate); }
+            if (GUEST_FIND_BUF(md, key, &b) && b && GUEST_CALL(G.data, b) && GUEST_CALL(G.size, b)) { size_t n = GUEST_CALL(G.size, b); free(d->vhdr[k]); d->vhdr[k] = malloc(n); memcpy(d->vhdr[k], GUEST_CALL(G.data, b), n); d->vhdr_n[k] = (int)n; } }
+        int ch = 0, rate = 0; if (md) { GUEST_FIND_I32(md, "channel-count", &ch); GUEST_FIND_I32(md, "sample-rate", &rate); }
         if (ch > 0) d->ch = ch; if (rate > 0) d->rate = rate;
         MD_TRACE(d, 0, "Configure (%s): %d channels %d Hz, headers %d + %d bytes", d->type == MD_TYPE_AAC ? "AAC" : "Vorbis", ch, rate, d->vhdr_n[0], d->vhdr_n[1]);
         return 0;
@@ -741,11 +855,11 @@ HLE_FORCE("_ZN5movie7Decoder9ConfigureEPNS_9MediaDataE", "movie decoder configur
     if (d->type == MD_TYPE_AVC && md) {   // SPS / PPS: csd-0 / csd-1 (Annex B, as Android's MediaCodec takes them) or, from this SDK's MP4 demuxer (Super Mario Odyssey), "avcc" = the avcC box
         md_avc_open(d);
         void *b = NULL;
-        for (int k = 0; k < 2; k++) { char key[8]; snprintf(key, sizeof key, "csd-%d", k); if (G.find_buf(md, key, &b) && b && G.data(b) && G.size(b)) mavc_param_sets(d->avc, G.data(b), G.size(b)); }
-        if (G.find_buf(md, "avcc", &b) && b && G.data(b) && G.size(b)) mavc_avcc(d->avc, G.data(b), G.size(b));
+        for (int k = 0; k < 2; k++) { char key[8]; snprintf(key, sizeof key, "csd-%d", k); if (GUEST_FIND_BUF(md, key, &b) && b && GUEST_CALL(G.data, b) && GUEST_CALL(G.size, b)) mavc_param_sets(d->avc, GUEST_CALL(G.data, b), GUEST_CALL(G.size, b)); }
+        if (GUEST_FIND_BUF(md, "avcc", &b) && b && GUEST_CALL(G.data, b) && GUEST_CALL(G.size, b)) mavc_avcc(d->avc, GUEST_CALL(G.data, b), GUEST_CALL(G.size, b));
     }
-    int w = 0, h = 0; if (md) { G.find_i32(md, "width", &w); G.find_i32(md, "height", &h); }
-    dm_host_mutex_lock(&d->mu); if (w > 0 && h > 0 && !d->fmt_sent) { d->w = w; d->h = h; } pthread_mutex_unlock(&d->mu);
+    int w = 0, h = 0; if (md) { GUEST_FIND_I32(md, "width", &w); GUEST_FIND_I32(md, "height", &h); }
+    dm_host_mutex_lock(&d->mu); if (w > 0 && h > 0 && !d->fmt_sent) { d->w = w; d->h = h; d->nheld = 0; } pthread_mutex_unlock(&d->mu);
     MD_TRACE(d, 0, "Configure: MediaData width %d height %d", w, h);
     return 0;
 }
@@ -788,7 +902,7 @@ static void md_reset(mdec_t *d, int close) {
     dm_host_mutex_lock(&d->mu);
     // Every input goes back to the free list, as with MediaCodec, but one the client holds may still be sent: Big Brain Academy: Brain vs. Brain's event thread acquires inputs while its
     // control thread flushes to loop an activity preview, and sends them after the flush (SendInputBufferForDecode claims them back). Those are withheld for a while (h_movie_AcqIn)
-    uint64_t now = now_ns();
+    uint64_t now = md_now();   // the guest clock under DM_DETCLOCK (md_now)
     for (int i = 0; i < MD_NIN; i++) { d->infree[i] = i; d->instale[i] = d->inown[i] ? now : 0; d->inown[i] = 0; }
     d->ninfree = MD_NIN; d->noutq = 0; d->npend = 0; d->avc_drain = 0; d->avc_due = 0; d->in_eos = 0; d->hold_n = 0; d->vb_prev = 0;
     // a flush keeps each slot's last picture: the same game reads an output it acquired before the flush right after it (a black frame in the loop otherwise)
@@ -834,7 +948,7 @@ HLE_FORCE("_ZN5movie7Decoder23AcquireInputBufferIndexEPiS1_", "movie decoder: ac
     // No input after an end-of-stream packet until Flush / Stop either, as with MediaCodec, which movie::Decoder wraps (ACodec keeps the input buffers once the input port saw EOS).
     // DRAGON QUEST XI S's movie player sends an end-of-stream packet (length 0, time 0) for every input it gets once its extractor is done, until the game stops the movie: when the
     // prologue movie was skipped, each became an end-of-stream output, the player made each one an audio sample, and 2.25 GB were mapped within seconds (the allocator then broke)
-    uint64_t now = now_ns(), wake = 0; int k = -1;
+    uint64_t now = md_now(), wake = 0; int k = -1;   // the guest clock under DM_DETCLOCK (md_now)
     for (int j = 0; j < d->ninfree && k < 0; j++) { int x = d->infree[j]; if (!d->instale[x] || now - d->instale[x] >= MD_STALE_NS) k = j; }
     if (d->in_eos) k = -1;
     if (k >= 0 && d->started) {
@@ -851,7 +965,7 @@ HLE_FORCE("_ZN5movie7Decoder23AcquireInputBufferIndexEPiS1_", "movie decoder: ac
 HLE_FORCE("_ZN5movie7Decoder14GetInputBufferEiPNS_6BufferE", "movie decoder: hand out an input buffer", int, h_movie_GetIn, void **self, int i, void *buf) {
     mdec_t *d = md_of(self); if (!d) return 0x1000;
     if (!buf || i < 0 || i >= MD_NIN) return 0x100b;
-    G.set_data(buf, d->in[i], MD_INCAP); G.set_range(buf, 0, (int)MD_INCAP);
+    GUEST_CALL(G.set_data, buf, d->in[i], MD_INCAP); GUEST_CALL(G.set_range, buf, 0, (int)MD_INCAP);
     return 0;
 }
 HLE_FORCE("_ZN5movie7Decoder24SendInputBufferForDecodeEiiilj", "movie decoder: send a packet for decoding (VP8 / VP9 with libvpx, AVC with VideoToolbox)", int, h_movie_SendIn,
@@ -915,17 +1029,17 @@ HLE_FORCE("_ZN5movie7Decoder24AcquireOutputBufferIndexEPiPlPjS1_", "movie decode
     return r;
 }
 static void md_format(mdec_t *d, void *md) {
-    if (MD_AUDIO(d)) { G.set_i32(md, "channel-count", d->ch > 0 ? d->ch : 2); G.set_i32(md, "sample-rate", d->rate > 0 ? d->rate : 48000); return; }
+    if (MD_AUDIO(d)) { GUEST_CALL(G.set_i32, md, GUEST_STR("channel-count"), d->ch > 0 ? d->ch : 2); GUEST_CALL(G.set_i32, md, GUEST_STR("sample-rate"), d->rate > 0 ? d->rate : 48000); return; }
     int w, h, stride, slice; md_dims(d, &w, &h, &stride, &slice);
-    G.set_i32(md, "width", w); G.set_i32(md, "height", h);
-    G.set_rect(md, "crop", 0, 0, w - 1, h - 1);
-    G.set_i32(md, "stride", stride); G.set_i32(md, "slice-height", slice);
-    G.set_i32(md, "nv12-y-stride", stride); G.set_i32(md, "nv12-y-offset", 0); G.set_i32(md, "nv12-uv-offset", stride * slice);
+    GUEST_CALL(G.set_i32, md, GUEST_STR("width"), w); GUEST_CALL(G.set_i32, md, GUEST_STR("height"), h);
+    GUEST_CALL(G.set_rect, md, GUEST_STR("crop"), 0, 0, w - 1, h - 1);
+    GUEST_CALL(G.set_i32, md, GUEST_STR("stride"), stride); GUEST_CALL(G.set_i32, md, GUEST_STR("slice-height"), slice);
+    GUEST_CALL(G.set_i32, md, GUEST_STR("nv12-y-stride"), stride); GUEST_CALL(G.set_i32, md, GUEST_STR("nv12-y-offset"), 0); GUEST_CALL(G.set_i32, md, GUEST_STR("nv12-uv-offset"), stride * slice);
     // The interleaved UV plane has the luma plane's byte stride. CRI Sofdec2's player (Catherine: Full Body, main+0x34e6bc) reads it with the other three and checks none of the results:
     // without it the chroma stride was stack garbage and its NV12 → RGB conversion read far outside guest memory on the first picture (main+0x344f74); in DRAGON QUEST VII Reimagined
     // every chroma row was read from the first one (a grey movie with vertical bands). The picture size again, as the SDK's DecoderImpl::GetOutputBufferFormatFromDecoder
     // (SDK 19 subsdk0+0x121f50) also sets it
-    G.set_i32(md, "nv12-uv-stride", stride); G.set_i32(md, "nv12-width", w); G.set_i32(md, "nv12-height", h);
+    GUEST_CALL(G.set_i32, md, GUEST_STR("nv12-uv-stride"), stride); GUEST_CALL(G.set_i32, md, GUEST_STR("nv12-width"), w); GUEST_CALL(G.set_i32, md, GUEST_STR("nv12-height"), h);
     // SDK 7.3.2 uses the hardware colour indices directly. SDK 4.4.1 adds one and also uses 1 for limited BT.601.
     // Keep the established mapping for unrecognized implementations and old rewrite outputs. H.264 planes from VideoToolbox are video range.
     int b709, full = 0;
@@ -933,7 +1047,7 @@ static void md_format(mdec_t *d, void *md) {
     else { b709 = d->vpx_cs == VPX_CS_BT_709 || (d->vpx_cs == VPX_CS_UNKNOWN && h >= 720); full = d->vpx_full; }
     int key = (b709 ? 3 : 1) + full;
     if (G.native_color_keys) key = b709 ? 2 + full : full ? 1 : 4;
-    G.set_i32(md, "nv12-colorspace", key);
+    GUEST_CALL(G.set_i32, md, GUEST_STR("nv12-colorspace"), key);
 }
 HLE_FORCE("_ZN5movie7Decoder15GetOutputFormatEPNS_9MediaDataE", "movie decoder: output format (NV12)", int, h_movie_OutFmt, void **self, void *md) {
     mdec_t *d = md_of(self); if (!d) return 0x1000;
@@ -955,8 +1069,7 @@ HLE_FORCE("_ZN5movie7Decoder19GetOutputBufferSizeEPiS1_", "movie decoder: output
     // of a Vorbis bound every 4 KB AAC frame was played as 0.68 s, the clock crawled, the player stopped taking audio and the opening movie froze on its first second.
     // Vorbis packets vary in length (a long block gives far more than a short one), so its outputs stay at the bound
     if (MD_AUDIO(d)) {
-        int sbr = d->vhdr_n[0] > 0 && ((d->vhdr[0][0] >> 3) == 5 || (d->vhdr[0][0] >> 3) == 29);
-        *size = d->type == MD_TYPE_AAC && d->ch > 0 ? 1024 * (sbr ? 2 : 1) * d->ch * 2 : MD_PCM_CAP; *mode = d->out_align ? d->out_align : d->mode;
+        *size = d->type == MD_TYPE_AAC && d->ch > 0 ? aac_frame_samples(d) * d->ch * 2 : MD_PCM_CAP; *mode = d->out_align ? d->out_align : d->mode;
         MD_TRACE(d, 11, "GetOutputBufferSize → %d (PCM)", *size); return 0;
     }
     int w, h, stride, slice; md_dims(d, &w, &h, &stride, &slice);
@@ -969,6 +1082,7 @@ HLE_FORCE("_ZN5movie7Decoder19GetOutputBufferSizeEPiS1_", "movie decoder: output
 // In the SDK, NnCodecConsumer draws the decoded frame into that texture on the GPU and signals the sync when done; the host writes the texture storage on the CPU (as WriteTexels; the replay layer re-uploads dirty pages), and the sync counts as done once written
 int nvn_host_write_texture(const void *nvntex, const void *src, int w, int h, size_t row, int *tw, int *th);
 int nvn_host_signal_sync(void *nvnsync);
+uint64_t nvn_host_texture_serial(const void *nvntex);   // hle_nvn.c: its Initialize serial (a texture made again at the same address has a new one)
 // The SDK returns a native-texture output to the decoder in GetOutputBuffer (below), and its hardware decoder fills it again later, so a client that also releases the index
 // (Metroid Dread; TSUKIHIME, GitHub issue #700) always does so first. The host decodes inside a release: returned in GetOutputBuffer, the slot was decoded into again and
 // announced at once, the client's decoder thread acquired it before its output thread's own release came, and that release freed the new picture. The slot was filled once
@@ -988,7 +1102,7 @@ static int md_out_tex(mdec_t *d, int i, void *buf) {
     // Native output is an opaque texture object, not a byte buffer. MK11's
     // NX64Render_AsyncTexture::Internal_CreateRHI passes its texture and capacity
     // zero to SetDataAndCapacity; the SDK consumer uses the pointer, not Capacity.
-    uint8_t *p = G.data(buf);
+    uint8_t *p = GUEST_CALL(G.data, buf);
     if (!p) { LOG("[RED] movie: client buffer in native-texture mode has no texture object"); return 0x100b; }
     void *tex = p; int tw = 0, th = 0, f = nvn_host_write_texture(tex, NULL, 0, 0, 0, &tw, &th);
     if (f < 0) { LOG("[RED] movie: buffer data %p in native-texture mode is not a texture object", tex); return 0x100b; }
@@ -997,17 +1111,25 @@ static int md_out_tex(mdec_t *d, int i, void *buf) {
     int w = d->w < tw ? d->w : tw, h = d->h < th ? d->h : th;
     // No picture (an end-of-stream output): nothing is drawn and the texture keeps the last frame, as the SDK's consumer has no frame to draw. A black frame here flashed at the
     // end of every loop of Big Brain Academy: Brain vs. Brain's activity previews, which read the end-of-stream output's buffer
+    // A decoder whose pictures are all the same (the port's H.264 stopgap: black, mavc_constant) writes each texture once: writing it again every frame changed nothing and
+    // cost Mario vs. Donkey Kong's title 1.7 ms of CPU a frame (two 960 x 1080 RGBA textures, 7.9 MB a frame) and their re-upload (docs/reference/movies.md, "H.264 movies
+    // without a decoder"). Keyed by the texture's Initialize serial, so a texture made again at the same address is written; a size change (Configure) clears the list
     if (d->out[i].pic && d->out[i].frm) {
-        const uint8_t *src = d->out[i].frm;
-        if (bgr) {   // into a copy: the slot's picture stays RGBA for another GetOutputBuffer of the same slot
-            size_t n = (size_t)d->w * h * 4;
-            if (d->bgra_cap < n) { free(d->bgra); d->bgra = malloc(n); d->bgra_cap = n; }
-            for (size_t k = 0; k < n; k += 4) { d->bgra[k] = src[k + 2]; d->bgra[k + 1] = src[k + 1]; d->bgra[k + 2] = src[k]; d->bgra[k + 3] = src[k + 3]; }
-            src = d->bgra;
+        const uint64_t ser = d->avc && mavc_constant(d->avc) ? nvn_host_texture_serial(tex) : 0;
+        int held = 0; for (int k = 0; ser && k < d->nheld; k++) held |= d->held[k] == ser;
+        if (!held) {
+            const uint8_t *src = d->out[i].frm;
+            if (bgr) {   // into a copy: the slot's picture stays RGBA for another GetOutputBuffer of the same slot
+                size_t n = (size_t)d->w * h * 4;
+                if (d->bgra_cap < n) { free(d->bgra); d->bgra = malloc(n); d->bgra_cap = n; }
+                for (size_t k = 0; k < n; k += 4) { d->bgra[k] = src[k + 2]; d->bgra[k + 1] = src[k + 1]; d->bgra[k + 2] = src[k]; d->bgra[k + 3] = src[k + 3]; }
+                src = d->bgra;
+            }
+            nvn_host_write_texture(tex, src, w, h, (size_t)d->w * 4, NULL, NULL);
+            if (ser) { if (d->nheld == 8) { memmove(d->held, d->held + 1, 7 * sizeof *d->held); d->nheld = 7; } d->held[d->nheld++] = ser; }
         }
-        nvn_host_write_texture(tex, src, w, h, (size_t)d->w * 4, NULL, NULL);
     }
-    void *sy = G.nvn_sync ? G.nvn_sync(buf) : NULL; if (sy && nvn_host_signal_sync(sy) && !d->red_dec++) LOG("[RED] movie: the buffer's sync object %p is not an NVNsync", sy);
+    void *sy = G.nvn_sync ? GUEST_CALL(G.nvn_sync, buf) : NULL; if (sy && nvn_host_signal_sync(sy) && !d->red_dec++) LOG("[RED] movie: the buffer's sync object %p is not an NVNsync", sy);
     MD_TRACE(d, 12, "GetOutputBuffer index %d → texture %p (%d×%d format %#x)%s", i, tex, tw, th, f, d->out[i].pic ? "" : " (no picture: the texture keeps its last frame)");
     // The SDK's texture mode returns the output index here: DecoderImpl::GetOutputBuffer calls CopyOutputBufferToClientTextureAndRelease (MediaCodec::renderOutputBufferAndRelease),
     // so a client never has to release it. Super Mario Party Jamboree's player (SDK 17.5.9) never calls ReleaseOutputBufferIndex: holding all 16 video slots, the decoder stopped and
@@ -1026,22 +1148,22 @@ HLE_FORCE("_ZN5movie7Decoder15GetOutputBufferEiPNS_6BufferE", "movie decoder: ge
     // The decoder writes from the start of the client's buffer. movie::Buffer::Data() is Base() + Offset() and Capacity() the whole buffer (STEINS;GATE RE:BOOT's subsdk0), so a buffer whose
     // read offset the client advanced was written past its end, over the guest heap (from PR #36): the range is reset first. Not in native-texture mode (md_out_tex),
     // where Data() is the texture object the client points it at and nothing is written through it
-    G.set_range(buf, 0, 0);
+    GUEST_CALL(G.set_range, buf, 0, 0);
     if (MD_AUDIO(d)) {   // PCM16 interleaved; an output without samples (end of stream) is empty
-        size_t n = d->out[i].pic ? d->out[i].bytes : 0, cap = G.cap(buf); uint8_t *p = G.data(buf);
-        if (!p || cap < n) { LOG("[RED] movie: client audio output buffer is %zu bytes, this packet needs %zu", cap, n); G.set_range(buf, 0, 0); return 0x100b; }
+        size_t n = d->out[i].pic ? d->out[i].bytes : 0, cap = GUEST_CALL(G.cap, buf); uint8_t *p = GUEST_CALL(G.data, buf);
+        if (!p || cap < n) { LOG("[RED] movie: client audio output buffer is %zu bytes, this packet needs %zu", cap, n); GUEST_CALL(G.set_range, buf, 0, 0); return 0x100b; }
         if (n) memcpy(p, d->out[i].frm, n);
-        G.set_range(buf, 0, (int)n);
+        GUEST_CALL(G.set_range, buf, 0, (int)n);
         MD_TRACE(d, 12, "GetOutputBuffer index %d → PCM %zu bytes", i, n);
         return 0;
     }
     int w, h, stride, slice; md_dims(d, &w, &h, &stride, &slice);
-    size_t need = (size_t)stride * slice * 3 / 2, cap = G.cap(buf);
-    uint8_t *p = G.data(buf);
-    if (!p || cap < need) { LOG("[RED] movie: client output buffer is %zu bytes, a frame needs %zu", cap, need); G.set_range(buf, 0, 0); return 0x100b; }
+    size_t need = (size_t)stride * slice * 3 / 2, cap = GUEST_CALL(G.cap, buf);
+    uint8_t *p = GUEST_CALL(G.data, buf);
+    if (!p || cap < need) { LOG("[RED] movie: client output buffer is %zu bytes, a frame needs %zu", cap, need); GUEST_CALL(G.set_range, buf, 0, 0); return 0x100b; }
     if (d->out[i].pic && d->out[i].frm) memcpy(p, d->out[i].frm, need);
     else { memset(p, 16, (size_t)stride * slice); memset(p + (size_t)stride * slice, 128, need - (size_t)stride * slice); }
-    G.set_range(buf, 0, (int)need);
+    GUEST_CALL(G.set_range, buf, 0, (int)need);
     MD_TRACE(d, 12, "GetOutputBuffer index %d → %zu bytes%s", i, need, d->out[i].pic ? "" : " (black frame)");
     return 0;
 }

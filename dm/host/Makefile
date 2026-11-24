@@ -24,10 +24,14 @@ ifeq ($(filter -j%,$(MAKEFLAGS)),)
 MAKEFLAGS += -j$(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
 endif
 # Service-layer takeover hle_*.c files are included by wildcard: adding a file does not touch this line (avoids merge conflicts)
-SRC=main.c loader.c hle.c crash.c probe.c thread.c save_sync.c memstat.m haptics_apple.m audio_input.c audio_input_mac.m audio_input_dualsense_mac.m dualsense_mic_mac.c pad_switch2_apple.m $(sort $(wildcard hle_*.c)) front_mac.m web_apple.m entry.S
+SRC=main.c loader.c hle.c crash.c probe.c thread.c save_sync.c memstat.m haptics_apple.m audio_input.c audio_input_mac.m audio_input_dualsense_mac.m dualsense_mic_mac.c pad_switch2_apple.m $(sort $(wildcard hle_*.c)) front_mac.m web_apple.m entry.S plat/plat_apple.c
+# The host platform layer (plat/plat.h): Apple's implementation here; Linux and Windows build the portable host with CMake (CMakeLists.txt, docker/README.md)
 # NVN null device + nn::vi + the Vulkan layer (dm/gfx/)
 # Sources under dm/gfx, dm/gfx/nvn, dm/gfx/tex, dm/gfx/vk and dm/gfx/gl are included by wildcard (tests/ and metal/ do not go into the host): adding a file does not touch this line
-GFX=$(sort $(wildcard ../gfx/*.c ../gfx/nvn/*.c ../gfx/nvn/*.m ../gfx/nvn/*.S ../gfx/tex/*.c ../gfx/tex/*.m ../gfx/vk/*.m ../gfx/gl/*.m))
+# The frontend's replay files for the backends without Metal (draw state, GPU-write ledger, handle resolution, pool table, decoder, pipeline rows): since the merge of upstream
+# 90edd532 the Metal backend keeps its own, as upstream's nvn_mtl.m has them, so an Apple host links none of them (CMake builds them for Linux and Windows)
+FRONT_ONLY = ../gfx/nvn/nvn_state.c ../gfx/nvn/nvn_gpuwrite.c ../gfx/nvn/nvn_resolve.c ../gfx/nvn/nvn_pools.c ../gfx/nvn/nvn_replay.c ../gfx/nvn/nvn_pipe.c
+GFX=$(filter-out ../gfx/nvn/nvn_null.c ../gfx/tex/nvn_fmt_vk.c $(FRONT_ONLY),$(sort $(wildcard ../gfx/*.c ../gfx/nvn/*.c ../gfx/nvn/*.m ../gfx/nvn/*.S ../gfx/tex/*.c ../gfx/tex/*.m ../gfx/vk/*.m ../gfx/gl/*.m))) ../third_party/cjson/cJSON.c   # cJSON: the JSON reader of gfx/nvn/nvn_refl.c; nvn_null.c: the null backend of the hosts without Metal (dm/host/CMakeLists.txt); nvn_fmt_vk.c: the Vulkan backend's format table, which includes the Vulkan headers
 # Third party: libvpx ships the VP8 and VP9 decoder sources (movie decoding, hle_movie.c), with its configuration headers in config/ (arm64, shared by Mac and iOS). Built separately into a static library, file by file, so host changes do not recompile it
 VPX=../third_party/libvpx
 VPX_SRC=$(sort $(shell find $(VPX) -name '*.c'))
@@ -78,16 +82,19 @@ FORCE:
 HOST_CFLAGS = $(CFLAGS) -I../gfx/nvn/include -I$(dir $(MSL_H)) -I../third_party/vulkan-headers/include -I$(dir $(GAME_H)) -I$(VPX) -I$(DAV1D)/include -I../third_party/stb_vorbis -fobjc-arc
 HOST_FRAMEWORKS = -framework Cocoa -framework WebKit -framework UserNotifications -framework QuartzCore -framework Metal -framework MetalFX -framework GameController -framework CoreBluetooth -framework IOBluetooth -framework CoreHaptics -framework IOKit -framework IOUSBHost -framework AudioToolbox -framework CoreAudio -framework AVFAudio -framework CoreFoundation -framework CoreGraphics -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework ImageIO -framework UniformTypeIdentifiers
 HOST_SRC = $(SRC) $(GFX)
-ifneq ($(filter ../%,$(filter-out ../gfx/%,$(HOST_SRC))),)
-$(error host sources outside dm/host and dm/gfx need an object rule: $(filter ../%,$(filter-out ../gfx/%,$(HOST_SRC))))
+ifneq ($(filter ../%,$(filter-out ../gfx/% ../third_party/%,$(HOST_SRC))),)
+$(error host sources outside dm/host, dm/gfx and dm/third_party need an object rule: $(filter ../%,$(filter-out ../gfx/% ../third_party/%,$(HOST_SRC))))
 endif
 OBJ_DIR = gen/$(GAME)/obj
-HOST_OBJ = $(foreach s,$(HOST_SRC),$(if $(filter ../gfx/%,$(s)),$(OBJ_DIR)/gfx/$(s:../gfx/%=%).o,$(OBJ_DIR)/host/$(s).o))   # the line's order: the link lays code out in it
+HOST_OBJ = $(foreach s,$(HOST_SRC),$(if $(filter ../gfx/%,$(s)),$(OBJ_DIR)/gfx/$(s:../gfx/%=%).o,$(if $(filter ../third_party/%,$(s)),$(OBJ_DIR)/third_party/$(s:../third_party/%=%).o,$(OBJ_DIR)/host/$(s).o)))   # the line's order: the link lays code out in it
 HOST_BIN = gen/$(GAME)/dmhost
 $(OBJ_DIR)/host/%.o: % Makefile ../mac/min_os.mk | $(GAME_H) $(MSL_H)
 	@mkdir -p $(dir $@)
 	clang $(HOST_CFLAGS) -MMD -MP -c $< -o $@
 $(OBJ_DIR)/gfx/%.o: ../gfx/% Makefile ../mac/min_os.mk | $(GAME_H) $(MSL_H)
+	@mkdir -p $(dir $@)
+	clang $(HOST_CFLAGS) -MMD -MP -c $< -o $@
+$(OBJ_DIR)/third_party/%.o: ../third_party/% Makefile ../mac/min_os.mk | $(GAME_H) $(MSL_H)   # cJSON (GFX above)
 	@mkdir -p $(dir $@)
 	clang $(HOST_CFLAGS) -MMD -MP -c $< -o $@
 $(HOST_BIN): $(HOST_OBJ) $(VPX_LIB) $(DAV1D_LIB) Makefile ../mac/min_os.mk

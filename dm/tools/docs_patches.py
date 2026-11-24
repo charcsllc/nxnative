@@ -234,7 +234,8 @@ def shader_rules():   # (file, line, comment) of translator rules keyed by a sha
 
 
 def switches(gs):   # [(key, value, [games])] of every profile key set away from its default in game.py
-    src = inspect.getsource(game.header) + '\n' + inspect.getsource(game.header_one)
+    # constants(): the keys and defaults header_one writes (the port's game.py reads them there, for Apple's header and its runtime form alike)
+    src = '\n'.join(inspect.getsource(f) for f in (game.header, game.header_one, getattr(game, 'constants', None)) if f)
     defaults = {}
     for k, d in re.findall(r'g\.(?:get|words)\(\s*[\'"](\w+)[\'"]\s*,\s*[\'"]([^\'"]*)[\'"]\s*\)', src): defaults.setdefault(k, d)
     out = {}

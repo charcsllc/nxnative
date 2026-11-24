@@ -25,10 +25,28 @@
 // 3 QuantizeSize, 4 Malloc, 5 Realloc, 6 Free (call sites by vtable offset: 4 / 5 / 6 at 8090 / 8423 / 20308; malloc main+0xb2e3d0 calls +0x20 with alignment 16), 13 the TLS cache flush,
 // 14 IsInternallyThreadSafe (1), 20 GetAllocationSize (stores a 32-bit size), 21 the TLS cache setup, 22 Trim (main+0x329a408). Its object is in the bss and its constructor is inlined into
 // the GMalloc setup, which the cut skips (the game's patches.py). It has no Binned3 name to find, so it keeps a row of fixed addresses, which runs only on the main build it was found in (AGENTS.md)
+// The host's slot functions are HLE_LINKAGE (hle.h: static on Apple; elsewhere external, so the thunk generator gives each a host-call thunk), for the x86-64 engine's
+// vtable below (VT_GUEST)
 #include "hle.h"
-#include <malloc/malloc.h>
-#include <mach/mach.h>
 #include <stdatomic.h>
+#include <stdbool.h>
+// The heap the engine allocates from is guest memory: on Apple a host malloc zone (plat_zone_*), on the x86-64 engine the arena's garena (aot.h, "Host memory the guest sees":
+// the engine's objects, thread stacks and NVN pool storage all live in it, so the guest's code reads and keeps addresses below 2^39; the garena announces the pages it commits
+// and decommits to the graphics backend, as the memory SVCs do). The zone stays a name there (g_zone: the host allocator is installed)
+#if DM_NATIVE_EXEC
+#define UE_MALLOC(z, n) plat_zone_malloc(z, n)
+#define UE_MEMALIGN(z, a, n) plat_zone_memalign(z, a, n)
+#define UE_REALLOC(z, p, n) plat_zone_realloc(z, p, n)
+#define UE_FREE(z, p) plat_zone_free(z, p)
+#define UE_SIZE(z, p) plat_zone_size(z, p)
+#else
+#include "aot.h"   // dm_guest_alloc, dm_guest_fnptr, the garena
+#define UE_MALLOC(z, n) dm_garena_malloc((n), 16)
+#define UE_MEMALIGN(z, a, n) dm_garena_malloc((n), (a))
+#define UE_REALLOC(z, p, n) dm_garena_realloc((p), (n), 16)
+#define UE_FREE(z, p) dm_garena_free(p)
+#define UE_SIZE(z, p) dm_garena_size(p)
+#endif
 
 // Slot layouts: which slots the host fills and which do nothing (up to 6; 0 ends the list); the others keep the guest's own functions
 enum { UE5, UE4_27, UE5_6, UE3, UE4_24 };
@@ -46,7 +64,7 @@ static const struct { const char *build, *what; int layout; uint64_t obj, vtable
 };
 enum { NSLOT = 32 };
 
-static malloc_zone_t *g_zone;
+static plat_zone *g_zone;
 static _Atomic int64_t g_used, g_peak;   // bytes in use (usable sizes) and their high-water mark, for the [mem] line (one per 256 MB of new peak)
 static void used(int64_t d) {
     int64_t after = atomic_fetch_add(&g_used, d) + d, peak = atomic_load(&g_peak);
@@ -61,18 +79,18 @@ static size_t align_of(size_t n, uint32_t a) {
 }
 static void *alloc(size_t n, uint32_t a) {
     size_t alignment = align_of(n, a);
-    void *p = alignment == 16 ? malloc_zone_malloc(g_zone, n ? n : 1) : malloc_zone_memalign(g_zone, alignment, n ? n : 1);
-    if (p) used((int64_t)malloc_size(p));
+    void *p = alignment == 16 ? UE_MALLOC(g_zone, n ? n : 1) : UE_MEMALIGN(g_zone, alignment, n ? n : 1);
+    if (p) used((int64_t)UE_SIZE(g_zone, p));
     return p;
 }
-static void release(void *p) { if (p) { used(-(int64_t)malloc_size(p)); malloc_zone_free(g_zone, p); } }
+static void release(void *p) { if (p) { used(-(int64_t)UE_SIZE(g_zone, p)); UE_FREE(g_zone, p); } }
 static void *realloc_aligned(void *p, size_t n, uint32_t a) {
     if (!p) return alloc(n, a);
     if (!n) { release(p); return NULL; }
     // The zone's realloc first: it grows in place and gives back what a shrink leaves, and an in-place block keeps its boundary. Only a block it leaves off the boundary is copied
-    size_t old = malloc_size(p), alignment = align_of(n, a);
-    void *q = malloc_zone_realloc(g_zone, p, n); if (!q) return NULL;
-    used((int64_t)malloc_size(q) - (int64_t)old);
+    size_t old = UE_SIZE(g_zone, p), alignment = align_of(n, a);
+    void *q = UE_REALLOC(g_zone, p, n); if (!q) return NULL;
+    used((int64_t)UE_SIZE(g_zone, q) - (int64_t)old);
     if (!((uintptr_t)q & (alignment - 1))) return q;
     void *r = alloc(n, a);
     if (!r) {
@@ -82,32 +100,40 @@ static void *realloc_aligned(void *p, size_t n, uint32_t a) {
     memcpy(r, q, old < n ? old : n); release(q); return r;
 }
 
-static void *m_Malloc(void *self, size_t n, uint32_t a) {
+HLE_LINKAGE void *m_Malloc(void *self, size_t n, uint32_t a) {
     (void)self; void *p = alloc(n, a);
     if (!p) die("Unreal heap: out of memory (%zu bytes, alignment %u, %.2f GB in use)", n, a, atomic_load(&g_used) / 1073741824.0);
     return p;
 }
-static void *m_TryMalloc(void *self, size_t n, uint32_t a) { (void)self; return alloc(n, a); }
-static void *m_Realloc(void *self, void *p, size_t n, uint32_t a) {
+HLE_LINKAGE void *m_TryMalloc(void *self, size_t n, uint32_t a) { (void)self; return alloc(n, a); }
+HLE_LINKAGE void *m_Realloc(void *self, void *p, size_t n, uint32_t a) {
     (void)self; void *q = realloc_aligned(p, n, a);
     if (!q && n) die("Unreal heap: out of memory in Realloc (%zu bytes, alignment %u, %.2f GB in use)", n, a, atomic_load(&g_used) / 1073741824.0);
     return q;
 }
-static void *m_TryRealloc(void *self, void *p, size_t n, uint32_t a) { (void)self; return realloc_aligned(p, n, a); }
-static void m_Free(void *self, void *p) { (void)self; release(p); }
-static size_t m_QuantizeSize(void *self, size_t n, uint32_t a) { (void)self; (void)a; return malloc_good_size(n); }
-static bool m_GetAllocationSize(void *self, void *p, size_t *out) { (void)self; if (!p) return false; *out = malloc_size(p); return true; }
-static void *m_Malloc32(void *self, uint32_t n, uint32_t a) { return m_Malloc(self, n, a); }
-static void *m_Realloc32(void *self, void *p, uint32_t n, uint32_t a) { return m_Realloc(self, p, n, a); }
-static uint32_t m_QuantizeSize32(void *self, uint32_t n, uint32_t a) { (void)self; (void)a; size_t q = malloc_good_size(n); return q > UINT32_MAX ? n : (uint32_t)q; }
-static bool m_GetAllocationSize32(void *self, void *p, uint32_t *out) { (void)self; if (!p) return false; *out = (uint32_t)malloc_size(p); return true; }
-static void m_Nothing(void *self) { (void)self; }   // Trim (its bool argument is ignored), the thread-local cache setup and teardown, DumpAllocatorStats
+HLE_LINKAGE void *m_TryRealloc(void *self, void *p, size_t n, uint32_t a) { (void)self; return realloc_aligned(p, n, a); }
+HLE_LINKAGE void m_Free(void *self, void *p) { (void)self; release(p); }
+HLE_LINKAGE size_t m_QuantizeSize(void *self, size_t n, uint32_t a) { (void)self; (void)a; return plat_zone_good_size(n); }
+HLE_LINKAGE bool m_GetAllocationSize(void *self, void *p, size_t *out) { (void)self; if (!p) return false; *out = UE_SIZE(g_zone, p); return true; }
+HLE_LINKAGE void *m_Malloc32(void *self, uint32_t n, uint32_t a) { return m_Malloc(self, n, a); }
+HLE_LINKAGE void *m_Realloc32(void *self, void *p, uint32_t n, uint32_t a) { return m_Realloc(self, p, n, a); }
+HLE_LINKAGE uint32_t m_QuantizeSize32(void *self, uint32_t n, uint32_t a) { (void)self; (void)a; size_t q = plat_zone_good_size(n); return q > UINT32_MAX ? n : (uint32_t)q; }
+HLE_LINKAGE bool m_GetAllocationSize32(void *self, void *p, uint32_t *out) { (void)self; if (!p) return false; *out = (uint32_t)UE_SIZE(g_zone, p); return true; }
+HLE_LINKAGE void m_Nothing(void *self) { (void)self; }   // Trim (its bool argument is ignored), the thread-local cache setup and teardown, DumpAllocatorStats
 static void *g_vt[NSLOT];
+#if DM_NATIVE_EXEC
+#define VT_GUEST g_vt   // the guest calls the host's functions at their own addresses
+#else
+// The x86-64 engine: the vtable the guest reads is a copy in the arena (design 5.2) whose host slots hold the functions' guest-visible addresses (dm_guest_fnptr: the m_*
+// functions are HLE_LINKAGE, so each has a host-call thunk); the guest's own slots and words stay as copied
+static void **g_vt_guest;
+#define VT_GUEST g_vt_guest
+#endif
 static const char *g_what;
 
 // Observation gate OBS_UE_MALLOC, on the cut constructor call: the object in the register the gate number's upper bits name (x0), before anything calls it
 static void obj_made(uint64_t *regs, int param) {
-    *(void **)(uintptr_t)regs[param] = g_vt;
+    *(void **)(uintptr_t)regs[param] = VT_GUEST;
     static int once; if (!once++) LOG("%s: Unreal's allocator (FMallocBinned3 at %#llx) runs on a host malloc zone", g_what, (unsigned long long)regs[param]);
 }
 
@@ -120,9 +146,9 @@ int dm_ue_heap_owns(uint64_t a, uint64_t n) {
     if (!g_zone || !a || !n) return 0;
     int dm_guest_as_contains(uintptr_t a);   // hle_svc.c
     if (dm_guest_as_contains((uintptr_t)a) || dm_guest_as_contains((uintptr_t)(a + n - 1))) return 0;   // inside the guest block: not this heap
-    vm_address_t at = (vm_address_t)a; vm_size_t sz = 0; vm_region_basic_info_data_64_t info; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj;
-    if (vm_region_64(mach_task_self(), &at, &sz, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&info, &cnt, &obj) != KERN_SUCCESS) return 0;   // vm_region_64: iOS has no mach_vm.h
-    return at <= a && a + n <= at + sz && (info.protection & (VM_PROT_READ | VM_PROT_WRITE)) == (VM_PROT_READ | VM_PROT_WRITE);
+    uint64_t at = 0, sz = 0; int prot = 0;
+    if (plat_vm_query(a, &at, &sz, &prot)) return 0;
+    return at <= a && a + n <= at + sz && (prot & (PLAT_PROT_READ | PLAT_PROT_WRITE)) == (PLAT_PROT_READ | PLAT_PROT_WRITE);
 }
 
 // The host's vtable over the guest's (the trivial slots stay the guest's), and the zone behind it
@@ -135,7 +161,16 @@ static void fill(const uint8_t *vtable, int L, const char *what) {
     g_vt[k_lay[L].free_] = (void *)m_Free;
     g_vt[k_lay[L].quantize] = s32 ? (void *)m_QuantizeSize32 : (void *)m_QuantizeSize; g_vt[k_lay[L].get_size] = s32 ? (void *)m_GetAllocationSize32 : (void *)m_GetAllocationSize;
     for (int s = 0; s < 6 && k_lay[L].nothing[s]; s++) g_vt[k_lay[L].nothing[s]] = (void *)m_Nothing;
-    g_zone = malloc_create_zone(0, 0); malloc_set_zone_name(g_zone, "guest Unreal heap"); g_what = what;
+#if !DM_NATIVE_EXEC
+    {
+        const int host[] = {k_lay[L].malloc_, k_lay[L].try_malloc, k_lay[L].realloc_, k_lay[L].try_realloc, k_lay[L].free_, k_lay[L].quantize, k_lay[L].get_size};   // 0: no such slot
+        g_vt_guest = dm_guest_alloc(sizeof g_vt);
+        memcpy(g_vt_guest, g_vt, sizeof g_vt);
+        for (unsigned s = 0; s < sizeof host / sizeof *host; s++) if (host[s]) g_vt_guest[host[s]] = dm_guest_fnptr(g_vt[host[s]]);
+        for (int s = 0; s < 6 && k_lay[L].nothing[s]; s++) g_vt_guest[k_lay[L].nothing[s]] = dm_guest_fnptr(g_vt[k_lay[L].nothing[s]]);
+    }
+#endif
+    g_zone = plat_zone_create("guest Unreal heap"); g_what = what;
 }
 
 // Called once the modules are loaded and relocated, before any guest code runs
@@ -155,7 +190,7 @@ void dm_ue_malloc_install(void) {
         for (int k = 0; k < (int)(sizeof k_ue / sizeof k_ue[0]); k++) if (!strcmp(m->build_id, k_ue[k].build)) {
             if (*(uint32_t *)(b + k_ue[k].cut) != (k_ue[k].cut_insn ? k_ue[k].cut_insn : 0xd503201f)) { LOG("[RED] %s: main is rewritten without the allocator cut (its patches.py): Unreal's own allocator runs", k_ue[k].what); return; }
             fill(b + k_ue[k].vtable, k_ue[k].layout, k_ue[k].what);
-            *(void **)(b + k_ue[k].obj) = g_vt;
+            *(void **)(b + k_ue[k].obj) = VT_GUEST;
             LOG("%s: Unreal's allocator (main+%#llx) runs on a host malloc zone", k_ue[k].what, (unsigned long long)k_ue[k].obj);
         }
     }

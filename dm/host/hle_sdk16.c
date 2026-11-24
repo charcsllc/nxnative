@@ -1,11 +1,23 @@
 // System service interfaces used by games on newer SDKs (16.x): oe / time / pl (shared font) / vi vsync / diag.
 // On the real device all of these go through Horizon system services (IPC); the host gives values directly or makes them "unavailable".
 #include "hle.h"
+// A guest function this file calls (docs/design/aot-recompiler.md 2.4): the plain call where the guest's code runs natively (Apple), or where a unit test supplies it
+// as a C function (DM_TEST_GUEST_C); on the x86-64 engine a guest call on the calling thread (aot.h DM_GUEST_CALL: nested inside the host call it is answering)
+// What the guest is handed is guest memory (docs/design/aot-recompiler.md 5.2; aot.h, "Host memory the guest sees"): the shared fonts' pages (GUEST_VM_ALLOC /
+// GUEST_VM_RELEASE: the platform layer's pages on Apple, the arena's here) and the event objects the host owns (an arena static, below)
+#if DM_NATIVE_EXEC || defined(DM_TEST_GUEST_C)
+#define GUEST_CALL(f, ...) f(__VA_ARGS__)
+#define GUEST_VM_ALLOC(n) plat_vm_alloc(n)
+#define GUEST_VM_RELEASE(p, n) plat_vm_release(p, n)
+#else
+#include "aot.h"
+#define GUEST_CALL DM_GUEST_CALL
+#define GUEST_VM_ALLOC(n) dm_guest_alloc(n)
+#define GUEST_VM_RELEASE(p, n) dm_guest_free(p, n)
+#endif
 #include <fcntl.h>
 #include <pthread.h>
-#include <pthread/qos.h>
 #include <stdatomic.h>
-#include <sys/mman.h>
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
@@ -20,10 +32,16 @@ HLE_FORCE("_ZN2nn2oe17GetDisplayVersionEPNS0_14DisplayVersionE", "display versio
         size_t n = strnlen(nacp, 15);
         memset(v, 0, 16); memcpy(v, nacp, n); return;
     }
+#ifdef DM_GAME_RUNTIME   // the port's one host for every profile (game_profile.h's runtime form, dm/host/game_rt.c): the build rows are an array of the profile chosen at start
+    const char *ver = "1.0.0";
+    for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main"))
+        for (int j = 0; j < DM_GAME_NVERSIONS; j++) if (DM_GAME_DISPLAY_VERSIONS[j].build && !strcmp(g_mod[i].build_id, DM_GAME_DISPLAY_VERSIONS[j].build)) ver = DM_GAME_DISPLAY_VERSIONS[j].ver;
+#else
     const struct { const char *build, *ver; } k[] = {DM_GAME_DISPLAY_VERSIONS};
     const char *ver = "1.0.0";
     for (int i = 0; i < g_nmod; i++) if (!strcmp(g_mod[i].name, "main"))
         for (unsigned j = 0; j < sizeof k / sizeof *k; j++) if (k[j].build && !strcmp(g_mod[i].build_id, k[j].build)) ver = k[j].ver;
+#endif
     memset(v, 0, 16); strlcpy(v, ver, 16);
 }
 HLE_FORCE("_ZN2nn2oe24GetExpectedVolumeBalanceEPfS1_", "system / application volume balance; the host always reports 1:1", void, h_oe_GetVolBal, float *sys, float *app) { *sys = 1.0f; *app = 1.0f; }
@@ -46,7 +64,12 @@ HLE_FORCE("_ZN2nn4time21GetDeviceLocationNameEPNS0_12LocationNameE", "device tim
 }
 HLE_FORCE("_ZN2nn4time8FinalizeEv", "pairs with Initialize; the host has no session", Result, h_time_Finalize, void) { return RES_OK; }
 // "Ensure network clock availability" async task: no request is sent; the finish event fires immediately and the result is failure. The object itself is untouched (constructor / destructor no-ops), the event lives in host static storage
+#if DM_NATIVE_EXEC || defined(DM_TEST_GUEST_C)
 static _Alignas(16) uint8_t g_ev_netclock[0x100];
+#else   // the x86-64 engine: the SDK's event code works on it and the game keeps its address, so it is made once in the arena (aot.h)
+static void *_Atomic g_ev_netclock_guest;
+#define g_ev_netclock ((uint8_t *)dm_garena_static(&g_ev_netclock_guest, NULL, 0x100))
+#endif
 HLE_FORCE("_ZN2nn4time39AsyncEnsureNetworkClockAvailabilityTaskC1Ev", "network clock task constructor; the host opens no session", void, h_time_NcCtor, void *self) { (void)self; }
 HLE_FORCE("_ZN2nn4time39AsyncEnsureNetworkClockAvailabilityTaskD1Ev", "network clock task destructor; no session to close", void, h_time_NcDtor, void *self) { (void)self; }
 HLE_FORCE("_ZN2nn4time39AsyncEnsureNetworkClockAvailabilityTask10InitializeENS_2os14EventClearModeE", "network clock task init (offline)", Result, h_time_NcInit, void *self, int mode) { (void)self; (void)mode; return RES_OK; }
@@ -71,11 +94,11 @@ static font_t font_map(const char *p) {
     font_t f = {0}; int fd = open(p, O_RDONLY); struct stat st;
     if (fd < 0 || fstat(fd, &st)) { if (fd >= 0) close(fd); return f; }
     size_t n = (size_t)st.st_size;
-    uint8_t *m = mmap(NULL, n + 8, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANON, -1, 0);
-    if (m == MAP_FAILED) { LOG("[RED] shared font memory allocation failed (%zu bytes)", n + 8); close(fd); return f; }
+    uint8_t *m = GUEST_VM_ALLOC(n + 8);
+    if (!m) { LOG("[RED] shared font memory allocation failed (%zu bytes)", n + 8); close(fd); return f; }
     size_t got = 0; while (got < n) { ssize_t r = pread(fd, m + 8 + got, n - got, (off_t)got); if (r <= 0) break; got += (size_t)r; }
     close(fd);
-    if (got != n) { LOG("[RED] shared font read short: %s (%zu / %zu bytes)", p, got, n); munmap(m, n + 8); return f; }
+    if (got != n) { LOG("[RED] shared font read short: %s (%zu / %zu bytes)", p, got, n); GUEST_VM_RELEASE(m, n + 8); return f; }
     uint32_t done = 0x18029a7fu, len = __builtin_bswap32((uint32_t)n ^ 0x49621806u);
     memcpy(m, &done, 4); memcpy(m + 4, &len, 4);
     f.p = m; f.n = n + 8; return f;
@@ -88,6 +111,76 @@ static font_t font_open(const char *path, const char *file) {   // path (an over
     if (f.p) LOG("shared font (%s): %s (%zu bytes, BFTTF 'decrypted' header + TTF as is)", file ? file : "fallback", path, f.n - 8);
     return f;
 }
+#if !defined(__APPLE__)
+// The port (Linux, Windows) has no Arial Unicode at a fixed path: the standard font's last stand-in is a sans-serif TrueType font of the system's (glyf outlines, which
+// nn::fontll reads), the first of a list found. Linux: the fonts folders of the XDG data directories ($XDG_DATA_HOME, default ~/.local/share, then $XDG_DATA_DIRS,
+// default /usr/local/share:/usr/share), at the paths the distributions' DejaVu, Liberation, Noto and FreeFont packages install to; Windows: %SystemRoot%\Fonts.
+// Without any stand-in, nn::pl::GetSharedFontLoadState would answer 0 for ever, and a game that waits for its shared fonts would stop there (Mario vs. Donkey Kong's main
+// thread polled it with svcSleepThread from nnMain on): the process stops at the first request instead (no_font, below; docs/reference/services.md, "Shared fonts on
+// Linux and Windows")
+static char g_font_looked[2600];   // what font_system looked for and where, for no_font's line
+static font_t font_system(void) {
+    static const char *const names[] = {
+#if defined(_WIN32)
+        "arial.ttf", "segoeui.ttf", "tahoma.ttf",
+#else
+        "truetype/dejavu/DejaVuSans.ttf", "dejavu-sans-fonts/DejaVuSans.ttf", "dejavu/DejaVuSans.ttf", "TTF/DejaVuSans.ttf",
+        "truetype/liberation/LiberationSans-Regular.ttf", "liberation-sans/LiberationSans-Regular.ttf", "liberation/LiberationSans-Regular.ttf",
+        "TTF/LiberationSans-Regular.ttf", "truetype/noto/NotoSans-Regular.ttf", "noto/NotoSans-Regular.ttf", "google-noto/NotoSans-Regular.ttf",
+        "TTF/NotoSans-Regular.ttf", "truetype/freefont/FreeSans.ttf", "gnu-free/FreeSans.ttf",
+#endif
+    };
+    char dirs[2048] = "", path[2200];
+#if defined(_WIN32)
+    const char *root = getenv("SystemRoot"), *sep = ";";   // the folders' list separator: ';' as in PATH (a drive letter has a ':')
+    snprintf(dirs, sizeof dirs, "%s\\Fonts", root && *root ? root : "C:\\Windows");
+#else
+    const char *sep = ":";
+    size_t o = 0;
+    const char *home = getenv("XDG_DATA_HOME"), *h = getenv("HOME"), *sys = getenv("XDG_DATA_DIRS");
+    if (home && *home) o += (size_t)snprintf(dirs + o, sizeof dirs - o, "%s/fonts", home);
+    else if (h && *h) o += (size_t)snprintf(dirs + o, sizeof dirs - o, "%s/.local/share/fonts", h);
+    for (const char *s = sys && *sys ? sys : "/usr/local/share:/usr/share"; *s && o < sizeof dirs;) {
+        const size_t n = strcspn(s, ":");
+        if (n) o += (size_t)snprintf(dirs + o, sizeof dirs - o, "%s%.*s/fonts", o ? ":" : "", (int)n, s);
+        s += n + (s[n] == ':');
+    }
+#endif
+    for (const char *d = dirs; *d;) {
+        const size_t n = strcspn(d, sep);
+        for (size_t i = 0; n && i < sizeof names / sizeof *names; i++) {
+#if defined(_WIN32)
+            snprintf(path, sizeof path, "%.*s\\%s", (int)n, d, names[i]);
+#else
+            snprintf(path, sizeof path, "%.*s/%s", (int)n, d, names[i]);
+#endif
+            font_t f = font_map(path);
+            if (f.p) { LOG("shared font (standard.ttf): %s, the system's (%zu bytes, BFTTF 'decrypted' header + TTF as is)", path, f.n - 8); return f; }
+        }
+        d += n + (d[n] != 0);
+    }
+    // what this platform looked for, by the names a player knows, and where: font_get says it once, with what the game then does (no_font)
+#if defined(_WIN32)
+    snprintf(g_font_looked, sizeof g_font_looked, "Arial, Segoe UI or Tahoma (arial.ttf, segoeui.ttf, tahoma.ttf) in %s", dirs);
+#else
+    snprintf(g_font_looked, sizeof g_font_looked, "DejaVu Sans, Liberation Sans, Noto Sans or FreeSans (the distributions' packages' paths) in the fonts folders %s", dirs);
+#endif
+    return (font_t){0};
+}
+#endif
+// No font stands in for the standard shared font. Horizon always has its shared fonts (nn::pl answers Loading only while they load), so a game has no path for their
+// absence and waits for them for ever (Mario vs. Donkey Kong's main thread polls GetSharedFontLoadState with svcSleepThread). The process stops at the game's first request
+// instead, with one [RED] line naming what was looked for and where, and an exit status of its own (aot.h DM_AOT_NO_FONT), which the launcher explains
+#if !defined(__APPLE__)
+#define SDK16_NO_FONT_STATUS 10   // aot.h DM_AOT_NO_FONT (that header is the x86-64 engine's, which an Apple build and some tests do not include)
+static void no_font(void) {
+    LOG("[RED] shared font: the game asked for its standard shared font and nothing stands in for it: not DM_SHARED_FONT, not DM_FONT_DIR/standard.ttf, and none of the "
+        "system's fonts this platform takes, %s. Horizon always has the shared fonts, so the game would wait for them for ever: nxhost-run exits with status %d; install one of "
+        "those fonts", g_font_looked, SDK16_NO_FONT_STATUS);
+    fflush(NULL);
+    _Exit(SDK16_NO_FONT_STATUS);
+}
+#endif
 static pthread_mutex_t font_mu = PTHREAD_MUTEX_INITIALIZER;
 #define FONT_TYPES 6
 static const char *const font_file[FONT_TYPES] = {"standard.ttf", "chinese_simplified.ttf", "chinese_simplified_ext.ttf", "chinese_traditional.ttf", "korean.ttf", "nintendo_ext.ttf"};
@@ -101,9 +194,16 @@ static font_t font_open_type(int type) {   // font_mu held; an empty font_t: the
     const char *one = getenv("DM_SHARED_FONT");   // one font for types 0-4
     if (type) return one && *one ? (font_t){0} : font_open(NULL, font_file[type]);
     font_t f = font_open(one, font_file[0]);
+#if defined(__APPLE__)
     if (!f.p && (f = font_open("/System/Library/Fonts/Supplemental/Arial Unicode.ttf", NULL)).p)
         LOG("[YELLOW] no standard.ttf in DM_FONT_DIR: the shared fonts are macOS's Arial Unicode as it is, which some games' font engines cannot load (dm/tools/make_shared_fonts.py makes the set)");
     if (!f.p) LOG("[RED] cannot open the standard shared font (DM_FONT_DIR with dm/tools/make_shared_fonts.py's fonts, or DM_SHARED_FONT naming a TTF)");
+#else
+    // the port: a font of the system's (font_system, above) where Apple's host takes macOS's Arial Unicode, with the same caveat; with none the process stops (no_font)
+    if (!f.p && (f = font_system()).p)
+        LOG("[YELLOW] no standard.ttf in DM_FONT_DIR: the shared fonts are the system's font as it is, which some games' font engines cannot load (dm/tools/make_shared_fonts.py makes the set)");
+    if (!f.p) no_font();
+#endif
     return f;
 }
 static font_t font_get(int type) {
@@ -134,7 +234,7 @@ static void font_load_init(void) {
 }
 HLE_FORCE("_ZN2nn6fontll18ScalableFontEngine8LoadFontEPcPKvjj", "shared font BFTTF allocation base → TTF payload; parsing and errors stay in the SDK", uint32_t, h_font_LoadFont, void *self, char *name, const void *data, unsigned index, unsigned capacity) {
     pthread_once(&font_load_once, font_load_init);
-    return font_load(self, name, font_payload(data), index, capacity);
+    return GUEST_CALL(font_load, self, name, font_payload(data), index, capacity);
 }
 // The address points straight at the TTF (past the 8-byte header) and the size excludes the header, except for a game on SDK 11 or later whose main imports ScalableFontEngineHelper::Decode
 //   (dm_sdk_major, dm_game_imports; the profile's shared_font overrides). Super Mario 3D World + Bowser's Fury (SDK 10) records shared fonts as type 0 (main+0x975658), calls no Decode and hands the address
@@ -149,6 +249,12 @@ static size_t font_skip(void) {
 #ifdef DM_GAME_SHARED_FONT_TTF
         skip = DM_GAME_SHARED_FONT_TTF ? 8 : 0; LOG("shared font: %s (game profile shared_font)", skip ? "the TTF itself" : "BFTTF header + TTF");
 #else
+#ifdef DM_GAME_RUNTIME   // the port's one host (game_profile.h's runtime form): the profile's shared_font is a field, -1 when the profile has no such key
+        if (dm_game.shared_font_ttf >= 0) {
+            skip = dm_game.shared_font_ttf ? 8 : 0; LOG("shared font: %s (game profile shared_font)", skip ? "the TTF itself" : "BFTTF header + TTF");
+            return (size_t)skip;
+        }
+#endif
         int m = dm_sdk_major(), dec = dm_game_imports("_ZN2nn6fontll24ScalableFontEngineHelper6Decode"); skip = DM_SDK_OLD(m) || !dec ? 8 : 0;
         LOG("shared font: %s (SDK %d, main %s ScalableFontEngineHelper::Decode)", skip ? "the TTF itself" : "BFTTF header + TTF", m, dec ? "imports" : "does not import");
 #endif
@@ -293,7 +399,7 @@ HLE_FORCE("_ZN2nn3nfp29StartNicknameAndOwnerSettingsEPNS0_12DeviceHandleEPbPNS0_
 // One thread per binding lifetime: repeated requests must not double its rate.
 // A destroyed binding retires its worker even if another service reuses the same
 // guest storage and handle number before the next tick (MacNativeGames dab728a).
-void dm_host_helper_qos(qos_class_t q);   // hle_thread.c
+void dm_host_helper_qos(plat_qos_t q);   // hle_thread.c
 typedef struct vsync_event { void *ev; uint64_t binding; struct vsync_event *next; } vsync_event_t;
 static pthread_mutex_t g_vs_mu = PTHREAD_MUTEX_INITIALIZER;
 static vsync_event_t *g_vs_events;
@@ -307,16 +413,25 @@ static int vsync_tick(vsync_event_t *v) {   // 0: the event is gone and this thr
     return 0;
 }
 __attribute__((weak)) int mtl_link_wait_vsync(uint64_t *seen, uint64_t timeout_ns) { (void)seen; (void)timeout_ns; return 0; }   // nvn_mtl.m
+#if !DM_NATIVE_EXEC
+// The portable host: the Vulkan window presenter's vsync source in the display link's place (dm/gfx/hostvk/vk_present.c, design 7.3), the same contract as mtl_link_wait_vsync. This
+// default answers "no source" in a build without that backend (nvn_null, the host tests that include this file), and the thread below keeps its own clock then, as without a window
+__attribute__((weak)) int be_vsync_wait_vsync(uint64_t *seen, uint64_t timeout_ns) { (void)seen; (void)timeout_ns; return 0; }
+#endif
 __attribute__((weak)) int nvn_vsync_hz(void) { return 60; }   // hle_nvn.c: 120 while 120 fps holds one tick of 1/120 s
 static void *vsync_thread(void *arg) {
     vsync_event_t *v = arg;
-    dm_host_helper_qos(QOS_CLASS_USER_INTERACTIVE);   // the game paces frames on this event
+    dm_host_helper_qos(PLAT_QOS_USER_INTERACTIVE);   // the game paces frames on this event
     const char *e = getenv("DM_VSYNC_HZ"); double hz = e ? atof(e) : 60.0; if (hz <= 0) hz = 60.0;
     uint64_t period = (uint64_t)(1e9 / hz), next = now_ns() + period, seen = 0;
     for (;;) {
         if (!e) period = nvn_vsync_hz() == 120 ? 1000000000ull / 120 : 1000000000ull / 60;   // follows 120 fps (a game that waits for each vblank is held to its rate)
+#if DM_NATIVE_EXEC
         if (!e && mtl_link_wait_vsync(&seen, 2 * period)) { if (!vsync_tick(v)) break; next = now_ns() + period; continue; }
-        uint64_t t = now_ns(); if (next > t) { struct timespec ts = {(time_t)((next - t) / 1000000000ull), (long)((next - t) % 1000000000ull)}; nanosleep(&ts, NULL); }
+#else
+        if (!e && be_vsync_wait_vsync(&seen, 2 * period)) { if (!vsync_tick(v)) break; next = now_ns() + period; continue; }
+#endif
+        uint64_t t = now_ns(); if (next > t) plat_sleep_ns(next - t);
         if (!vsync_tick(v)) break;
         next += period; if (now_ns() > next + 4 * period) next = now_ns() + period;   // do not try to catch up when far behind
     }
@@ -326,8 +441,12 @@ static void *vsync_thread(void *arg) {
 HLE_FORCE("_ZN2nn2vi33GetIndirectImageMemoryRequirementEPmS1_ii", "indirect layer image memory: RGBA8 linear, 4 KB aligned", Result, h_vi_IndirectReq, size_t *size, size_t *align, int w, int h) {
     *size = ((size_t)(w > 0 ? w : 0) * (size_t)(h > 0 ? h : 0) * 4 + 0xfff) & ~(size_t)0xfff; *align = 0x1000; return RES_OK;
 }
+#ifndef DM_HLE_THREAD_C   // hle_thread.c's, which a test that builds this file without it does not have (t_shared_font); one that includes both has the real one
+__attribute__((weak)) void dm_detclock_vsync_event(void *ev) { (void)ev; }
+#endif
 HLE_FORCE("_ZN2nn2vi20GetDisplayVsyncEventEPNS_2os15SystemEventTypeEPNS0_7DisplayE", "vsync event: a host thread signals it at 60 Hz", Result, h_vi_VsyncEvent, void *ev, void *disp) {
     (void)disp; hle_bind_system_event(ev, 1);
+    dm_detclock_vsync_event(ev);   // under DM_DETCLOCK the guest clock signals it at each vsync time instead of the thread below (hle_thread.c)
     uint64_t binding = hle_system_event_binding(ev);
     pthread_mutex_lock(&g_vs_mu);
     int running = 0; for (vsync_event_t *v = g_vs_events; v; v = v->next) running |= v->binding == binding;
@@ -346,12 +465,25 @@ HLE_FORCE("_ZN2nn4diag6detail7PutImplERKNS0_11LogMetaDataEPKcm", "game log → h
     (void)meta; while (n && (s[n - 1] == '\n' || s[n - 1] == '\0')) n--; if (n) LOG("[game] %.*s", (int)n, s);
 }
 // Abort: report the call site (module + offset) and the guest backtrace, then exit
+#if DM_NATIVE_EXEC || defined(DM_TEST_GUEST_C)
 static void diag_abort(uint32_t res, void *lr) {
     module_t *m = module_of(lr);
     LOG("game called nn::diag abort: Result %#x, call site %s+%#llx", res, m ? m->name : "?", m ? (unsigned long long)((uint8_t *)lr - m->base) : (unsigned long long)(uintptr_t)lr);
     dm_backtrace((uint64_t)__builtin_frame_address(1));
     die("game aborted");
 }
+#else
+// The x86-64 engine: lr (the callers' __builtin_return_address(0)) is the host-call thunk's return address and the host's frames are x86 ones (no frame pointer at -O2),
+// so the call site and the guest's frames come from the calling thread's state block (aot.h dm_aot_guest_lr, dm_aot_guest_backtrace: the call site, then the x29 chain)
+static void diag_abort(uint32_t res, void *lr) {
+    (void)lr;
+    const uint64_t at = dm_aot_guest_lr();
+    const module_t *m = module_of((const void *)(uintptr_t)at);
+    LOG("game called nn::diag abort: Result %#x, call site %s+%#llx", res, m ? m->name : "?", m ? (unsigned long long)(at - (uint64_t)(uintptr_t)m->base) : (unsigned long long)at);
+    dm_aot_guest_backtrace();
+    die("game aborted");
+}
+#endif
 HLE_FORCE("_ZN2nn4diag6detail9AbortImplEv", "game aborted", void, h_diag_Abort0, void) { diag_abort(0, dm_bigstack_caller(__builtin_return_address(0))); }
 HLE_FORCE("_ZN2nn4diag6detail9AbortImplEPKNS_6ResultE", "game aborted (with Result)", void, h_diag_AbortR, const uint32_t *r) { diag_abort(r ? *r : 0, dm_bigstack_caller(__builtin_return_address(0))); }
 HLE_FORCE("_ZN2nn4diag12GetBacktraceEPmi", "backtrace; the host provides none (0 frames)", int, h_diag_Bt, uint64_t *out, int n) { (void)out; (void)n; return 0; }

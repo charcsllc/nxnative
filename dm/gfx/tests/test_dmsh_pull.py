@@ -4,6 +4,7 @@ its declared type, add the wide-line entries (main0_wl, main0_z_wl: the body as 
 segment is clipped; no entries when a parameter or an output is one it cannot handle), leave the other entry points out, decline shaders it does not fit, and compile with the
 Metal compiler for macOS and iOS (temporary files only in a temporary folder). t_wline.m draws with the wide-line entry on the GPU."""
 from pathlib import Path
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -30,7 +31,8 @@ def shader(types, extra='', ids='', tf=False, gs=False, ret=False):
     return src
 
 class PullingInputs(unittest.TestCase):
-    def compiles(self, msl):
+    def compiles(self, msl):   # last in each test: the variant's text is checked before; only this step needs the Metal compiler
+        if not shutil.which('xcrun'): self.skipTest('variant text checked; compiling it needs xcrun and the Metal compiler (Xcode), and xcrun is not on PATH')
         with tempfile.TemporaryDirectory(prefix='dmsh_pull_test_') as d:
             p = Path(d) / 'v.metal'; p.write_text(msl)
             for sdk in ('macosx', 'iphoneos'):

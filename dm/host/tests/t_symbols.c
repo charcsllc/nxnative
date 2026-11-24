@@ -1,6 +1,8 @@
-// Exercise the real HLE, forced-takeover and stub indexes with synthetic Mach-O sections; no game files required.
+// Exercise the real HLE, forced-takeover and stub indexes with synthetic registration tables (the swhle / swforce sections); no game files required.
 #include "../hle.h"
+#if defined(__APPLE__)
 #include <mach-o/getsect.h>
+#endif
 #include <assert.h>
 #include <signal.h>
 #include <sys/resource.h>
@@ -11,18 +13,30 @@ static hle_ent entries[4];
 static hle_force_ent forces[3];
 static hle_force_ent *force_sec = forces; static unsigned long force_sec_n = 3, force_sec_extra;   // the alias phase swaps in its own table
 static int have_sections;
-static uint8_t *test_section(const struct mach_header_64 *mh, const char *seg, const char *sect, unsigned long *size) {
-    (void)mh; assert(!strcmp(seg, "__DATA"));
+static const void *test_section(const char *sect, size_t *size) {
     *size = 0;
     if (!have_sections) return NULL;
-    if (!strcmp(sect, "swhle")) { *size = sizeof entries; return (uint8_t *)entries; }
-    assert(!strcmp(sect, "swforce")); *size = force_sec_n * sizeof *force_sec + force_sec_extra; return (uint8_t *)force_sec;
+    if (!strcmp(sect, "swhle")) { *size = sizeof entries; return entries; }
+    assert(!strcmp(sect, "swforce")); *size = force_sec_n * sizeof *force_sec + force_sec_extra; return force_sec;
 }
-#define getsectiondata test_section
+// hle.c and loader.c read their tables through plat_table_swhle / plat_table_swforce (PLAT_TABLE_DEFINE, plat.h): here they read the synthetic ones.
+// Apple: the real PLAT_TABLE_DEFINE, whose getsectiondata must ask for the __DATA segment; elsewhere the linker's section bounds are replaced as a whole
+#if defined(__APPLE__)
+static uint8_t *test_getsectiondata(const struct mach_header_64 *mh, const char *seg, const char *sect, unsigned long *size) {
+    (void)mh; assert(!strcmp(seg, "__DATA"));
+    size_t n = 0; const void *p = test_section(sect, &n); *size = n; return (uint8_t *)(uintptr_t)p;
+}
+#define getsectiondata test_getsectiondata
+#else
+#undef PLAT_TABLE_DEFINE
+#define PLAT_TABLE_DEFINE(name) static const void *plat_table_##name(size_t *bytes) { return test_section(#name, bytes); }
+#endif
 #include "../hle.c"
 #include "../loader.c"
 void mtl_present_screen(uint32_t w, uint32_t h) { (void)w; (void)h; }   // loader.c: a screen taller than 16:9; no renderer here
+#if defined(__APPLE__)
 #undef getsectiondata
+#endif
 
 struct dm_flags g_flag;
 uint64_t unimpl_stubs[MAX_STUB];
@@ -32,6 +46,17 @@ uint64_t guest_ticks(void) { return 0; }
 void guest_clock_read_wait(void) {}
 void hlecount_seal(void) {}
 int svc_nro_deactivate(module_t *m) { m->loaded = 0; return 1; }   // no memory mappings in this fixture
+#if !DM_NATIVE_EXEC
+// The x86-64 execution engine's side of loader.c (aot_arena.c, aot_run.c), which this fixture does not reach: its modules are made by hand and run no guest code
+void *dm_guest_alloc(size_t n) { (void)n; abort(); }
+uint8_t *dm_aot_image_map(const uint8_t *bytes, size_t len, size_t bss, uint64_t ro_end, size_t *mapped) { (void)bytes; (void)len; (void)bss; (void)ro_end; (void)mapped; abort(); }
+struct dm_guest_state *dm_aot_self_state(void) { return NULL; }
+uint64_t dm_guest_call(struct dm_guest_state *st, uint64_t addr, int nargs, ...) { (void)st; (void)addr; (void)nargs; abort(); }
+uint64_t dm_aot_bind(const module_t *m, const char *name, uint64_t v) { (void)m; (void)name; return v; }   // modules outside the arena keep host addresses (aot_arena.c)
+int dm_aot_load_module_pack(module_t *m, const char *dir, const uint8_t sha256[32], uint64_t image_size, uint64_t text_end, uint64_t bss, char *err, size_t errn) {
+    (void)m; (void)dir; (void)sha256; (void)image_size; (void)text_end; (void)bss; (void)err; (void)errn; abort();
+}
+#endif
 void dm_exl_sync_all(void) {}
 void thr_svc_enter(uint64_t *r, uint64_t a) { (void)r; (void)a; }
 void thr_svc_leave(void) {}

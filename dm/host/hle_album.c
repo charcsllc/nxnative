@@ -7,9 +7,14 @@
 // and Resident Evil 4 / PRAGMATA (Switch 2: 5-arg SaveScreenshot with ImageOrientation).
 // Offline/system-only album features (SaveCurrentScreenshot compositor capture, SaveAndShareScreenshot social upload, ShowAlbumFiles system applet) still return failure.
 #include "hle.h"
+#if defined(_WIN32)
+#define link plat_win32_link   // plat.h: no link() in mingw-w64
+#endif
+#if defined(__APPLE__)
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CoreGraphics.h>
 #include <ImageIO/ImageIO.h>
+#endif
 #include <errno.h>
 #include <fcntl.h>
 #include <limits.h>
@@ -106,6 +111,7 @@ static uint8_t *album_rotate_rgba(const uint8_t *src, size_t w, size_t h, int or
     return dst;
 }
 
+#if defined(__APPLE__)
 static int album_write_png(const char *path, const uint8_t *rgba, size_t w, size_t h) {
     CGColorSpaceRef cs = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
     CGDataProviderRef prov = cs ? CGDataProviderCreateWithData(NULL, rgba, w * h * 4, NULL) : NULL;
@@ -125,6 +131,46 @@ static int album_write_png(const char *path, const uint8_t *rgba, size_t w, size
     if (cs) CGColorSpaceRelease(cs);
     return ok;
 }
+#else
+// ImageIO is Apple's: the same picture (8-bit RGB, the alpha byte skipped as kCGImageAlphaNoneSkipLast skips it) as a PNG of uncompressed deflate blocks, which every PNG reader
+// takes: larger than ImageIO's file (about 6 MB for 1920x1080), written once per screenshot. 1 when written
+static uint32_t png_crc(uint32_t c, const uint8_t *p, size_t n) {
+    static uint32_t t[256];
+    if (!t[1]) for (uint32_t i = 0; i < 256; i++) { uint32_t v = i; for (int k = 0; k < 8; k++) v = v & 1 ? 0xedb88320u ^ (v >> 1) : v >> 1; t[i] = v; }
+    c = ~c; for (size_t i = 0; i < n; i++) c = t[(c ^ p[i]) & 0xff] ^ (c >> 8);
+    return ~c;
+}
+static int png_chunk(FILE *f, const char *type, const uint8_t *data, size_t n) {
+    uint8_t be[4] = {(uint8_t)(n >> 24), (uint8_t)(n >> 16), (uint8_t)(n >> 8), (uint8_t)n};
+    uint32_t c = png_crc(png_crc(0, (const uint8_t *)type, 4), data, n);
+    uint8_t cb[4] = {(uint8_t)(c >> 24), (uint8_t)(c >> 16), (uint8_t)(c >> 8), (uint8_t)c};
+    return fwrite(be, 4, 1, f) == 1 && fwrite(type, 4, 1, f) == 1 && (!n || fwrite(data, n, 1, f) == 1) && fwrite(cb, 4, 1, f) == 1;
+}
+static int album_write_png(const char *path, const uint8_t *rgba, size_t w, size_t h) {
+    if (!w || !h || w > 0x7fffffff || h > 0x7fffffff) return 0;
+    size_t row = 1 + w * 3, raw = row * h, nblk = (raw + 65534) / 65535, zn = 2 + raw + nblk * 5 + 4;
+    uint8_t *z = malloc(zn), *line = malloc(row);
+    FILE *f = z && line ? fopen(path, "wb") : NULL;
+    int ok = f != NULL;
+    if (ok) {
+        static const uint8_t sig[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+        uint8_t ihdr[13] = {(uint8_t)(w >> 24), (uint8_t)(w >> 16), (uint8_t)(w >> 8), (uint8_t)w, (uint8_t)(h >> 24), (uint8_t)(h >> 16), (uint8_t)(h >> 8), (uint8_t)h, 8, 2, 0, 0, 0};
+        size_t o = 0, left = raw, a1 = 1, a2 = 0, blk = 0; z[o++] = 0x78; z[o++] = 0x01;   // zlib: deflate, no dictionary
+        for (size_t y = 0; y < h; y++) {   // each row: filter 0, then RGB
+            line[0] = 0; for (size_t x = 0; x < w; x++) memcpy(line + 1 + x * 3, rgba + (y * w + x) * 4, 3);
+            for (size_t i = 0; i < row; i++) {
+                if (!blk) { blk = left < 65535 ? left : 65535; left -= blk; z[o++] = left ? 0 : 1; z[o++] = (uint8_t)blk; z[o++] = (uint8_t)(blk >> 8); z[o++] = (uint8_t)~blk; z[o++] = (uint8_t)(~blk >> 8); }
+                z[o++] = line[i]; blk--; a1 = (a1 + line[i]) % 65521; a2 = (a2 + a1) % 65521;
+            }
+        }
+        z[o++] = (uint8_t)(a2 >> 8); z[o++] = (uint8_t)a2; z[o++] = (uint8_t)(a1 >> 8); z[o++] = (uint8_t)a1;   // Adler-32
+        ok = fwrite(sig, 8, 1, f) == 1 && png_chunk(f, "IHDR", ihdr, 13) && png_chunk(f, "IDAT", z, o) && png_chunk(f, "IEND", NULL, 0);
+        ok = (fclose(f) == 0) && ok;
+    }
+    free(z); free(line);
+    return ok;
+}
+#endif
 
 static Result album_errno_result(int err) {
     return (err == ENOSPC || err == EDQUOT) ? ALBUM_RES_FULL : ALBUM_RES_UNKNOWN;

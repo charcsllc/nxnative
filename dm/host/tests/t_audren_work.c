@@ -7,21 +7,31 @@
 static void *backing;
 static size_t backing_size;
 static int allocations, frees, fail_alloc;
+// The system's aligned allocation and its release: posix_memalign / free, and on Windows _aligned_malloc / _aligned_free (what hle_audren.c's work_release is there)
+#if defined(_WIN32)
+#include <malloc.h>
+static int sys_memalign(void **p, size_t align, size_t n) { *p = _aligned_malloc(n, align); return *p ? 0 : ENOMEM; }
+#define sys_free _aligned_free
+#else
+#define sys_memalign posix_memalign
+#define sys_free free
+#endif
 static int work_alloc(void **out, size_t align, size_t size) {
     if (fail_alloc) return ENOMEM;
-    int r = posix_memalign(out, align, size);
+    int r = sys_memalign(out, align, size);
     if (!r) { assert(!backing); backing = *out; backing_size = size; allocations++; }
     return r;
 }
 static void work_free(void *p) {
     if (p) { assert(p == backing); backing = NULL; backing_size = 0; frees++; }
-    free(p);
+    sys_free(p);
 }
+// hle_audren.c allocates its local work buffer with posix_memalign and releases it with work_release
 #define posix_memalign work_alloc
-#define free work_free
+#define work_release work_free
 #include "../hle_audren.c"
 #undef posix_memalign
-#undef free
+#undef work_release
 
 enum { SDK_WORK = 0x760000, SERVICE_WORK = 0x61d000 };
 static int opens, starts, joins, closes, fail_open, nested, multi_open, expect_game_event;
@@ -167,7 +177,7 @@ int main(void) {
     assert(h_ar_WorkSize(param) == SDK_WORK);
     memcpy(param, saved, sizeof param);
     assert(h_ar_WorkSize(param) == SERVICE_WORK);
-    void *work; assert(!posix_memalign(&work, WORK_PAGE, SDK_WORK));
+    void *work; assert(!sys_memalign(&work, WORK_PAGE, SDK_WORK));
     memset(work, 0xa5, SDK_WORK);
     void *handle[2], *event[8]; game_event = event;
     for (int route = 0; route < 4; route++) {   // no event, event, nested open, event kept in the handle (SDK 3 to 12)
@@ -235,7 +245,7 @@ int main(void) {
     h_ar_Close(handle[0], handle[1]);
     assert(joins == j_before && !g_ar[0].handle[0] && !g_ar[0].manual && event_destroys == d_before);
     // Coexistence: explicit CPU+manual renderer opened beside an unbound DSP renderer still binds and forwards cleanly.
-    void *work2; assert(!posix_memalign(&work2, WORK_PAGE, SDK_WORK));
+    void *work2; assert(!sys_memalign(&work2, WORK_PAGE, SDK_WORK));
     void *handle2[2];
     multi_open = 1;
     assert(!h_ar_Open0(handle, param, work, SDK_WORK));   // slot 0: manual, no render thread
@@ -252,8 +262,8 @@ int main(void) {
     h_ar_Close(handle2[0], handle2[1]);
     assert(joins == j_before + 1 && !g_ar[1].handle[0]);
     multi_open = 0;
-    free(work2);
-    free(work);
+    sys_free(work2);
+    sys_free(work);
     // The output device notification: a second acquire is refused until a release, which destroys the event as the SDK's does (Nintendo Switch Sports Resort, main+0x3af119c)
     h_ad_NotifyRelease21(notify_event);   // never acquired: nothing to destroy
     assert(notify_destroys == 0);

@@ -1,11 +1,15 @@
 // Clock snapshot arithmetic (hle_time.c, from PR #36): CalculateSpanBetween and CalculateStandardUserSystemClockDifferenceByUser looked up by their mangled names in the real swforce
 // registrations, run on both host snapshot entries and on edited copies; the C library's local-time functions, UTC as on a Switch, against nn::time's local conversion (issue #2784)
 #include "../hle.h"
+#if !defined(_WIN32)
 #include <sys/wait.h>
+#endif
 #include <time.h>
 #include <unistd.h>
-#include <mach-o/getsect.h>
 
+#if !defined(__APPLE__)   // Apple's clock_gettime_nsec_np, read through POSIX clock_gettime
+static uint64_t clock_gettime_nsec_np(clockid_t c) { struct timespec ts; clock_gettime(c, &ts); return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec; }
+#endif
 static uint64_t test_wall_ns, test_steady_ns, test_guest_ns;
 static uint64_t test_clock_gettime_nsec_np(clockid_t clock) {
     if (!test_wall_ns) return clock_gettime_nsec_np(clock);
@@ -25,19 +29,20 @@ static time_t test_time(time_t *out) {
 
 uint64_t guest_ns(void) { return test_wall_ns ? test_guest_ns : clock_gettime_nsec_np(CLOCK_MONOTONIC); }
 static int checks, fails;
-extern const struct mach_header_64 _mh_execute_header;
+PLAT_TABLE_DEFINE(swforce)   // the real forced registrations (on Apple: getsectiondata of __DATA,swforce)
+PLAT_TABLE_DEFINE(swhle)     // and the plain ones
 #define CHECK(c, msg) do { checks++; if (!(c)) { fails++; fprintf(stderr, "FAIL: %s\n", msg); } } while (0)
 static void *hook(const char *name) {
-    unsigned long bytes = 0;
-    const hle_force_ent *e = (const hle_force_ent *)getsectiondata(&_mh_execute_header, "__DATA", "swforce", &bytes);
+    size_t bytes = 0;
+    const hle_force_ent *e = (const hle_force_ent *)plat_table_swforce(&bytes);
     void *fn = NULL; unsigned count = 0;
     for (size_t i = 0; e && i < bytes / sizeof *e; i++) if (!strcmp(e[i].name, name)) { count++; fn = (void *)e[i].fn; }
     CHECK(count == 1 && fn, name);
     return count == 1 ? fn : NULL;
 }
 static void *section_fn(const char *sect, const char *name, unsigned *count) {
-    unsigned long bytes = 0; void *fn = NULL; *count = 0;
-    const hle_ent *e = (const hle_ent *)getsectiondata(&_mh_execute_header, "__DATA", sect, &bytes);   // hle_force_ent and hle_ent both begin {name, fn}
+    size_t bytes = 0; void *fn = NULL; *count = 0;
+    const hle_ent *e = (const hle_ent *)(!strcmp(sect, "swforce") ? plat_table_swforce(&bytes) : plat_table_swhle(&bytes));   // hle_force_ent and hle_ent both begin {name, fn}
     size_t step = !strcmp(sect, "swforce") ? sizeof(hle_force_ent) : sizeof(hle_ent);
     for (size_t i = 0; e && i < bytes / step; i++) { const hle_ent *x = (const hle_ent *)((const char *)e + i * step); if (!strcmp(x->name, name)) { ++*count; fn = x->fn; } }
     return fn;
@@ -52,7 +57,11 @@ static void check_utc_libc(void) {
     const int64_t save = 1794761043;   // Hades II's save header time, 2026-11-15 16:44:03 UTC
     struct tm u; time_t sv = (time_t)save; gmtime_r(&sv, &u);
     CHECK(mk && mk(&u) == save, "mktime of a UTC struct tm gives the time back unchanged (TZ=Asia/Seoul)");
+#if defined(_WIN32)   // Windows' struct tm has no tm_gmtoff (libc_pass.c leaves the guest's field as it was)
+    struct tm l; CHECK(lt && lt(&save, &l) == &l && l.tm_hour == 16 && l.tm_min == 44, "localtime_r is UTC (TZ=Asia/Seoul)");
+#else
     struct tm l; CHECK(lt && lt(&save, &l) == &l && l.tm_hour == 16 && l.tm_min == 44 && l.tm_gmtoff == 0, "localtime_r is UTC (TZ=Asia/Seoul)");
+#endif
     Result (*cal)(CalendarTime *, CalendarAdditionalInfo *, const int64_t *) = hook("_ZN2nn4time14ToCalendarTimeEPNS0_12CalendarTimeEPNS0_22CalendarAdditionalInfoERKNS0_9PosixTimeE");
     CalendarTime ct; CalendarAdditionalInfo ai;
     CHECK(cal && cal(&ct, &ai, &save) == RES_OK && ct.day == 16 && ct.hour == 1 && ct.minute == 44 && ai.offset == 9 * 3600, "ToCalendarTime converts in the host zone (01:44 KST)");
@@ -68,6 +77,8 @@ void *guest_sym(const char *name) {
 }
 static void put64(uint8_t *s, int off, int64_t v) { memcpy(s + off, &v, 8); }
 static int64_t get64(const uint8_t *s, int off) { int64_t v; memcpy(&v, s + off, 8); return v; }
+// Each phase runs in a fresh process (a child), whose clock context is not set yet: POSIX only (Windows has no fork; the checks run on Linux and Apple)
+#if !defined(_WIN32)
 static void check_sample_phase(uint64_t phase) {
     const int64_t offset = 1794821231;
     pid_t pid = fork();
@@ -105,9 +116,12 @@ static void check_sample_phase(uint64_t phase) {
     CHECK(!(result & 8), "a backwards wall-clock adjustment beyond the threshold is reported");
     CHECK(!(result & 16), "elapsed time with suspended guest ticks does not change the user clock");
 }
+#endif
 int main(void) {
+#if !defined(_WIN32)
     check_sample_phase(250000000ull);
     check_sample_phase(750000000ull);
+#endif
     Result (*snap)(uint8_t *) = hook("_ZN2nn4time13ClockSnapshot29CreateWithStandardSystemClockEPS1_");
     Result (*adj_snap)(uint8_t *) = hook("_ZN2nn4time13ClockSnapshot31CreateWithAdjustableSystemClockEPS1_");
     unsigned (*span)(int64_t *, const uint8_t *, const uint8_t *) = hook("_ZN2nn4time20CalculateSpanBetweenEPNS_8TimeSpanERKNS0_13ClockSnapshotES5_");

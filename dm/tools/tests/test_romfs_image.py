@@ -6,7 +6,9 @@ import shutil
 import shlex
 import struct
 import subprocess
+import sys
 import tempfile
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
@@ -15,6 +17,14 @@ REPO = Path(__file__).resolve().parents[3]
 spec = importlib.util.spec_from_file_location('romfs_image', REPO / 'dm/tools/romfs_image.py')
 assert spec is not None and spec.loader is not None
 image = importlib.util.module_from_spec(spec); spec.loader.exec_module(image)
+spec = importlib.util.spec_from_file_location('romfs', REPO / 'dm/tools/romfs.py')   # the readers' view of an image (bounded entry reads)
+assert spec is not None and spec.loader is not None
+romfs = importlib.util.module_from_spec(spec); spec.loader.exec_module(romfs)
+
+# The validator is the host's own reader (dm/host/romfs_image.h) built as a program, with the first of cc, clang and gcc on PATH (the chain image has clang only).
+# Without one the checks that run it skip; the packer's own round trips still run
+C_COMPILER = next((c for c in ('cc', 'clang', 'gcc') if shutil.which(c)), None)
+NO_C_COMPILER = 'no C compiler (cc, clang or gcc on PATH) to build the host\'s romfs_image.h validator'
 
 
 class Images(unittest.TestCase):
@@ -25,10 +35,11 @@ class Images(unittest.TestCase):
         root = Path(cls.tools.name)
         source = root / 'validate.c'
         source.write_text('#include "romfs_image.h"\nint main(int argc, char **argv) {\n'
-                          'if (argc != 2) return 2; romfs_img *m = romfs_image_open(argv[1]);\n'
-                          'if (!m) return 1; romfs_image_close(m); return 0; }\n')
+                          '    if (argc != 2) return 2;\n    romfs_img *m = romfs_image_open(argv[1]);\n'
+                          '    if (!m) return 1;\n    romfs_image_close(m);\n    return 0;\n}\n')
         cls.validator = root / 'validate'
-        subprocess.run(['cc', '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-I', str(REPO / 'dm/host'),
+        if not C_COMPILER: cls.validator = None; return
+        subprocess.run([C_COMPILER, '-std=gnu11', '-Wall', '-Wextra', '-Werror', '-I', str(REPO / 'dm/host'),
                         str(source), '-o', str(cls.validator)], check=True)
 
     def setUp(self):
@@ -38,6 +49,7 @@ class Images(unittest.TestCase):
         self.dst = self.root / 'romfs.img'
 
     def valid(self):
+        if not self.validator: self.skipTest(NO_C_COMPILER)
         return subprocess.run([str(self.validator), str(self.dst)]).returncode == 0
 
     def content(self, name):
@@ -126,6 +138,7 @@ class Images(unittest.TestCase):
         self.assertEqual(self.dst.read_bytes(), original)
         self.assertFalse(Path(str(self.dst) + '.part').exists())
 
+    @unittest.skipUnless(sys.platform == 'darwin', 'scripts/push_romfs.sh is the Mac\'s iPhone push (xcrun devicectl; BSD stat -f %z)')
     def test_push_helper_refreshes_cache_and_propagates_copy_failure(self):
         resources = self.root / 'resources.env'
         resources.write_text('DM_RESOURCE_ROMFS=' + shlex.quote(str(self.src)) + '\n')
@@ -158,6 +171,53 @@ class Images(unittest.TestCase):
         image.pack(self.src, self.dst)
         self.assertTrue(self.valid()); self.assertEqual(self.content('A'), b'upper')
         self.assertEqual(self.content('a'), b'lower')
+
+    def test_entry_reads_without_pread(self):
+        """romfs.py's bounded entry reads where os.pread does not exist (Windows): a seek and a read under the file's lock, the same bytes as with pread, from
+        several threads at once on one reader and on several"""
+        data = bytes(range(256)) * 300
+        (self.src / 'data').mkdir(); (self.src / 'data/blob').write_bytes(data); (self.src / 'data/other').write_bytes(b'x' * 1000)
+        image.pack(self.src, self.dst)
+        def read_all(path, chunks):
+            out = []
+            with romfs.open(self.dst / path, 'rb', buffering=0) as f:
+                for off, n in chunks:
+                    f.seek(off); out.append(f.read(n))
+            return out
+        chunks = [(0, 10), (len(data) - 5, 100), (12345, 4096), (len(data) + 7, 3)]
+        want = [data[o:o + n] for o, n in chunks]
+        with_pread = read_all('data/blob', chunks)
+        self.assertEqual(with_pread, want)
+        with patch.object(romfs, '_pread', None):
+            self.assertEqual(read_all('data/blob', chunks), want)
+            self.assertEqual(read_all('data/other', [(0, 2000)]), [b'x' * 1000], 'an entry read stops at its end')
+            with romfs.open(self.dst / 'data/blob', 'rb', buffering=0) as shared:
+                errors = []
+                def worker(k):
+                    try:
+                        for i in range(200):
+                            off = (k * 7919 + i * 131) % (len(data) - 64)
+                            got = romfs._read_at(shared.fd, 64, shared.start + off, shared.lock)
+                            if got != data[off:off + 64]: errors.append((k, i))
+                    except Exception as e:   # noqa: BLE001 (any failure fails the test below)
+                        errors.append(e)
+                threads = [threading.Thread(target=worker, args=(k,)) for k in range(4)]
+                for t in threads: t.start()
+                for t in threads: t.join()
+                self.assertEqual(errors, [], 'reads of one descriptor from four threads, each seeking under the lock')
+
+    def test_resolve_windows_separators(self):
+        """romfs.py's _resolve on Windows (os.altsep set): a path with backslashes, or both separators, still names the image and the entry inside it"""
+        (self.src / 'data').mkdir(); (self.src / 'data/blob').write_bytes(b'blob')
+        image.pack(self.src, self.dst)
+        posix = str(self.dst / 'data' / 'blob')
+        with patch.object(romfs._os, 'altsep', '/'), patch.object(romfs._os.path, 'abspath', lambda p: p):
+            for form in (posix.replace('/', '\\'), posix.replace('/data/', '\\data\\')):
+                with self.subTest(form=form):
+                    resolved = romfs._resolve(form)
+                    self.assertIsNotNone(resolved, 'the image is found through either separator')
+                    self.assertEqual(resolved[1], 'data/blob')
+        self.assertEqual(romfs._resolve(posix)[1], 'data/blob')
 
     def test_dump_tool_listings_are_left_out(self):   # an FTP dump's .listing in every folder (Nintendo Switch Sports Resort's dump): not a game file
         (self.src / 'Parameter/P').mkdir(parents=True)

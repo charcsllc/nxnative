@@ -1,0 +1,624 @@
+#!/usr/bin/env python3
+"""The discovery test (CTest `discover`): `nxaot discover` over every corpus NRO (dm/tools/aot/corpus, corpus.tsv), compared with the full symbol
+table of the NRO's ELF (corpus/nro/<nro>.syms.tsv: every STT_FUNC symbol, local ones included, and the assembler's mapping symbols), twice:
+with the NRO's own DT_SYMTAB as a source (`symbols`; its exported functions) and with no symbol as a source (`--symbols-as-oracle`, `oracle`).
+
+  test_discover.py --nxaot <path to nxaot> --work <scratch folder>
+
+Checks, per NRO and mode:
+- every STT_FUNC symbol of .symtab is the start of a discovered function (0 missed);
+- no discovered entry lies inside another symbol's range (a function split) and every discovered entry has a symbol (an extra would have to be
+  explained here: there is none in this corpus);
+- sizes: the discovered size is the walk's extent, the symbol's size is the assembler's; they are compared as equal, or shorter by trailing
+  words that are padding or traps (nop, zero, brk, udf: after a call that does not return, or alignment), and must never be longer;
+- the coverage reports 0 uncovered words outside data blocks and 0 undefined words inside functions;
+- every `$d` mapping symbol in the text lies in a data block the loader found (the NRO header, MOD0);
+- the switch program has no br left for the dispatcher: every one is a jump table; fnptr's cleanup landing pads are found; excl's exclusive
+  windows include an ABA-sensitive one; except-gcc's CFA interpreter (rt/unwind.c), a switch in a loop whose table base is set before the
+  loop and whose cases call memcpy, is a halfword table of 47 entries.
+It prints one row per NRO and mode: functions by primary provenance, jump tables by entry width, the brs left, windows, summary classes.
+
+Then the jump tables of a module written word by word (hand_tables below; README.md, "Module loader and discovery"): each form compilers emit
+for a switch whose index is computed from more than one value (a bit field of a product, the case offset of a sum, a mask of an exclusive or,
+a shifted sum compared on its low half), with byte, halfword and word entries, signed and unsigned, an `adr` base and a table-relative one,
+and the forms of README.md's "Unbounded brs by form" (a compare whose b.hi lies in another block, an index masked with `and x, #0xff` or
+`#0xffffffff` and compared as a narrower value, an index bounded on a path past a blr), must be a jump table with exactly its cases, index by
+index; and each unsound look-alike (the compare on another register, a compare that a path to the load goes around, the index changed by
+another value after its compare or its mask, a compare of the low half of a 64-bit index, a signed compare, a blr between the compare and the
+load) must stay a br for the dispatcher.
+The guarded cases from a function's own code (README.md, "Static cases of a br left to the dispatcher"): a table whose base a blr before its compare
+makes unknown, and one read by an index nothing bounds, each give a `guess` row of exactly their cases and stay brs (none with --no-guess); a guess
+that lands in the region of the function's other table, which would then no longer be derived, is withdrawn, and the function's rows are those of a
+discovery without guesses.
+Exit 0 when every check passes.
+"""
+import argparse
+import hashlib
+import os
+import re
+import struct
+import subprocess
+import sys
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CORPUS = os.path.join(HERE, '..', 'corpus')
+NOP = 0xD503201F
+
+
+def is_pad_or_trap(w):
+    return w in (NOP, 0) or (w & 0xFFE0001F) in (0xD4200000, 0xD4400000) or (w >> 16) == 0
+
+
+def symbols(path):
+    funcs, data_maps = {}, []
+    with open(path) as f:
+        for line in f:
+            if line.startswith('#'):
+                continue
+            value, size, kind, bind, name = line.rstrip('\n').split('\t')
+            value, size = int(value, 16), int(size, 16)
+            if kind == 'func':
+                if value not in funcs or bind != 'local':
+                    funcs[value] = (size, name)
+            elif kind == 'map' and name.startswith('$d'):
+                data_maps.append(value)
+    return funcs, data_maps
+
+
+def discover(nxaot, nro, tsv, oracle):
+    cmd = [nxaot, 'discover', nro, '--tsv', tsv] + (['--symbols-as-oracle'] if oracle else [])
+    run = subprocess.run(cmd, capture_output=True, text=True)
+    if run.returncode:
+        raise SystemExit(f'{" ".join(cmd)} failed:\n{run.stdout}{run.stderr}')
+    fns, tables, brs, summary, windows = {}, [], [], {}, []
+    with open(tsv) as f:
+        for line in f:
+            r = line.rstrip('\n').split('\t')
+            if r[0] == 'fn':
+                fns[int(r[1], 16)] = {'size': int(r[2], 16), 'prov': r[4], 'class': r[14], 'name': r[17]}
+            elif r[0] == 'jt':
+                tables.append({'br': int(r[1], 16), 'width': int(r[4]), 'count': int(r[9])})
+            elif r[0] == 'br':
+                brs.append((int(r[1], 16), r[4]))
+            elif r[0] == 'win':
+                windows.append(r[4])
+            elif r[0] == 'summary':
+                summary[r[1]] = dict(zip(r[2::2], r[3::2]))
+    return fns, tables, brs, summary, windows
+
+
+def data_blocks(nxaot, nro):
+    run = subprocess.run([nxaot, 'module', nro], capture_output=True, text=True, check=True)
+    return [(int(r.split('\t')[1], 16), int(r.split('\t')[2], 16)) for r in run.stdout.splitlines() if r.startswith('data\t')]
+
+
+# ---------- Jump tables of a module written word by word ----------
+# The A64 encodings, each checked with llvm-mc-18 (nxnative-aot image), as gen_bench.py's are
+
+def _rel(off, bits):
+    return (off >> 2) & ((1 << bits) - 1)
+
+
+HI, HS, GT, RET = 8, 2, 12, 0xD65F03C0
+def e_b(off): return 0x14000000 | _rel(off, 26)
+def e_bl(off): return 0x94000000 | _rel(off, 26)
+def e_bcond(cond, off): return 0x54000000 | _rel(off, 19) << 5 | cond                    # b.<cond>: 2 hs, 8 hi, 12 gt
+def e_cbz(rt, off): return 0xB4000000 | _rel(off, 19) << 5 | rt                         # cbz xt
+def e_br(rn): return 0xD61F0000 | rn << 5
+def e_movz(rd, imm): return 0xD2800000 | imm << 5 | rd                                  # movz xd, #imm
+def e_adr(rd, off): return 0x10000000 | (off & 3) << 29 | ((off >> 2) & 0x7FFFF) << 5 | rd
+def e_adrp(rd, pages): return 0x90000000 | (pages & 3) << 29 | ((pages >> 2) & 0x7FFFF) << 5 | rd
+def e_addi(rd, rn, imm): return 0x91000000 | imm << 10 | rn << 5 | rd                  # add xd, xn, #imm
+def e_subi_w(rd, rn, imm): return 0x51000000 | imm << 10 | rn << 5 | rd               # sub wd, wn, #imm
+def e_add(rd, rn, rm, lsl=0): return 0x8B000000 | rm << 16 | lsl << 10 | rn << 5 | rd  # add xd, xn, xm, lsl #lsl
+def e_add_w(rd, rn, rm): return 0x0B000000 | rm << 16 | rn << 5 | rd                   # add wd, wn, wm
+def e_add_ext(rd, rn, rm, option, sh): return 0x8B200000 | rm << 16 | option << 13 | sh << 10 | rn << 5 | rd  # add xd, xn, wm, uxtb (0) / sxth (5) #sh
+def e_eor(rd, rn, rm): return 0xCA000000 | rm << 16 | rn << 5 | rd
+def e_mul(rd, rn, rm): return 0x9B007C00 | rm << 16 | rn << 5 | rd                     # mul xd, xn, xm
+def e_ubfx(rd, rn, lsb, width): return 0xD3400000 | lsb << 16 | (lsb + width - 1) << 10 | rn << 5 | rd
+def e_and_ones(rd, rn, ones): return 0x92400000 | (ones - 1) << 10 | rn << 5 | rd      # and xd, xn, #(2^ones - 1)
+def e_cmpi(rn, imm): return 0xF100001F | imm << 10 | rn << 5                           # cmp xn, #imm
+def e_cmpi_w(rn, imm): return 0x7100001F | imm << 10 | rn << 5                         # cmp wn, #imm
+def e_ldrb(rt, rn, rm): return 0x38606800 | rm << 16 | rn << 5 | rt                    # ldrb wt, [xn, xm]
+def e_ldrb_uxtw(rt, rn, rm): return 0x38604800 | rm << 16 | rn << 5 | rt               # ldrb wt, [xn, wm, uxtw]
+def e_ldrh_uxtw(rt, rn, rm): return 0x78605800 | rm << 16 | rn << 5 | rt               # ldrh wt, [xn, wm, uxtw #1]
+def e_ldrsw(rt, rn, rm): return 0xB8A07800 | rm << 16 | rn << 5 | rt                   # ldrsw xt, [xn, xm, lsl #2]
+
+
+class HandModule:
+    """A behaviour image of functions written word by word, with no symbol and no FDE: word 0 branches over word +4 (a data word, as an NRO's
+    MOD0 offset) to main, which calls every function; the jump tables in read-only data; its manifest beside it (src/module/manifest.h). A word
+    is a number or a function of (its address, the address of a label)"""
+    PAGE = 0x1000
+
+    def __init__(self):
+        self.words, self.labels, self.tables = [e_b(8), 0], {}, []
+
+    def label(self, name):
+        self.labels[name] = 4 * len(self.words)
+
+    def emit(self, *words):
+        self.words.extend(words)
+
+    def table(self, name, width, count, entries):
+        """A table of count entries of width bytes at label name: entries(address of a label, the table's address) -> the entries"""
+        self.tables.append((name, width, count, entries))
+
+    def write(self, folder, name):
+        text = 4 * len(self.words)
+        ro_off = -(-text // self.PAGE) * self.PAGE
+        ro, at = bytearray(), []
+        for tname, width, count, _ in self.tables:
+            ro += bytes(-len(ro) % 8)
+            self.labels[tname] = ro_off + len(ro)
+            at.append(len(ro))
+            ro += bytes(width * count)
+        addr = self.labels.__getitem__
+        for (tname, width, count, entries), off in zip(self.tables, at):
+            values = entries(addr, addr(tname))
+            assert len(values) == count
+            for i, v in enumerate(values):
+                ro[off + i * width:off + (i + 1) * width] = (v & ((1 << 8 * width) - 1)).to_bytes(width, 'little')
+        code = b''.join(struct.pack('<I', w(4 * i, addr) if callable(w) else w) for i, w in enumerate(self.words))
+        data_off = -(-(ro_off + len(ro)) // self.PAGE) * self.PAGE
+        image = code + bytes(ro_off - text) + ro + bytes(data_off - ro_off - len(ro)) + bytes(8)
+        with open(os.path.join(folder, name + '.image.bin'), 'wb') as f:
+            f.write(image)
+        manifest = os.path.join(folder, name + '.aot.tsv')
+        with open(manifest, 'w') as f:
+            f.write(f'# nxaot-manifest 1\tmain\t{hashlib.sha1(image).hexdigest()}\t{hashlib.sha256(image).hexdigest()}\n'
+                    f'layout\ttext_end\t{ro_off:#x}\tro_off\t{ro_off:#x}\tdata_off\t{data_off:#x}\tbss\t0x0\timage_size\t{len(image):#x}\n'
+                    'data\t0x4\t0x8\n')
+        return manifest
+
+
+# Each case: (name, what the switch is, how many cases, the body's builder). A builder emits the function at label name and returns the label
+# of its br and, for a form that must be bounded, the entries' width, whether they are signed, and the label each index reaches; for a
+# look-alike, None. The functions read x0, x1 and x2; case k returns k + 1; default returns 0xffff
+def _cases(m, name, n):
+    for k in range(n):
+        m.label(f'{name}.case{k}')
+        m.emit(e_movz(0, k + 1), RET)
+    m.label(f'{name}.default')
+    m.emit(e_movz(0, 0xffff), RET)
+
+
+def _adrp_add(m, rd, table):
+    m.emit(lambda pc, A: e_adrp(rd, (A(table) >> 12) - (pc >> 12)), lambda pc, A: e_addi(rd, rd, A(table) & 0xFFF))
+
+
+def _to(cond, label):
+    return lambda pc, A: e_bcond(cond, A(label) - pc)
+
+
+def _byte_dispatch(m, name, index, n):
+    """adrp x11 / add x11 (the table); adr x12 (the base: case 0); ldrb w13, [x11, <index>]; add x12, x12, x13, lsl #2; br x12, then the cases"""
+    _adrp_add(m, 11, f'{name}.table')
+    m.emit(lambda pc, A: e_adr(12, A(f'{name}.case0') - pc), e_ldrb(13, 11, index), e_add(12, 12, 13, 2))
+    m.label(f'{name}.br')
+    m.emit(e_br(12))
+    _cases(m, name, n)
+    order = [(5 * i + 3) % n for i in range(n)]  # index i -> case order[i]: not in order, so that the targets' order is checked
+    m.table(f'{name}.table', 1, n, lambda A, t: [(A(f'{name}.case{k}') - A(f'{name}.case0')) // 4 for k in order])
+    return [f'{name}.case{k}' for k in order]
+
+
+def form_byte_product(m, name):
+    # clang's and GCC's dense switch over a bit field of a product (gen_bench.py's `switch ((a * b) >> 37 & 31)`): ubfx; cmp; b.hi
+    n = 12
+    m.emit(e_mul(8, 0, 1), e_ubfx(10, 8, 37, 5), e_cmpi(10, n - 1), _to(HI, f'{name}.default'))
+    return f'{name}.br', 1, False, _byte_dispatch(m, name, 10, n)
+
+
+def form_half_offset(m, name):
+    # GCC's signed halfword table over a case offset of a sum (sub, cmp, b.hi on w8, the entry at uxtw #1, added sxth #2), with a case placed
+    # before the base: its entry is negative
+    n = 9
+    m.emit(lambda pc, A: e_b(A(f'{name}.dispatch') - pc))
+    m.label(f'{name}.neg')
+    m.emit(e_movz(0, 100), RET)
+    m.label(f'{name}.dispatch')
+    m.emit(e_add_w(8, 0, 1), e_subi_w(8, 8, 3), e_cmpi_w(8, n - 1), _to(HI, f'{name}.default'))
+    _adrp_add(m, 9, f'{name}.table')
+    m.emit(e_ldrh_uxtw(10, 9, 8), lambda pc, A: e_adr(11, A(f'{name}.case0') - pc), e_add_ext(10, 11, 10, 5, 2))
+    m.label(f'{name}.br')
+    m.emit(e_br(10))
+    _cases(m, name, n)
+    labels = [f'{name}.neg'] + [f'{name}.case{k}' for k in range(1, n)]
+    m.table(f'{name}.table', 2, n, lambda A, t: [(A(lb) - A(f'{name}.case0')) // 4 for lb in labels])
+    return f'{name}.br', 2, True, labels
+
+
+def form_word_relative(m, name):
+    # clang's table-relative word entries (ldrsw, added to the table's own address) over a mask of an exclusive or: no compare, the mask bounds it
+    n = 8
+    m.emit(e_eor(8, 0, 1), e_and_ones(8, 8, 3))
+    _adrp_add(m, 9, f'{name}.table')
+    m.emit(e_ldrsw(10, 9, 8), e_add(10, 9, 10))
+    m.label(f'{name}.br')
+    m.emit(e_br(10))
+    _cases(m, name, n)
+    order = [(3 * i + 1) % n for i in range(n)]
+    m.table(f'{name}.table', 4, n, lambda A, t: [A(f'{name}.case{k}') - t for k in order])
+    return f'{name}.br', 4, True, [f'{name}.case{k}' for k in order]
+
+
+def form_byte_low_half(m, name):
+    # An unsigned byte table over the zero-extended low half of a shifted sum (cmp w8; b.hs; the entry at uxtw, added uxtb #2)
+    n = 6
+    m.emit(e_add(8, 0, 1, 4), e_cmpi_w(8, n), _to(HS, f'{name}.default'))
+    _adrp_add(m, 10, f'{name}.table')
+    m.emit(e_ldrb_uxtw(9, 10, 8), lambda pc, A: e_adr(11, A(f'{name}.case0') - pc), e_add_ext(9, 11, 9, 0, 2))
+    m.label(f'{name}.br')
+    m.emit(e_br(9))
+    _cases(m, name, n)
+    order = [n - 1 - i for i in range(n)]
+    m.table(f'{name}.table', 1, n, lambda A, t: [(A(f'{name}.case{k}') - A(f'{name}.case0')) // 4 for k in order])
+    return f'{name}.br', 1, False, [f'{name}.case{k}' for k in order]
+
+
+def unsound_other_register(m, name):
+    # The compare bounds x2, the table is indexed by x8
+    m.emit(e_eor(8, 0, 1), e_cmpi(2, 11), _to(HI, f'{name}.default'))
+    _byte_dispatch(m, name, 8, 12)
+    return f'{name}.br', None, None, None
+
+
+def unsound_around(m, name):
+    # cbz x2 goes to the table's load around the compare: the bound does not hold on every path to the br
+    m.emit(e_eor(8, 0, 1), lambda pc, A: e_cbz(2, A(f'{name}.load') - pc), e_cmpi(8, 11), _to(HI, f'{name}.default'))
+    m.label(f'{name}.load')
+    _byte_dispatch(m, name, 8, 12)
+    return f'{name}.br', None, None, None
+
+
+def unsound_changed(m, name):
+    # The index bounded by its compare, then another value added to it before the load
+    m.emit(e_eor(8, 0, 1), e_cmpi(8, 11), _to(HI, f'{name}.default'), e_add(8, 8, 2))
+    _byte_dispatch(m, name, 8, 12)
+    return f'{name}.br', None, None, None
+
+
+def unsound_mask_changed(m, name):
+    # The relative word table's form, another value added to the index after its mask
+    m.emit(e_eor(8, 0, 1), e_and_ones(8, 8, 3), e_add(8, 8, 2))
+    _adrp_add(m, 9, f'{name}.table')
+    m.emit(e_ldrsw(10, 9, 8), e_add(10, 9, 10))
+    m.label(f'{name}.br')
+    m.emit(e_br(10))
+    _cases(m, name, 8)
+    m.table(f'{name}.table', 4, 8, lambda A, t: [A(f'{name}.case{k}') - t for k in range(8)])
+    return f'{name}.br', None, None, None
+
+
+def unsound_low_half(m, name):
+    # The low half compared (cmp w8), the whole 64-bit register used as the index
+    m.emit(e_add(8, 0, 1, 4), e_cmpi_w(8, 11), _to(HI, f'{name}.default'))
+    _byte_dispatch(m, name, 8, 12)
+    return f'{name}.br', None, None, None
+
+
+def unsound_signed(m, name):
+    # A signed compare (b.gt): a negative index passes it
+    m.emit(e_eor(8, 0, 1), e_cmpi(8, 11), _to(GT, f'{name}.default'))
+    _byte_dispatch(m, name, 8, 12)
+    return f'{name}.br', None, None, None
+
+
+LS = 9                                                                                   # b.ls
+
+
+def e_tbnz(rt, bit, off): return 0x37000000 | (bit & 0x1F) << 19 | _rel(off, 14) << 5 | rt  # tbnz wt, #bit
+def e_and_ones_w(rd, rn, ones): return 0x12000000 | (ones - 1) << 10 | rn << 5 | rd       # and wd, wn, #(2^ones - 1)
+def e_blr(rn): return 0xD63F0000 | rn << 5
+
+
+def form_cmp_split(m, name):
+    # The compare and its b.hi in different blocks (a tbnz between them): the Z flag reaches b.hi as `(x - C) == 0` (README.md, "Unbounded brs by form")
+    n = 10
+    m.emit(e_subi_w(8, 0, 3), e_cmpi_w(8, n - 1), lambda pc, A: e_tbnz(2, 3, A(f'{name}.default') - pc), _to(HI, f'{name}.default'))
+    return f'{name}.br', 1, False, _byte_dispatch(m, name, 8, n)
+
+
+def form_and_narrow(m, name):
+    # The index `and x8, x0, #0xff`, its compare on `and w9, w0, #0xff`: a narrower value of the same register (libpng's png_set_filter's form)
+    n = 8
+    m.emit(e_and_ones_w(9, 0, 8), e_cmpi_w(9, n - 1), _to(HI, f'{name}.default'), e_and_ones(8, 0, 8))
+    return f'{name}.br', 1, False, _byte_dispatch(m, name, 8, n)
+
+
+def form_and_low32(m, name):
+    # The index `and x8, x0, #0xffffffff`, its compare on w0 (a trunc of the same register)
+    n = 7
+    m.emit(e_cmpi_w(0, n - 1), _to(HI, f'{name}.default'), e_and_ones(8, 0, 32))
+    return f'{name}.br', 1, False, _byte_dispatch(m, name, 8, n)
+
+
+def form_after_blr(m, name):
+    # Bounded on both paths into the table, one of them past a blr whose result it compares: a call with no summary changes everything, and the
+    # region goes on past it (libjpeg's jinit_color_converter's form)
+    n = 6
+    m.emit(lambda pc, A: e_cbz(2, A(f'{name}.viacall') - pc), e_cmpi(0, n - 1), _to(HI, f'{name}.default'),
+           lambda pc, A: e_b(A(f'{name}.dispatch') - pc))
+    m.label(f'{name}.viacall')
+    m.emit(e_blr(3), e_cmpi(0, n - 1), _to(LS, f'{name}.dispatch'), lambda pc, A: e_b(A(f'{name}.default') - pc))
+    m.label(f'{name}.dispatch')
+    return f'{name}.br', 1, False, _byte_dispatch(m, name, 0, n)
+
+
+def unsound_before_blr(m, name):
+    # The index compared, then a blr that may change it: the call's result is unbounded at the br
+    m.emit(e_cmpi(0, 11), _to(HI, f'{name}.default'), e_blr(3))
+    _byte_dispatch(m, name, 0, 12)
+    return f'{name}.br', None, None, None
+
+
+# Guarded cases from the function's own code (README.md, "Static cases of a br left to the dispatcher"): brs no table bounds, each with the cases its
+# guess must give (a `guess` row of exactly those targets) and none of a table. The cases lie between a branch over them and the br, inside the span the
+# function's walk covers (the module has no FDE), as a compiler's switch lies inside its function's FDE
+def guess_cmp_here(m, name):
+    # The table's base set before a call that may change it (a blr: every register for the analysis), the index compared after the call: no table,
+    # the base unknown past the call; the guess takes the call to keep x19..x29 (the calling convention) and bounds the index by its compare
+    n = 5
+    _adrp_add(m, 21, f'{name}.table')
+    m.emit(e_blr(3), e_cmpi(0, n - 1), _to(HI, f'{name}.default'), lambda pc, A: e_b(A(f'{name}.dispatch') - pc))
+    _cases(m, name, n)
+    m.label(f'{name}.dispatch')
+    m.emit(lambda pc, A: e_adr(12, A(f'{name}.case0') - pc), e_ldrb(13, 21, 0), e_add(12, 12, 13, 2))
+    m.label(f'{name}.br')
+    m.emit(e_br(12))
+    order = [(2 * i + 1) % n for i in range(n)]
+    m.table(f'{name}.table', 1, n, lambda A, t: [(A(f'{name}.case{k}') - A(f'{name}.case0')) // 4 for k in order])
+    return f'{name}.br', [f'{name}.case{k}' for k in order]
+
+
+def guess_scan(m, name):
+    # The table read by an index no compare bounds (x0, an argument): no table; the guess reads it from index 0 while its entries land on instructions
+    # of the function, up to the next table (an address the module's code names), the padding before it giving case 0 again
+    n = 4
+    m.emit(lambda pc, A: e_b(A(f'{name}.dispatch') - pc))
+    _cases(m, name, n)
+    m.label(f'{name}.dispatch')
+    _adrp_add(m, 11, f'{name}.table')
+    m.emit(lambda pc, A: e_adr(12, A(f'{name}.case0') - pc), e_ldrb(13, 11, 0), e_add(12, 12, 13, 2))
+    m.label(f'{name}.br')
+    m.emit(e_br(12))
+    order = [n - 1 - i for i in range(n)]
+    m.table(f'{name}.table', 1, n, lambda A, t: [(A(f'{name}.case{k}') - A(f'{name}.case0')) // 4 for k in order])
+    return f'{name}.br', [f'{name}.case{k}' for k in order]
+
+
+def guess_garbage(m, name):
+    # A guess the check withdraws: br1's table, read by an index nothing bounds (x2), holds its two cases and then an entry that lands on the block of br2's
+    # table read (r), then one past the function. With that guess br2's region is entered from br1, whose path carries x1 past br2's compare: br2's
+    # table no longer comes out of its regions, so the guess would make the function lose a table, and the function stays as it is without guesses
+    m.emit(e_cmpi(1, 1), _to(HI, f'{name}.join'))
+    m.label(f'{name}.r')
+    _adrp_add(m, 14, f'{name}.t2')
+    m.emit(lambda pc, A: e_adr(15, A(f'{name}.d0') - pc), e_ldrb(16, 14, 1), e_add(15, 15, 16, 2))
+    m.label(f'{name}.br2')
+    m.emit(e_br(15))
+    m.label(f'{name}.d0')
+    m.emit(e_movz(0, 10), RET)
+    m.label(f'{name}.d1')
+    m.emit(e_movz(0, 20), RET)
+    m.label(f'{name}.join')
+    _adrp_add(m, 11, f'{name}.t1')
+    m.emit(lambda pc, A: e_adr(12, A(f'{name}.r') - pc), e_ldrb(13, 11, 2), e_add(12, 12, 13, 2), lambda pc, A: e_b(A(f'{name}.br1') - pc))
+    m.label(f'{name}.c0')
+    m.emit(e_movz(0, 100), RET)
+    m.label(f'{name}.c1')
+    m.emit(e_movz(0, 200), RET)
+    m.label(f'{name}.br1')
+    m.emit(e_br(12))
+    m.table(f'{name}.t2', 1, 2, lambda A, t: [0, (A(f'{name}.d1') - A(f'{name}.d0')) // 4])
+    m.table(f'{name}.t1', 1, 4, lambda A, t: [(A(f'{name}.c0') - A(f'{name}.r')) // 4, (A(f'{name}.c1') - A(f'{name}.r')) // 4, 0, 0xFF])
+    return f'{name}.br1', f'{name}.br2', [f'{name}.d0', f'{name}.d1']
+
+
+GUESS_FORMS = [('guess_cmp_here', guess_cmp_here), ('guess_scan', guess_scan)]
+
+
+def hand_guesses(nxaot, work, failures):
+    """The guesses of a module of GUESS_FORMS and guess_garbage: each br's guess row its cases exactly, no table; guess_garbage's guess withdrawn (no
+    guess row, br2 a table of its two cases, the discovery line naming one function withdrawn) and its rows those of a discovery without guesses
+    (--no-guess); the brs of GUESS_FORMS with --no-guess have no guess row"""
+    m = HandModule()
+    m.label('main')
+    for name in [n for n, _ in GUESS_FORMS] + ['guess_garbage', 'guess_end']:
+        m.emit(lambda pc, A, name=name: e_bl(A(name) - pc))
+    m.emit(RET)
+    expect = {}
+    for name, build in GUESS_FORMS:
+        while len(m.words) % 4:
+            m.emit(NOP)
+        m.label(name)
+        expect[name] = build(m, name)
+    while len(m.words) % 4:
+        m.emit(NOP)
+    m.label('guess_garbage')
+    br1, br2, d = guess_garbage(m, 'guess_garbage')
+    m.label('guess_end')   # the function after it, where br1's fourth entry lands: no instruction of guess_garbage
+    m.emit(RET)
+    folder = os.path.join(work, 'hand_guess')
+    os.makedirs(folder, exist_ok=True)
+    manifest = m.write(folder, 'guess')
+    rows = {}
+    for mode, extra in (('guess', []), ('no-guess', ['--no-guess'])):
+        tsv = os.path.join(folder, f'guess.{mode}.tsv')
+        run = subprocess.run([nxaot, 'discover', manifest, '--tsv', tsv] + extra, capture_output=True, text=True)
+        if run.returncode:
+            failures.append(f'hand-written guesses ({mode}): nxaot discover failed:\n{run.stdout}{run.stderr}')
+            return
+        r = {'jt': {}, 'br': {}, 'guess': {}, 'fn': {}, 'out': run.stdout}
+        with open(tsv) as f:
+            for line in f:
+                c = line.rstrip('\n').split('\t')
+                if c[0] in ('jt', 'br', 'guess', 'fn'):
+                    r[c[0]][int(c[1], 16)] = c
+        rows[mode] = r
+    g, n = rows['guess'], rows['no-guess']
+    for name, (br_label, labels) in expect.items():
+        br = m.labels[br_label]
+        want = sorted(m.labels[lb] for lb in labels)
+        got = sorted(int(t, 16) for t in g['guess'][br][3].split(',')) if br in g['guess'] else None
+        ok = got == want and br in g['br'] and br not in g['jt'] and br not in n['guess']
+        print(f'hand-written guess {name:<15} at {br:#x}: {"guess " + ",".join(hex(x) for x in got) if got else "no guess"}'
+              f'{"" if br not in n["guess"] else " (and a guess with --no-guess)"}')
+        if not ok:
+            failures.append(f'hand-written guess {name} (br at {br:#x}): a guess of {[hex(x) for x in want]} and no table expected (none with --no-guess), '
+                            f'got {[hex(x) for x in got] if got else "none"}{", a table" if br in g["jt"] else ""}')
+    b1, b2 = m.labels[br1], m.labels[br2]
+    entry = m.labels['guess_garbage']
+    t2 = g['jt'].get(b2)
+    t2_ok = t2 is not None and [int(t, 16) for t in t2[12].split(',')] == [m.labels[lb] for lb in d]
+    same = all(g[k].get(a) == n[k].get(a) for k in ('fn', 'jt', 'br') for a in set(g[k]) | set(n[k]) if a == entry or a in (b1, b2) or
+               (k == 'jt' and int(g[k].get(a, n[k].get(a))[2], 16) == entry))
+    withdrawn = re.search(r"aot: guessed cases: .*; (\d+) functions' guesses withdrawn", g['out'])
+    ok = b1 not in g['guess'] and b1 in g['br'] and t2_ok and same and withdrawn is not None and withdrawn.group(1) == '1'
+    print(f'hand-written guess guess_garbage  at {b1:#x}: {"no guess" if b1 not in g["guess"] else "a guess"}, br2 at {b2:#x} '
+          f'{"a table of its 2 cases" if t2_ok else "not its table"}, rows {"as" if same else "unlike"} --no-guess\'s, '
+          f'{withdrawn.group(1) if withdrawn else "no"} function withdrawn')
+    if not ok:
+        failures.append(f'hand-written guess_garbage: the guess withdrawn expected (no guess row at {b1:#x}, br2 a table of d0 and d1, the function\'s rows '
+                        f'as without guesses, one function withdrawn); got {"a guess row" if b1 in g["guess"] else "no guess row"}, br2 '
+                        f'{"right" if t2_ok else "wrong"}, rows {"same" if same else "different"}, the line {withdrawn.group(0) if withdrawn else "missing"}')
+
+
+HAND_FORMS = [('byte_product', form_byte_product), ('half_offset', form_half_offset), ('word_relative', form_word_relative),
+              ('byte_low_half', form_byte_low_half), ('cmp_split', form_cmp_split), ('and_narrow', form_and_narrow), ('and_low32', form_and_low32),
+              ('after_blr', form_after_blr), ('other_register', unsound_other_register), ('around', unsound_around),
+              ('changed', unsound_changed), ('mask_changed', unsound_mask_changed), ('low_half', unsound_low_half), ('signed', unsound_signed),
+              ('before_blr', unsound_before_blr)]
+
+
+def hand_tables(nxaot, work, failures):
+    """The jump tables of the module of HAND_FORMS: each form bounded with its cases index by index, each look-alike a br for the dispatcher"""
+    m = HandModule()
+    m.label('main')
+    for name, _ in HAND_FORMS:
+        m.emit(lambda pc, A, name=name: e_bl(A(name) - pc))
+    m.emit(RET)
+    expect = {}
+    for name, build in HAND_FORMS:
+        while len(m.words) % 4:
+            m.emit(NOP)
+        m.label(name)
+        expect[name] = build(m, name)
+    folder = os.path.join(work, 'hand')
+    os.makedirs(folder, exist_ok=True)
+    manifest = m.write(folder, 'hand')
+    tsv = os.path.join(folder, 'hand.tsv')
+    run = subprocess.run([nxaot, 'discover', manifest, '--tsv', tsv], capture_output=True, text=True)
+    if run.returncode:
+        failures.append(f'hand-written tables: nxaot discover failed:\n{run.stdout}{run.stderr}')
+        return
+    tables, brs = {}, {}
+    with open(tsv) as f:
+        for line in f:
+            r = line.rstrip('\n').split('\t')
+            if r[0] == 'jt':
+                tables[int(r[1], 16)] = {'width': int(r[4]), 'signed': r[5] == '1', 'targets': [int(t, 16) for t in r[12].split(',')]}
+            elif r[0] == 'br':
+                brs[int(r[1], 16)] = r[4]
+    for name, (br_label, width, signed, labels) in expect.items():
+        br = m.labels[br_label]
+        if width is None:
+            ok = br in brs and br not in tables
+            got = f'br: {brs[br]}' if br in brs else f'a table of {len(tables[br]["targets"])} targets' if br in tables else 'neither'
+        else:
+            want = [m.labels[lb] for lb in labels]
+            t = tables.get(br)
+            ok = t is not None and t['targets'] == want and t['width'] == width and t['signed'] == signed
+            got = (f'a table of {len(t["targets"])} entries, width {t["width"]}, signed {int(t["signed"])}' if t else
+                   f'br: {brs.get(br, "none")}')
+            if t and t['targets'] != want:
+                got += f', targets {[hex(x) for x in t["targets"]]} for {[hex(x) for x in want]}'
+        print(f'hand-written {"table" if width else "look-alike"} {name:<15} at {br:#x}: {got}')
+        if not ok:
+            failures.append(f'hand-written {name} (br at {br:#x}): {"a table with its cases" if width else "a br for the dispatcher"} '
+                            f'expected, got {got}')
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--nxaot', required=True)
+    ap.add_argument('--work', required=True)
+    a = ap.parse_args()
+    os.makedirs(a.work, exist_ok=True)
+    rows = []
+    with open(os.path.join(CORPUS, 'corpus.tsv')) as f:
+        for line in f:
+            if not line.startswith('#') and line.strip():
+                nro, program, toolchain = line.split('\t')[:3]
+                rows.append((nro, program, toolchain))
+    failures = []
+    header = (f'{"nro":<18} {"mode":<7} {"fns":>4} {"provenance (primary)":<44} {"tables b/h/w":>12} {"br":>3} {"windows c/a/l":>13} '
+              f'{"pres/open/nor":>13} {"pads":>4} {"miss":>4} {"extra":>5} {"split":>5} {"sizes =/<":>9} {"uncov":>5}')
+    print(header)
+    for nro, program, toolchain in rows:
+        path = os.path.join(CORPUS, 'nro', nro)
+        image = open(path, 'rb').read()
+        funcs, data_maps = symbols(os.path.join(CORPUS, 'nro', nro[:-4] + '.syms.tsv'))
+        blocks = data_blocks(a.nxaot, path)
+        for addr in data_maps:
+            if not any(lo <= addr < hi for lo, hi in blocks):
+                failures.append(f'{nro}: the $d mapping symbol at {addr:#x} lies in no data block of the loader ({blocks})')
+        ranges = sorted((v, v + s) for v, (s, _) in funcs.items())
+        for mode in ('symbols', 'oracle'):
+            fns, tables, brs, summary, windows = discover(a.nxaot, path, os.path.join(a.work, f'{nro}.{mode}.tsv'), mode == 'oracle')
+            tag = f'{nro} ({mode})'
+            missed = [(v, n) for v, (s, n) in funcs.items() if v not in fns]
+            for v, n in missed:
+                failures.append(f'{tag}: the symbol {n} at {v:#x} is no discovered function')
+            extra = [e for e in fns if e not in funcs]
+            splits = [e for e in fns if any(lo < e < hi for lo, hi in ranges)]
+            for e in extra:
+                failures.append(f'{tag}: the discovered function at {e:#x} ({fns[e]["prov"]}) has no symbol')
+            for e in splits:
+                failures.append(f'{tag}: the discovered function at {e:#x} ({fns[e]["prov"]}) lies inside a symbol\'s range')
+            same = shorter = 0
+            for v, (s, n) in funcs.items():
+                if v not in fns:
+                    continue
+                d = fns[v]['size']
+                if d == s:
+                    same += 1
+                elif d < s and all(is_pad_or_trap(struct.unpack_from('<I', image, p)[0]) for p in range(v + d, v + s, 4)):
+                    shorter += 1
+                else:
+                    failures.append(f'{tag}: {n} at {v:#x}: discovered size {d:#x}, symbol size {s:#x}, and the difference is not padding or traps')
+            cov = summary.get('coverage', {})
+            if cov.get('uncovered') != '0' or cov.get('undefined') != '0':
+                failures.append(f'{tag}: coverage {cov}')
+            if program == 'switch' and brs:
+                failures.append(f'{tag}: brs left for the dispatcher in the switch program: {[f"{b:#x} ({w})" for b, w in brs]}')
+            if nro == 'except-gcc.nro' and not any(t['width'] == 2 and t['count'] == 47 for t in tables):
+                failures.append(f'{tag}: the CFA interpreter\'s switch (a halfword table of 47 entries) is not a jump table: brs {brs}')
+            pads = int(summary.get('discovery', {}).get('landing_pads', '0'))
+            if program == 'fnptr' and pads == 0:
+                failures.append(f'{tag}: no landing pad found in a program built with -fexceptions')
+            if program == 'excl' and 'aba' not in windows:
+                failures.append(f'{tag}: the ABA-sensitive window of the lock-free pop was not found')
+            primary = {}
+            for fn in fns.values():
+                p = fn['prov'].split(',')[0]
+                primary[p] = primary.get(p, 0) + 1
+            prov = ','.join(f'{k}:{primary[k]}' for k in sorted(primary, key=lambda k: -primary[k]))
+            widths = [sum(1 for t in tables if t['width'] == w) for w in (1, 2, 4)]
+            classes = [sum(1 for f in fns.values() if f['class'] == c) for c in ('preserving', 'open', 'noreturn')]
+            wins = [windows.count(k) for k in ('cas', 'aba', 'load')]
+            print(f'{nro:<18} {mode:<7} {len(fns):>4} {prov:<44} {"/".join(map(str, widths)):>12} {len(brs):>3} {"/".join(map(str, wins)):>13} '
+                  f'{"/".join(map(str, classes)):>13} {pads:>4} {len(missed):>4} {len(extra):>5} {len(splits):>5} {f"{same}/{shorter}":>9} '
+                  f'{cov.get("uncovered", "?"):>5}')
+    hand_tables(a.nxaot, a.work, failures)
+    hand_guesses(a.nxaot, a.work, failures)
+    for line in failures:
+        print('FAIL ' + line)
+    print(f'discover test: {len(rows)} NROs, 2 modes each, {len(HAND_FORMS)} hand-written switches, {len(GUESS_FORMS) + 1} hand-written guesses, '
+          f'{len(failures)} failures')
+    return 1 if failures else 0
+
+
+if __name__ == '__main__':
+    sys.exit(main())

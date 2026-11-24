@@ -10,8 +10,9 @@
 static int heap_mprotect(void *addr, size_t size, int prot);
 static void *heap_mmap(void *addr, size_t size, int prot, int flags, int fd, off_t offset);
 static _Noreturn void heap_abort(void);
-// Substitution is confined to this translation unit; production needs no test API.
-#define mprotect heap_mprotect
+// Substitution is confined to this translation unit; production needs no test API. hle_svc.c changes protections through plat_vm_protect (mprotect on POSIX)
+#define plat_vm_protect heap_mprotect
+#define mprotect heap_mprotect   // Apple's guest_release keeps upstream's mprotect / mmap
 #define mmap heap_mmap
 #define abort heap_abort
 #ifndef HLE_SVC_SOURCE
@@ -19,6 +20,7 @@ static _Noreturn void heap_abort(void);
 #endif
 #include HLE_SVC_SOURCE
 #undef abort
+#undef plat_vm_protect
 #undef mprotect
 #undef mmap
 
@@ -45,6 +47,15 @@ uint64_t guest_ns(void) { return 0; }
 uint64_t guest_ticks(void) { return 0; }
 uint64_t dm_entropy64(void) { return 0; }
 int thr_limit_used(void) { return 0; }
+#if !DM_NATIVE_EXEC
+// The x86-64 execution engine's side of hle_svc.c: the guest block from its arena (here a plain reservation, as before), no user exception context and no
+// main-thread guest stack in this fixture
+void *dm_guest_reserve(size_t n) { return plat_vm_reserve(n); }
+void *dm_guest_alloc(size_t n) { (void)n; abort(); }
+int dm_aot_main_stack(uint64_t *lo, uint64_t *size) { (void)lo; (void)size; return 0; }
+void be_guest_map(void *mem, uint64_t size) { (void)mem; (void)size; }     // the graphics backend's view of guest memory (t_guest_map counts the calls)
+void be_guest_unmap(void *mem, uint64_t size) { (void)mem; (void)size; }
+#endif
 int dm_ue_heap_owns(uint64_t a, uint64_t n) { (void)a; (void)n; return 0; } // No Unreal allocator is installed in this fixture.
 void dm_guest_write_prepare(void *addr, size_t size) { (void)addr; (void)size; }
 // This fixture calls the SVC dispatcher directly, without rewritten guest gates.
@@ -63,7 +74,7 @@ static int heap_mprotect(void *addr, size_t size, int prot) {
     // The production state must not be published before the host operation.
     assert(g_heap_cur == old_size && regs[0] == sentinel && regs[1] == requested);
     if (injected_error) { errno = injected_error; return -1; }
-    return mprotect(addr, size, prot);
+    return plat_vm_protect(addr, size, prot);
 }
 static void *heap_mmap(void *addr, size_t size, int prot, int flags, int fd, off_t offset) {
     if (flags & MAP_FIXED) {
@@ -76,7 +87,13 @@ static void *heap_mmap(void *addr, size_t size, int prot, int flags, int fd, off
 }
 static int correct_call(void) {
     int grow = requested > old_size;
+#if DM_NATIVE_EXEC
     return calls == (grow || injected_map_error ? 1 : 0) && map_calls == (grow ? 0 : 1) &&
+#else
+    // The x86-64 engine's guest_release (hle_svc.c): the shrink's pages go inaccessible and are discarded (plat_vm_discard), with no replacement mapping, so a shrink
+    // is one protection change, as a growth is, and an injected replacement failure changes nothing
+    return calls == 1 && map_calls == 0 &&
+#endif
         last_addr == g_heap + (grow ? old_size : requested) &&
         last_size == (grow ? requested - old_size : old_size - requested) &&
         last_prot == (grow ? PROT_READ | PROT_WRITE : PROT_NONE);
@@ -125,6 +142,7 @@ static void used_memory(size_t heap_size) {
     assert(svc_dispatch(0x29, r, 0) == 0);
     assert(r[0] == 0 && r[1] == heap_size + DM_GAME_MEM_USED);
 }
+__attribute__((weak)) int dm_sdk_ounce(void) { return 0; }   // loader.c: a Switch 1 SDK (hle_svc.c's alias region and pool rule)
 int main(void) {
     mem_init();
     page = (size_t)getpagesize(); g_heap_cap = 4 * page;

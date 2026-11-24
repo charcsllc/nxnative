@@ -47,7 +47,9 @@ static int g_test_pinned;   // t_live_pinned: a frozen or DM_DETCLOCK guest cloc
 uint64_t guest_ns_at_host_time(uint64_t host_ns) { return g_test_pinned ? guest_now : host_ns + guest_now - motion_now; }   // the two test clocks: host now is guest now
 int guest_clock_pinned(void) { return g_test_pinned; }
 static uint64_t test_frame;   // presented frames (t_rec moves it)
-uint64_t dm_guest_frame(void) { return test_frame; }
+// An atomic read, as hle_os.c's: t_frame_hold's ticker thread presents frames while ctl_hold polls, and a plain read in that loop (whose usleep does nothing here) may be
+// read once and the wait never end
+uint64_t dm_guest_frame(void) { return __atomic_load_n(&test_frame, __ATOMIC_SEQ_CST); }
 // The touchscreen as the game would read it: the first finger, and whether one was put down since the last read (a touch's Start is reported once, hle_touch.c)
 static int touch_down, touch_new, touch_downs; static float touch_x, touch_y;
 static void touch_to(const dm_touch *t, int n) { if (n > 0) { touch_new |= !touch_down; touch_downs += !touch_down; touch_x = t[0].x; touch_y = t[0].y; } touch_down = n > 0; }
@@ -66,6 +68,7 @@ int touch_fill_n(void *out, int max, uint64_t now, int points) {
 }
 int gesture_fill(void *out, int n, uint64_t now) { (void)out; (void)n; (void)now; return 0; }
 void dm_gfx_shot_at(long frame, const char *path) { (void)frame; (void)path; }
+void crash_dump_now(const char *why) { (void)why; }
 void hle_bind_system_event(void *g, int autoclear) { (void)g; (void)autoclear; }
 void hle_signal_system_event(void *g) { g_signalled = g; g_signals++; }
 int hle_signal_bound_system_event(void *g) { g_signalled = g; g_signals++; return 1; }
@@ -76,12 +79,12 @@ void dm_gfx_restop(void) {}
 void dm_gfx_memtrim(void) {}
 void dm_gfx_texraw(uint64_t serial, const char *path) { (void)serial; (void)path; }
 void dm_ctl_peek(uint64_t a, int n) { (void)a; (void)n; }
-void crash_dump_now(const char *why) { (void)why; }
 void dm_ctl_memdump(uint64_t a, uint64_t n, const char *path) { (void)a; (void)n; (void)path; }
 void dm_ctl_cvar_i32(uint64_t off, int32_t v) { (void)off; (void)v; }
 void dm_ctl_cvar_f32(uint64_t off, float v) { (void)off; (void)v; }
 void dm_gfx_texdump_next(const char *path) { (void)path; }
 void dm_gfx_passdump_next(long n) { (void)n; }
+int dm_aot_profile_mark(const char *path) { (void)path; return 0; }
 void dm_gfx_addr_note(uint64_t a, char *note, size_t n) { (void)a; if (n) note[0] = 0; }   // DM_CTL "addr" (nvn_mtl.m)
 void dm_gfx_bufsnap(const char *key, uint64_t a, size_t n, const char *path) { (void)key; (void)a; (void)n; (void)path; }   // DM_CTL "bufsnap" (nvn_mtl.m)
 void probe_atrace(uint64_t lo, uint64_t n) { (void)lo; (void)n; }   // DM_CTL "atrace" (probe.c)
@@ -233,6 +236,55 @@ static void t_npads(void) {
     h_hid_ShowCtrl(info, NULL);
     CHECK(info[0] == 2 && info[1] == NPAD_HANDHELD, "handheld: the applet selects the handheld controller");
 }
+
+#if !defined(__APPLE__)   // Apple's hosts still ignore DisconnectNpad (hle_hid.c h_hid_Disconnect)
+// nn::hid::DisconnectNpad: the npad has no controller until its player presses a button that was not down at the disconnect (no sooner than RECONNECT_NS after it)
+// or the controller applet runs; Handheld and an npad without a controller are left alone
+static void t_disconnect(void) {
+    static uint8_t ev0[0x40], ev1[0x40]; int32_t info[2];
+    g_mode = 1; ids((const uint32_t[]){0, 1, NPAD_HANDHELD}, 3); dm_pad_players(0x3);
+    dm_input_set(0, 0, 0, 0, 0); dm_pad_set(DM_BTN_A, 0, 0, 0, 0); dm_pad_set_player(1, 0, 0, 0, 0, 0);
+    h_hid_BindStyleEv(&(uint32_t){0}, ev0, 0); h_hid_BindStyleEv(&(uint32_t){1}, ev1, 0);
+    CHECK(buttons_of(0, STYLE_FULLKEY) == DM_BTN_A, "player 1 holds A on No1");
+    g_signals = 0; h_hid_Disconnect(&(uint32_t){0});
+    CHECK(h_hid_GetStyle(&(uint32_t){0}) == 0 && buttons_of(0, STYLE_FULLKEY) == 0, "a disconnected npad has no controller: no style, no state");
+    CHECK(g_signals == 1 && g_signalled == ev0, "the npad's style event is signalled at the disconnect");
+    h_hid_Disconnect(&(uint32_t){0});
+    CHECK(g_signals == 1, "a second disconnect of the same npad does nothing");
+    CHECK(h_hid_GetStyle(&(uint32_t){1}) == STYLE_FULLKEY, "the other player's npad keeps its controller");
+    motion_now += 2 * (uint64_t)RECONNECT_NS;
+    CHECK(h_hid_GetStyle(&(uint32_t){0}) == 0, "the button held since the disconnect does not connect the controller again");
+    dm_pad_set(0, 0, 0, 0, 0); CHECK(h_hid_GetStyle(&(uint32_t){0}) == 0, "releasing it neither");
+    dm_pad_set(DM_BTN_A, 0, 0, 0, 0);
+    CHECK(h_hid_GetStyle(&(uint32_t){0}) == STYLE_FULLKEY && g_signals == 2 && g_signalled == ev0, "a new press connects it again and signals the style event");
+    CHECK(buttons_of(0, STYLE_FULLKEY) == DM_BTN_A, "its state is read again");
+
+    // No sooner than RECONNECT_NS after the disconnect: a game looks for the missing controller in the frames after it
+    dm_pad_set(0, 0, 0, 0, 0); h_hid_Disconnect(&(uint32_t){0});
+    dm_pad_set(DM_BTN_B, 0, 0, 0, 0); motion_now += RECONNECT_NS / 2;
+    CHECK(h_hid_GetStyle(&(uint32_t){0}) == 0, "a press right after the disconnect does not connect yet");
+    motion_now += RECONNECT_NS;
+    CHECK(h_hid_GetStyle(&(uint32_t){0}) == STYLE_FULLKEY, "the same press connects once the time has passed");
+    dm_pad_set(0, 0, 0, 0, 0); buttons_of(0, STYLE_FULLKEY);
+
+    // The controller applet connects every npad the game disconnected (Mario vs. Donkey Kong's "Change controllers?": all eight npads disconnected, then the applet)
+    g_signals = 0; for (uint32_t id = 0; id < DM_PLAYERS; id++) h_hid_Disconnect(&id);
+    CHECK(g_signals == 2 && h_hid_GetStyle(&(uint32_t){0}) == 0 && h_hid_GetStyle(&(uint32_t){1}) == 0, "both players' npads disconnected, the six without a controller left alone");
+    CHECK(!(atomic_load(&g_gone) >> 2), "an npad without a controller is not marked");
+    CHECK(h_hid_ShowCtrl(info, (const int8_t[8]){1, 2}) == RES_OK && info[0] == 2 && info[1] == 0, "the applet reports both players");
+    CHECK(g_signals == 4 && h_hid_GetStyle(&(uint32_t){0}) == STYLE_FULLKEY && h_hid_GetStyle(&(uint32_t){1}) == STYLE_FULLKEY, "and their npads have their controllers again");
+
+    // Handheld: the console's own controls cannot be disconnected, and No1 has no controller to disconnect
+    g_mode = 0; g_signals = 0;
+    h_hid_Disconnect(&(uint32_t){NPAD_HANDHELD}); h_hid_Disconnect(&(uint32_t){0});
+    CHECK(h_hid_GetStyle(&(uint32_t){NPAD_HANDHELD}) == STYLE_HANDHELD && !atomic_load(&g_gone) && g_signals == 0, "handheld: nothing disconnected");
+    h_hid_Disconnect(&(uint32_t){1});
+    CHECK(h_hid_GetStyle(&(uint32_t){1}) == 0 && h_hid_GetStyle(&(uint32_t){NPAD_HANDHELD}) == STYLE_HANDHELD, "handheld: player 2's npad can be");
+    h_hid_ShowCtrl(info, NULL);
+    CHECK(info[0] == 2 && info[1] == NPAD_HANDHELD && h_hid_GetStyle(&(uint32_t){1}) == STYLE_FULLKEY, "handheld: the applet connects it again");
+    g_mode = 1; dm_pad_players(1); g_style_ev[0] = NULL; g_style_ev[1] = NULL;   // the table holds plain pointers under g_style_lock (styles_sync)
+}
+#endif
 
 
 // The console mode at run time (dm_set_opmode → dm_hid_opmode_changed): player 1 moves between No1 and Handheld and both npads' style events are signalled, Handheld's too
@@ -659,6 +711,23 @@ static void t_rec(void) {
     CHECK(g_nsteps == 50000 && g_steps[49999].at == 99998, "all 50,000 steps of the file are parsed");
     free(g_steps); g_steps = NULL; g_nsteps = g_cap_steps = 0;
     CHECK(!keys_file(path), "a missing steps file reads as none");
+}
+
+// A hold counted in presented frames ("~f<n>", DM_KEYS and DM_CTL): the button stays down until that many more frames have been presented, however long they take.
+// DM_KEYS reads "~f" into the step's fhold (hle_hid.c keys_parse, upstream's form); a DM_CTL line's hold waits in ctl_hold, here against a thread that presents a frame every 20 ms
+static void *t_frame_ticker(void *arg) { (void)arg; for (int i = 0; i < 4; i++) { usleep(20000); __atomic_add_fetch(&test_frame, 1, __ATOMIC_SEQ_CST); } return NULL; }
+static void t_frame_hold(void) {
+    char ks[] = "f700:A~f12,f800:A~0.5";
+    g_nsteps = 0; keys_parse(ks);
+    CHECK(g_nsteps == 2 && g_steps[0].fhold && g_steps[0].hold == 12 && !g_steps[1].fhold && g_steps[1].hold == 0.5, "~f12 is a hold of 12 frames, ~0.5 one in seconds");
+    free(g_steps); g_steps = NULL; g_nsteps = g_cap_steps = 0;
+    key_step st = {.hold = 4, .fhold = 1};
+    test_frame = 700; pthread_t th; int made = !pthread_create(&th, NULL, t_frame_ticker, NULL);
+    CHECK(made, "the frame ticker starts");
+    if (made) { ctl_hold(&st); CHECK(__atomic_load_n(&test_frame, __ATOMIC_SEQ_CST) == 704, "a DM_CTL hold of ~f4 ends when four more frames have been presented"); pthread_join(th, NULL); }
+    st = (key_step){.hold = 0.01}; ctl_hold(&st);
+    CHECK(test_frame == 704, "a hold in seconds reads no frame count");
+    test_frame = 0;
 }
 
 // Live controller motion (dm_motion_set): player 1's six-axis sensor reports the controller's tilt and rotation instead of lying flat, and goes back to flat when cleared
@@ -1812,7 +1881,11 @@ int main(void) {
     t_icon_decoration();
     t_slots();
     t_npads();
+#if !defined(__APPLE__)
+    t_disconnect();
+#endif
     t_script();
+    t_frame_hold();
     t_vibration();
     t_opmode();
     t_joycons();

@@ -69,6 +69,12 @@ class CheckTools(unittest.TestCase):
             bad, out = self.check([failure], allow=allow)
             self.assertEqual(bad, [failure]); self.assertEqual(out, '')
 
+    def test_no_xcrun_is_a_missing_compiler(self):   # a Mac without Xcode or its command line tools, and any other system: 'missing', not a traceback
+        def no_xcrun(*a, **k): raise FileNotFoundError(2, 'No such file or directory', 'xcrun')
+        with mock.patch.object(own_compilers.subprocess, 'run', no_xcrun):
+            self.assertEqual(own_compilers.metal_version('macosx'), 'missing')
+            self.assertEqual(own_compilers.other_metal(), [])
+
     def test_missing_or_translator_still_fail(self):   # returned to dmsh_build.py, which stops with its own message
         xlate = mismatch('dmsh_xlate', '0' * 16)
         for bad, want in (([mismatch('metal_macosx', 'missing')],) * 2, ([mismatch('spirv-cross', 'missing')],) * 2, ([xlate, mismatch('metal_macosx', OTHER)], [xlate])):
@@ -112,6 +118,7 @@ class NspScript(unittest.TestCase):
             nsp.check_metal(sys.executable, REPO, {})
         run.assert_not_called()
 
+    @unittest.skipUnless(shutil.which('xcrun'), 'own_compilers.py --check-metal asks xcrun for the Metal compiler; xcrun (Xcode or its command line tools) is not on PATH')
     def test_check_metal_runs(self):   # the real tool with the real lock: exit 0 or 1 with the message, never a traceback (no Xcode: no compiler, which dmsh_build.py reports)
         r = subprocess.run([sys.executable, str(REPO / 'dm/gfx/tools/own_compilers.py'), '--check-metal'], capture_output=True, text=True,
                            env={k: v for k, v in os.environ.items() if k != own_compilers.ALLOW})

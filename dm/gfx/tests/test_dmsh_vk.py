@@ -1,0 +1,709 @@
+"""The shader chain for the Vulkan target (docs/design/vulkan-backend.md, section 2) on synthetic Maxwell shaders only, no game files: the Vulkan translator
+(dm/gfx/tools/dmsh_xlate_vk), the SPIR-V passes (dmsh_spv.py), the build and its census (dmsh_build_vk.py) and the version (dmsh_chain_vk.py).
+Run in the chain image (docker/README.md has the command): the translator built into build/xlate_vk (XLATE_VK selects another dmsh_xlate_vk.dll, or a published translator,
+dm/tools/publish_port_tools.sh, which runs without dotnet), dotnet, SPIRV-Tools (spirv-val, spirv-as, spirv-link) and spirv-cross on PATH (SPIRV_CROSS_VK selects another). Where one of them is missing, the tests that need it skip and say which; the portable checks still run.
+Each class prints its counts (shaders translated, entry points, validation results, bindings checked)."""
+import contextlib
+import importlib.util
+import io
+import json
+import os
+from pathlib import Path
+import re
+import shutil
+import struct
+import subprocess
+import sys
+import tempfile
+import types
+import unittest
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[3]
+TOOLS = ROOT / 'dm/gfx/tools'
+RYU = ROOT / 'dm/third_party/ryujinx/src/Ryujinx.Graphics.Shader'
+sys.path.insert(0, str(TOOLS))
+import dmsh_chain  # noqa: E402
+import dmsh_build_vk  # noqa: E402
+import dmsh_chain_vk  # noqa: E402
+import dmsh_spv  # noqa: E402
+import tool_lock  # noqa: E402   the fingerprints and sha16 (moved out of dmsh_chain.py upstream)
+import shader_lib  # noqa: E402   read_stamp (dm/tools, on the path dmsh_build_vk puts it)
+spec = importlib.util.spec_from_file_location('test_image_atomic_bounds', ROOT / 'dm/tools/tests/test_image_atomic_bounds.py')
+atomic_tests = importlib.util.module_from_spec(spec); spec.loader.exec_module(atomic_tests)   # its synthetic_shader: the compute shapes
+
+DOTNET = os.environ.get('DOTNET', 'dotnet')
+XLATE = Path(dmsh_chain_vk.XLATE_VK)
+XLATE_CMD = dmsh_chain_vk.xlate_cmd()   # dotnet <dll>, or a published translator alone
+SPIRV_CROSS = dmsh_chain_vk.spirv_cross()
+
+
+def missing(*tools):
+    """The reason a test cannot run here, or '' (the translator, dotnet and the SPIR-V tools it names)"""
+    gone = [t for t in tools if not shutil.which(t)]
+    if 'xlate' in tools:
+        gone.remove('xlate') if 'xlate' in gone else None
+        if not XLATE.is_file(): gone.append(f'the Vulkan translator {XLATE} (build it as docker/README.md says)')
+        if not dmsh_chain_vk.published() and not shutil.which(DOTNET): gone.append('dotnet')
+    return ', '.join(gone)
+
+
+# Synthetic Maxwell shaders, encoded from the vendored translator's instruction table (as test_image_atomic_bounds.synthetic_shader does)
+TABLE = (RYU / 'Decoders/InstTable.cs').read_text()
+PT, RZ = 7, 255
+
+
+def base(name):
+    return int(re.search(r'Add\("([01x]{64})", InstName\.' + name + r'\s*,', TABLE)[1].replace('x', '0'), 2)
+
+
+def mov(r, v): return base('Mov32i') | ((v & 0xffffffff) << 20) | (PT << 16) | (15 << 12) | r
+def ald(d, attr, size=3): return base('Ald') | d | (RZ << 8) | (PT << 16) | (attr << 20) | (RZ << 39) | (size << 47)          # ALD.32 .. .128 Rd, a[attr]
+def ast(s, attr, size=3): return base('Ast') | s | (RZ << 8) | (PT << 16) | (attr << 20) | (RZ << 39) | (size << 47)          # AST a[attr], Rs
+def ipa(d, attr): return base('Ipa') | d | (RZ << 8) | (PT << 16) | (RZ << 20) | (attr << 28) | (RZ << 39) | (PT << 47)        # IPA.PASS Rd, a[attr]
+def fmnmx(d, a, b, low=True): return base('Fmnmx') | d | (a << 8) | (PT << 16) | (b << 20) | (PT << 39) | ((0 if low else 1) << 42)
+def iadd32i(d, a, imm): return base('Iadd32i') | d | (a << 8) | (PT << 16) | ((imm & 0xffffffff) << 20)
+def tex2d(d, coord, handle, mask=15): return base('Tex') | d | (coord << 8) | (PT << 16) | (RZ << 20) | (2 << 28) | (mask << 31) | (handle << 36) | (PT << 51)   # TEX.2D, slot handle
+def ldc(d, slot, offset, size=4): return base('Ldc') | d | (RZ << 8) | (PT << 16) | (offset << 20) | (slot << 36) | (size << 48)   # LDC.32 (size 5: .64) Rd, c[slot][offset]
+def ldg(d, a): return base('Ldg') | d | (a << 8) | (PT << 16) | (1 << 45) | (4 << 48)                                               # LDG.E.32 Rd, [Ra]
+def stg(s, a): return base('Stg') | s | (a << 8) | (PT << 16) | (1 << 45) | (4 << 48)                                               # STG.E.32 [Ra], Rs
+def dadd(d, a, b): return base('Dadd') | d | (a << 8) | (PT << 16) | (b << 20)
+def vote_any(d): return base('Vote') | d | (PT << 16) | (PT << 39) | (PT << 45) | (1 << 48)
+def exit_(): return base('Exit') | (PT << 16) | 15
+
+
+def code(instructions, header=b''):
+    words = []
+    for i, ins in enumerate(instructions + [exit_()]):
+        if i % 3 == 0: words.append(0)   # the scheduling word before each group of three
+        words.append(ins)
+    return header + struct.pack('<%dQ' % len(words), *words)
+
+
+def sph(stage, omap=0, imap=(), mrt=False):
+    """A shader program header: stage 1 vertex, 4 geometry, 5 fragment; omap: the fragment outputs' component bits (4 per target); imap: (generic input, interpolation byte)"""
+    w = [0] * 20
+    w[0] = 1 | (3 << 5) | (stage << 10) | (int(mrt) << 14)
+    for i, b in imap: w[6 + (i >> 2)] |= b << ((i & 3) * 8)
+    w[18] = omap
+    return struct.pack('<20I', *w)
+
+
+PERSPECTIVE, FLAT = 0xAA, 0x55   # an input's four components interpolated with perspective, or constant
+GENERIC0, GENERIC1, POSITION = 0x80, 0x90, 0x70
+
+# key → (stage, code, facts): the shapes the chain treats apart
+GRAPHICS = {
+    'vs_basic': ('vs', code([ald(0, GENERIC0), ast(0, POSITION), ast(0, GENERIC0, 1)], sph(1)), {}),            # output 0 written in x, y only: vs_init's (0, 0, 0, 1) for z, w
+    'vs_int': ('vs', code([ald(4, GENERIC0), ast(4, POSITION), ald(0, GENERIC1, 0), iadd32i(0, 0, 1), ast(0, GENERIC0, 0)], sph(1)), {}),   # input 1 only used as an integer
+    'vs_tf': ('vs', code([ald(0, GENERIC0), ast(0, POSITION), ast(0, GENERIC0)], sph(1)), {}),                   # captured by transform feedback (the job's tf)
+    'vs_vote': ('vs', code([ald(0, GENERIC0), vote_any(4), ast(0, POSITION), ast(4, GENERIC0, 0)], sph(1)), {}),  # a subgroup ballot in a vertex shader
+    'vs_fp64': ('vs', code([ald(0, GENERIC0), dadd(4, 0, 0), ast(0, POSITION), ast(4, GENERIC0, 1)], sph(1)), {}),  # doubles: the _fp32 variant
+    # a game uniform slot (c3: slot 0), the shader's constants (c1), and storage buffer 0 through its address in the driver bank (c0 + 0x110), read and written
+    'vs_cbuf': ('vs', code([ldc(0, 3, 0x10), ldc(1, 1, 0), ldc(2, 0, 0x110, size=5), ldg(5, 2), stg(5, 2), ald(8, GENERIC0), ast(8, POSITION), ast(0, GENERIC0, 1)], sph(1)), {}),
+    'ps_cbuf': ('ps', code([ipa(0, GENERIC0), ldc(1, 4, 0x20), ldc(2, 1, 0x200)], sph(5, omap=0xF, imap=[(0, PERSPECTIVE)])), {}),   # c1 + 0x200: past a shared bank's 256 bytes
+    'ps_minmax': ('ps', code([ipa(0, GENERIC0), ipa(1, GENERIC0 + 4), fmnmx(2, 0, 1), fmnmx(3, 0, 1, low=False), mov(1, 0)], sph(5, omap=0xF, imap=[(0, PERSPECTIVE)])), {}),
+    'ps_tex': ('ps', code([ipa(0, GENERIC0), ipa(1, GENERIC0 + 4), tex2d(0, 0, 8, mask=1), iadd32i(0, 0, 1)], sph(5, omap=0xF, imap=[(0, PERSPECTIVE)])), {'tex': {'0': '2d'}}),
+    'ps_uint': ('ps', code([ipa(0, GENERIC0), iadd32i(0, 0, 1)], sph(5, omap=0xF, imap=[(0, FLAT)])), {}),          # an output from integer bits
+    'ps_mixed': ('ps', code([ipa(0, GENERIC0), ipa(1, GENERIC1), iadd32i(4, 1, 1)], sph(5, omap=0xFF, imap=[(0, PERSPECTIVE), (1, FLAT)], mrt=True)), {}),   # two outputs, one from integer bits
+    'gs_pass': ('gs', struct.pack('<5I', (1 << 24) | (4 << 10) | (3 << 5) | 1, 0, 1 << 24, 7 << 24, 1) + bytes(0x3c) + struct.pack('<QQ', 0, exit_()), {}),   # passthrough header
+}
+TF = [{'stride': 16, 'outputs': [[0, 4]]}, [], [], []]
+
+
+def compute_shapes():
+    """The image-atomic compute shapes of test_image_atomic_bounds (dimensions, reductions, compare-and-swap, source sizes, a bindless descriptor, the bounds modes)"""
+    out = {}
+    for dim, image in ((1, 'buffer'), (3, '2d'), (4, '2darray'), (5, '3d')):
+        out[f'cs_return_{image}'] = (atomic_tests.synthetic_shader(0, 0, dim=dim, discard=False, consume_result=True), image, 'R32Uint')
+        out[f'cs_cas_{image}'] = (atomic_tests.synthetic_shader(0, 0, dim=dim, discard=False, consume_result=True, cas=(3, 7)), image, 'R32Uint')
+    for d, shape in enumerate(('1d', 'buffer', '1darray', '2d', '2darray', '3d')):
+        for reduction in (False, True): out[f'cs_dim_{shape}_{int(reduction)}'] = (atomic_tests.synthetic_shader(1, 2, 3, reduction=reduction, dim=d), shape, 'R32Uint')
+    for size in (0, 1, 6):
+        out[f'cs_size_{size}'] = (atomic_tests.synthetic_shader(0, 0, size=size), '2darray', 'R32Uint')
+    out['cs_bindless'] = (atomic_tests.synthetic_shader(0, 0, reduction=True, size=6, bindless='cbuf'), '2darray', 'R32Sint')
+    for mode in (1, 2, 3): out[f'cs_mode_{mode}'] = (atomic_tests.synthetic_shader(0, 0, mode=mode), '2darray', 'R32Uint')
+    return out
+
+
+def jobs_for(work):
+    jobs = []
+    for key, (stage, data, facts) in GRAPHICS.items():
+        p = work / (key + '.bin'); p.write_bytes(data)
+        jobs.append({**dict(key=key, stage=stage, code=str(p), tex={}, img={}, attr={}, fout={}, debug=True, reduced=True), **facts, **({'tf': TF} if key == 'vs_tf' else {})})
+    for key, (data, image, fmt) in compute_shapes().items():
+        p = work / (key + '.bin'); p.write_bytes(data)
+        jobs.append(dict(key=key, stage='cs', code=str(p), tex={}, img={'0': dict(type=image, fmt=fmt)}, attr={}, fout={}, local=[1, 1, 1], debug=True, reduced=True))
+    return jobs
+
+
+STAGE = {'vs': 0, 'hs': 1, 'ds': 2, 'gs': 3, 'ps': 4, 'cs': 0}
+
+
+def check_bindings(test, stage, m, where):
+    """Every descriptor of a module where the binding model of 2.3 puts it (dmsh_xlate_vk/Program.cs); → the number checked"""
+    s, n = STAGE[stage], 0
+    for r in dmsh_spv.resources(m):
+        nm, b = r['name'], r['binding']
+        with test.subTest(module=where, binding=nm):
+            if r['set'] == 0:
+                test.assertEqual(r['class'], 'ubo')
+                if b == 0: test.assertEqual(nm, 'support_buffer')
+                else: test.assertEqual(((b - 1) // 18, (b - 1) % 18), (s, int(re.fullmatch(r'[a-z]+_c(\d+)', nm).group(1))))
+            elif r['set'] == 1:
+                test.assertEqual(r['class'], 'ssbo'); test.assertEqual((b // 16, b % 16), (s, int(re.fullmatch(r'[a-z]+_s(\d+)', nm).group(1))))
+            elif r['set'] == 2:
+                test.assertIn(r['class'], ('combined', 'texture', 'sampler')); test.assertEqual(b // 512, s)
+                if b % 512 < 256: test.assertEqual(b % 512, slot_of(nm, image=False))
+            elif r['set'] == 3:
+                test.assertIn(r['class'], ('storage_image', 'storage_texel_buffer', 'texel_buffer')); test.assertEqual(b // 512, s)
+                if b % 512 < 8: test.assertEqual(b % 512, slot_of(nm, image=True))
+                elif b % 512 < 264: test.assertEqual(b % 512 - 8, slot_of(nm, image=False))
+            else: test.fail(f'descriptor set {r["set"]}')
+        n += 1
+    return n
+
+
+def slot_of(name, image):   # the NVN slot dmsh_build.py decode_tex reads from a binding's name
+    m = re.match(r'[a-z]+_[ti]\w*?_(?:cb(\d+)|tcb)_([0-9A-F]+)', name); h = int(m.group(2), 16)
+    for w in (h & 0x3fff, (h >> 14) & 0x3fff):
+        b = w * 4
+        if image and 0x120 <= b < 0x160 and b % 8 == 0: return (b - 0x120) // 8
+        if not image and 0x20 <= b < 0x168 and b % 8 == 0: return (b - 0x20) // 8
+        if not image and 0x168 <= b < 0x568 and b % 8 == 0: return 128 + (b - 0x168) // 8
+    return -1
+
+
+def first_stores(m):
+    """The OpStore instructions right after the vertex entry point's first OpLabel and OpVariables: (variable, value)"""
+    fn = next(e[2] for e in m.entry_points() if e[0] == 'vs')
+    k = m.entry_insert_point(fn); out = []
+    while m.ins[k][0] & 0xffff == dmsh_spv.STORE: out.append((m.ins[k][1], m.ins[k][2])); k += 1
+    return out
+
+
+class Portable(unittest.TestCase):   # no tools needed
+    def test_metal_chain_untouched(self):
+        self.assertFalse([f for f in dmsh_chain.FILES if 'dmsh_xlate_vk' in f or f.endswith(('_vk.py', '_vk.lock', 'dmsh_spv.py'))], 'a Vulkan chain file in the Metal version (DMSH_CHAIN)')
+        self.assertIn(f'"{dmsh_chain.version()}"', (TOOLS.parent / 'nvn/dmsh_chain.h').read_text())
+
+    def test_vulkan_version_covers_its_files(self):
+        for f in ('tools/dmsh_build_vk.py', 'tools/dmsh_spv.py', 'tools/dmsh_xlate_vk/Program.cs', 'tools/dmsh_xlate_vk/dmsh_xlate_vk.csproj', 'tools/dmsh_build.py',
+                  'tools/dmsh_chain_vk.lock', 'tools/dmsh_facts.py', 'tools/c1_guard.py', 'tools/cb_extent.py', 'tools/dmsh_reflect.py', 'tools/dmsh_entry.py', 'nvn/dmsh_abi.h'):
+            self.assertIn(f, dmsh_chain_vk.FILES)
+        self.assertTrue(set(f for f in dmsh_chain.FILES if 'third_party' in f) <= set(dmsh_chain_vk.FILES))
+        self.assertTrue(set(dmsh_chain_vk.SHARED) <= set(dmsh_chain.FILES), 'a SHARED file that is not the Metal chain\'s')
+        self.assertIn(f'"{dmsh_chain_vk.version()}"', Path(dmsh_chain_vk.HEADER).read_text(), 'dm/gfx/nvn/dmsh_chain_vk.h is stale: run dm/gfx/tools/dmsh_chain_vk.py --header')
+
+    def test_version_covers_the_modules_it_runs(self):   # every module of the chain's folder the build loads is hashed into DMSH_CHAIN_VK (upstream moved code into new modules once)
+        r = subprocess.run([sys.executable, '-B', '-c', 'import sys; sys.path.insert(0, sys.argv[1]); import dmsh_build_vk; '
+                            'print("\\n".join(m.__file__ for m in list(sys.modules.values()) if getattr(m, "__file__", None)))', str(TOOLS)], capture_output=True, text=True, check=True)
+        loaded = {'tools/' + Path(p).name for p in r.stdout.split() if Path(p).resolve().parent == TOOLS.resolve()}
+        self.assertIn('tools/dmsh_reflect.py', loaded)
+        self.assertEqual(loaded - set(dmsh_chain_vk.FILES), {'tools/tool_lock.py'})   # tool_lock checks the tools against the lock and decides no output (as for DMSH_CHAIN)
+
+    def test_lock_rows(self):   # the dlls and the source hash, and per-platform tool rows; no Metal compiler
+        lock = dmsh_chain_vk.lock()
+        for k in dmsh_chain_vk.DLLS + ('xlate_source',) + tuple('dmsh_xlate_vk_' + p for p in dmsh_chain_vk.PUBLISHED): self.assertRegex(lock.get(k, ''), r'^[0-9a-f]{16}$', k)
+        self.assertEqual(lock['xlate_source'], dmsh_chain_vk.xlate_source_sha(), 'dmsh_chain_vk.lock holds another translator source: rebuild and run --update-lock in the chain image')
+        self.assertTrue(any(k.startswith('spirv-tools_') for k in lock) and any(k.startswith('spirv-cross_') for k in lock) and any(k.startswith('glslang_') for k in lock))
+        self.assertFalse([k for k in lock if 'metal' in k])
+
+    def test_kinds_are_nvn_refl_kinds(self):   # every reflection kind names a binding kind of nvn_refl.h
+        kinds = dmsh_build_vk.KINDS
+        enums = set(re.findall(r'\bNVN_RB_\w+', (TOOLS.parent / 'nvn/nvn_refl.h').read_text()))
+        self.assertFalse(set(kinds.values()) - enums)
+        self.assertEqual(len(kinds), 19)
+
+    def test_passes_on_assembly(self):   # the passes on a hand-written module (no translator): a vertex shader with a subgroup mask, test_subgroup.py's
+        if missing('spirv-as', 'spirv-val'): self.skipTest('needs ' + missing('spirv-as', 'spirv-val'))
+        asm = (Path(__file__).resolve().parent / 'test_subgroup.py').read_text().split("ASSEMBLY = '''", 1)[1].split("'''", 1)[0].replace('ACCESS', 'OpAccessChain')
+        asm = asm.replace('%position = OpVariable %po Output', '%position = OpVariable %po Output\n%color = OpVariable %po Output').replace(
+            'OpDecorate %position BuiltIn Position', 'OpDecorate %position BuiltIn Position\nOpDecorate %color Location 0').replace('%mask %vertex %position', '%mask %vertex %position %color')
+        with tempfile.TemporaryDirectory() as d:
+            src, spv = Path(d) / 'a.spvasm', Path(d) / 'a.spv'
+            src.write_text(asm); subprocess.run(['spirv-as', '--target-env', 'vulkan1.3', str(src), '-o', str(spv)], check=True, capture_output=True)
+            m = dmsh_spv.Module.read(spv)
+            done = dmsh_spv.apply(m, 'vs', pad={3: ('float', 4, 0)}, fp_controls=True)
+            self.assertEqual((done['invariant'], done['vs_init'], done['vs_pad'], done['float_controls']), (1, 1, [3], 1))
+            m.write(str(spv)); ok, why = dmsh_spv.validate(str(spv)); self.assertTrue(ok, why)
+            self.assertEqual(len(first_stores(m)), 2)
+            self.assertEqual(dmsh_spv.interface(m)[-1]['location'], 3)
+
+    @staticmethod
+    def image_module(fmt, ops, caps=()):   # words only: a storage image of the given format (0: none), loaded, then written ('write') and read ('read')
+        I, S = dmsh_spv, dmsh_spv.SC_UNIFORM_CONSTANT
+        ins = [[2 << 16 | I.CAPABILITY, 1]] + [[2 << 16 | I.CAPABILITY, c] for c in caps] + [
+            [3 << 16 | I.T_FLOAT, 1, 32], [9 << 16 | I.T_IMAGE, 2, 1, 1, 0, 0, 0, 2, fmt], [4 << 16 | I.T_POINTER, 3, S, 2], [4 << 16 | I.VARIABLE, 3, 4, S],
+            [4 << 16 | I.LOAD, 2, 5, 4]] + [[4 << 16 | I.IMAGE_WRITE, 5, 6, 7] if o == 'write' else [5 << 16 | 98, 8, 9, 5, 6] for o in ops]
+        return dmsh_spv.Module(struct.pack('<%dI' % (5 + sum(map(len, ins))), dmsh_spv.MAGIC, 0x10600, 0, 10, 0, *[w for i in ins for w in i]))
+
+    def test_formatless_capabilities(self):   # a read or a write of a storage image without a format declares its capability, once; an image with a format declares none
+        caps = lambda m: [i[1] for i in m.of(dmsh_spv.CAPABILITY)]
+        for fmt, ops, before, added, after in ((0, ['write'], (), ['write'], [1, 56]), (0, ['read'], (), ['read'], [1, 55]), (0, ['read', 'write', 'write'], (), ['read', 'write'], [1, 55, 56]),
+                                               (33, ['read', 'write'], (), [], [1]), (0, ['write'], (56,), [], [1, 56]), (0, [], (), [], [1])):
+            m = self.image_module(fmt, ops, before)
+            self.assertEqual((dmsh_spv.formatless(m), caps(m)), (added, after), (fmt, ops, before))
+            self.assertEqual(dmsh_spv.formatless(m), [])   # nothing left to declare
+        m = self.image_module(0, ['write'])
+        self.assertEqual(dmsh_spv.apply(m, 'cs')['formatless'], ['write'])   # the build applies it
+        self.assertEqual([i[0] & 0xffff for i in m.ins[:2]], [dmsh_spv.CAPABILITY] * 2)   # among the capabilities, before the types
+
+    def test_formatless_validates(self):   # spirv-val refuses the write without the capability, and takes the module after the pass
+        if missing('spirv-as', 'spirv-val'): self.skipTest('needs ' + missing('spirv-as', 'spirv-val'))
+        asm = '''OpCapability Shader
+OpMemoryModel Logical GLSL450
+OpEntryPoint GLCompute %main "main" %img
+OpExecutionMode %main LocalSize 1 1 1
+OpDecorate %img DescriptorSet 3
+OpDecorate %img Binding 0
+%void = OpTypeVoid
+%fn = OpTypeFunction %void
+%float = OpTypeFloat 32
+%int = OpTypeInt 32 1
+%v2int = OpTypeVector %int 2
+%v4float = OpTypeVector %float 4
+%image = OpTypeImage %float 2D 0 0 0 2 Unknown
+%pimage = OpTypePointer UniformConstant %image
+%img = OpVariable %pimage UniformConstant
+%zero = OpConstant %int 0
+%at = OpConstantComposite %v2int %zero %zero
+%main = OpFunction %void None %fn
+%entry = OpLabel
+%i = OpLoad %image %img
+%texel = OpImageRead %v4float %i %at
+OpImageWrite %i %at %texel
+OpReturn
+OpFunctionEnd
+'''
+        with tempfile.TemporaryDirectory() as d:
+            src, spv = Path(d) / 'a.spvasm', Path(d) / 'a.spv'
+            src.write_text(asm); subprocess.run(['spirv-as', '--target-env', 'vulkan1.3', str(src), '-o', str(spv)], check=True, capture_output=True)
+            ok, why = dmsh_spv.validate(str(spv)); self.assertFalse(ok); self.assertIn('WithoutFormat', why)
+            m = dmsh_spv.Module.read(spv); self.assertEqual(dmsh_spv.apply(m, 'cs')['formatless'], ['read', 'write'])
+            m.write(str(spv)); ok, why = dmsh_spv.validate(str(spv)); self.assertTrue(ok, why)
+
+    def test_module_reads(self):   # defs() as result() gives it, flatten in place as on a copy, and consistent(): whether data() reads back as the same instructions
+        m = self.image_module(0, ['read', 'write'])
+        m.decorate(4, dmsh_spv.D_DESCRIPTOR_SET, 3); m.decorate(4, dmsh_spv.D_BINDING, 7)
+        self.assertEqual(m.defs(), {r: i for i in m.ins if (r := dmsh_spv.Module.result(i)) is not None})
+        before = m.data(); copy = dmsh_spv.flatten(m); same = dmsh_spv.Module(m.data())
+        self.assertIs(dmsh_spv.flatten(same, copy=False), same)
+        self.assertEqual((same.data(), m.data()), (copy.data(), before))   # in place: the copy's bytes; m itself as it was
+        self.assertNotEqual(copy.data(), before)
+        self.assertTrue(m.consistent())
+        m.ins[0] = m.ins[0] + [0]; self.assertFalse(m.consistent())
+
+    # Handle names whose decoding upstream changed (dm/gfx/tests/test_dmsh_reflect.py has them): c2 arrays with a separate sampler word (EA SPORTS FC 27), a uniform buffer's handles
+    # with their sampler word in c2 (Kirby Air Riders), type-2 sampler IDs in a uniform buffer (The Witcher 3), a type-1 handle's two words in one uniform buffer, type-3 constant samplers
+    HANDLES = (('array<texture2d_array<float>, 301>', 'fp_t2das_cb2_0'), ('array<texture2d<float>, 301>', 'fp_t2d_cb196610_10570000'), ('array<depth2d<float>, 32>', 'fp_t2ds_cb196614_10570000'),
+               ('texture2d<float>', 'fp_t_cb720898_2000005A'), ('texture2d<float>', 'fp_t_cb720898_2000405C'), ('texture2d<float>', 'fp_t_cb720898_2004005A'),
+               ('texture2d<float>', 'fp_t_cb720898_1000005A'), ('texture2d<float>', 'fp_t_cb262147_10010002'), ('texture2d<float>', 'fp_t_cb5_3041005C'),
+               ('texture2d<float>', 'fp_t_cb65538_3041005C'), ('texture2d<float>', 'fp_t_cb7_2A'))
+
+    def test_handle_names_decided_as_metal_reflect(self):   # each combined binding's texture and sampler entries as dmsh_reflect.py reflect makes them of the same names, extra words and IDs included
+        import dmsh_reflect
+        src, resources, aid = 'struct spvDescriptorSetBuffer0\n{\n', [], 0
+        for k, (ty, nm) in enumerate(self.HANDLES):
+            n = int(ty.rsplit(', ', 1)[1].rstrip('>')) if ty.startswith('array<') else 1
+            src += f'    {ty} {nm} [[id({aid})]];\n    {f"array<sampler, {n}>" if n > 1 else "sampler"} {nm}Smplr [[id({aid + n})]];\n'; aid += 2 * n
+            resources.append({'set': 2, 'binding': 4 * 512 + k, 'name': nm, 'class': 'combined', 'array': n, 'used': True, 'id': 100 + k})
+        fields = ('kind', 'reg', 'off', 'soff', 'sreg', 'raw_id')
+        metal = {(b['msl_name'].removesuffix('Smplr'), b['msl_name'].endswith('Smplr'), *(b.get(f) for f in fields))
+                 for b in dmsh_reflect.reflect('k', 'ps', src + '};\n', {'cbufs': [], 'sbufs': [], 'textures': [], 'images': []})}
+        with mock.patch.object(dmsh_spv, 'resources', lambda m: resources), mock.patch.object(dmsh_spv, 'image_uses', lambda m: {}):
+            vk = {(b['name'], b['class'] == 'sampler', *(b.get(f) for f in fields)) for b in dmsh_build_vk.Build.bindings(None, 'ps', None, {'sbufs': []})}
+        self.assertEqual(vk, metal)
+        self.assertEqual(len(vk), 2 * len(self.HANDLES))
+
+    def test_prepare_refuses_what_it_cannot_translate(self):   # a reason, not a job: NVN2 code (dmsh_build.py job_for's arch), a stage-8 record job_for refuses, a ray-tracing key of the map
+        import dmsh_ampere
+        def rec(key, stage8=False):   # an NVN2 pixel shader's record: its key, a 0x80-byte SPH and one instruction, the control section (magic, version, the instructions' length, the stage byte)
+            ctl = bytearray(0x60); struct.pack_into('<II', ctl, 0, dmsh_ampere.CTL_MAGIC, dmsh_ampere.CTL_VERSION); struct.pack_into('<I', ctl, 0x38, 0x88); ctl[0x56] = 8 if stage8 else 0
+            return b'BTCDBTCD' + bytes.fromhex(key) + bytes(0x28) + bytes(0x88) + bytes(ctl)
+        nvn2, stage8, rt = '00000000000000a0', '00000000000000a1', '00000000000000a2'
+        recs = {nvn2: rec(nvn2), stage8: rec(stage8, stage8=True), rt: b''}
+        b = dmsh_build_vk.Build.__new__(dmsh_build_vk.Build); b.rt = {rt}
+        b.s = dmsh_build_vk.shared(dmsh_build_vk.Build.scope()); b.s['FACTS'] = {}
+        jobs, c1s, refused = {}, {}, {}
+        with tempfile.TemporaryDirectory() as w:
+            for k in recs: b.prepare(k, lambda k: ('ps.bin', recs[k]), w, jobs, c1s, refused)
+        self.assertEqual((jobs, sorted(refused)), ({}, sorted(recs)))
+        self.assertIn('decodes Maxwell code only', refused[nvn2]); self.assertIn('stage8 RT record', refused[stage8]); self.assertIn('ray-tracing', refused[rt])
+
+    def test_balanced_batches(self):   # every job once, in at most n batches of about equal cost (apart by less than the costliest job), the costliest first, the same for the same input
+        items = list(range(1, 101)); b = dmsh_build_vk.balanced(items, 8, lambda x: x)
+        self.assertEqual((sorted(x for lst in b for x in lst), len(b)), (items, 8))
+        tot = [sum(lst) for lst in b]
+        self.assertEqual(tot, sorted(tot, reverse=True)); self.assertLessEqual(max(tot) - min(tot), 100)
+        self.assertEqual(b, dmsh_build_vk.balanced(items, 8, lambda x: x))
+        self.assertEqual((dmsh_build_vk.balanced([5], 8, lambda x: x), dmsh_build_vk.balanced([], 8, lambda x: x)), ([[5]], []))
+
+    def test_progress_lines(self):   # a step's count: the first at once, then at most twice a second (a count held back goes out while waiting), the last when the step is done
+        out, now = io.StringIO(), [0.0]
+        with mock.patch.object(dmsh_build_vk, 'time', types.SimpleNamespace(monotonic=lambda: now[0])), contextlib.redirect_stdout(out):
+            c = dmsh_build_vk.Count('finishing', 3); c.add(); now[0] = 0.2; c.add(); c.show(); now[0] = 0.6; c.show(); c.show(); c.add()
+        self.assertEqual(out.getvalue().splitlines(), ['progress: finishing 0/3', 'progress: finishing 2/3', 'progress: finishing 3/3'])
+
+    def test_retranslate_as_one_translation_each(self):
+        """The second translations in batches give each job what translate_one gives it alone (a stand-in translator): a failure and its message, an FP32 variant's [RED] line
+        taken as a success, the jobs of a batch that stopped part way; the jobs of a batch that reported nothing are not run again"""
+        fake = ("import json, os, sys\n"
+                "jobs, out = json.load(open(sys.argv[1])), sys.argv[2]\n"
+                "with open(os.environ['FAKE_LOG'], 'a') as f: f.write(','.join(j['key'] for j in jobs) + '\\n')\n"
+                "ok = bad = 0\n"
+                "for j in jobs:\n"
+                "    k = j['key']\n"
+                "    if k == 'crash' and len(jobs) > 1: sys.exit(3)\n"
+                "    if k == 'bad': print(f'[RED] {k}: InvalidOperationException: no such register', file=sys.stderr); bad += 1; continue\n"
+                "    open(os.path.join(out, k + '.spv'), 'wb').write(b'spv'); ok += 1\n"
+                "    if k == 'fp64': print(f'[RED] {k}: the FP32 variant failed, devices without shaderFloat64 cannot run it: X: y', file=sys.stderr)\n"
+                "print(f'translated: {ok} ok, {bad} failed')\n"
+                "sys.exit(1 if bad else 0)\n")
+        keys = ('a', 'bad', 'fp64', 'crash', 'c', 'e', 'f', 'g', 'h')
+        with tempfile.TemporaryDirectory() as d:
+            d = Path(d); (d / 'xlate.py').write_text(fake); log = d / 'runs'
+            b = dmsh_build_vk.Build.__new__(dmsh_build_vk.Build); b.xlate, b.nj = [sys.executable, str(d / 'xlate.py')], 1   # 4 batches for 9 jobs
+            with mock.patch.dict(os.environ, FAKE_LOG=str(log)), contextlib.redirect_stdout(io.StringIO()):
+                one = {}
+                for k in keys:
+                    w = d / ('one_' + k); w.mkdir(); one[k] = b.translate_one({'key': k}, str(w))
+                log.unlink(); w = d / 'batch'; w.mkdir()
+                got = b.retranslate([{'key': k} for k in keys], str(w), lambda j: 1)
+            runs = log.read_text().split()
+        self.assertEqual(got, one)
+        self.assertEqual({k: v for k, v in one.items() if v}, {'bad': '[RED] bad: InvalidOperationException: no such register'})
+        batches = [r.split(',') for r in runs if ',' in r]; again = [r for r in runs if ',' not in r]
+        self.assertEqual(sorted(k for r in batches for k in r), sorted(keys))
+        crashed = next(r for r in batches if 'crash' in r)
+        self.assertEqual(sorted(again), sorted(['bad', 'fp64'] + crashed))   # run alone: a [RED] line, or a batch that did not finish
+
+
+@unittest.skipIf(missing('xlate', 'spirv-val'), 'needs ' + missing('xlate', 'spirv-val'))
+class Translator(unittest.TestCase):
+    """The Vulkan translator on every synthetic shape: spirv-val clean (Vulkan 1.3), bindings where 2.3 puts them, the passes' marks"""
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory(prefix='dm-vk-xlate-'); cls.work = Path(cls.tmp.name)
+        cls.jobs = jobs_for(cls.work)
+        (cls.work / 'jobs.json').write_text(json.dumps(cls.jobs))
+        cls.result = subprocess.run([*XLATE_CMD, str(cls.work / 'jobs.json'), str(cls.work)], capture_output=True, text=True)
+
+    @classmethod
+    def tearDownClass(cls): cls.tmp.cleanup()
+
+    def module(self, key, sfx=''): return dmsh_spv.Module.read(self.work / f'{key}{sfx}.spv')
+
+    def test_source_sha_matches_lock(self):
+        r = subprocess.run([*XLATE_CMD, '--source-sha'], capture_output=True, text=True, check=True)
+        self.assertEqual(r.stdout.strip(), dmsh_chain_vk.xlate_source_sha())
+        self.assertEqual(r.stdout.strip(), dmsh_chain_vk.lock()['xlate_source'])
+
+    def test_every_shape_translates_and_validates(self):
+        self.assertEqual(self.result.returncode, 0, self.result.stderr)
+        counts = {'shaders': 0, 'modules': 0, 'valid': 0, 'entry points': 0, 'bindings': 0}
+        for job in self.jobs:
+            for sfx in ('', '_fp32'):
+                p = self.work / f'{job["key"]}{sfx}.spv'
+                if not p.exists(): continue
+                m = dmsh_spv.Module.read(p); dmsh_spv.apply(m, job['stage']); p2 = self.work / f'{job["key"]}{sfx}.passes.spv'; m.write(str(p2))
+                for q in (p, p2):
+                    ok, why = dmsh_spv.validate(str(q)); self.assertTrue(ok, f'{q.name}: {why}'); counts['valid'] += 1
+                counts['modules'] += 1; counts['entry points'] += len(m.entry_points())
+                counts['bindings'] += check_bindings(self, job['stage'], m, p.name)
+            counts['shaders'] += 1
+        print(f'\nVulkan translator: {counts["shaders"]} shaders translated, {counts["modules"]} modules, {counts["entry points"]} entry points, '
+              f'{counts["valid"]} spirv-val --target-env vulkan1.3 runs clean (before and after the passes), {counts["bindings"]} bindings checked against 2.3')
+        self.assertEqual(counts['shaders'], len(GRAPHICS) + len(compute_shapes()))
+
+    def test_stages(self):
+        for job in self.jobs:
+            self.assertEqual([e[0] for e in self.module(job['key']).entry_points()], [job['stage']], job['key'])
+            self.assertEqual([e[1] for e in self.module(job['key']).entry_points()], ['main'])
+
+    def test_image_bindings(self):   # an image in slot 0 of the compute stage: set 3, binding 0; the combined texture of slot 0 in the pixel stage: set 2, binding 4 * 512
+        for key in compute_shapes():
+            imgs = [r for r in dmsh_spv.resources(self.module(key)) if r['class'] in ('storage_image', 'storage_texel_buffer')]
+            self.assertEqual([(r['set'], r['binding']) for r in imgs], [(3, 0)], key)
+        tex = [r for r in dmsh_spv.resources(self.module('ps_tex')) if r['class'] == 'combined']
+        self.assertEqual([(r['set'], r['binding'], r['dim']) for r in tex], [(2, 4 * 512, '2d')])
+        res = json.loads((self.work / 'ps_tex.res.json').read_text())
+        self.assertEqual([(t['set'], t['binding']) for t in res['textures']], [(2, 2048)])
+        self.assertEqual(res['sbuf_align'], 64)
+
+    def test_buffer_bindings(self):   # uniform buffers in set 0 at 1 + 18 s + slot, storage buffers in set 1 at 16 s + index, the support buffer at set 0, binding 0
+        got = {r['name']: (r['set'], r['binding'], r['class']) for r in dmsh_spv.resources(self.module('vs_cbuf'))}
+        self.assertEqual({k: got[k] for k in ('support_buffer', 'vp_c1', 'vp_c3', 'vp_s0')}, {'support_buffer': (0, 0, 'ubo'), 'vp_c1': (0, 2, 'ubo'), 'vp_c3': (0, 4, 'ubo'), 'vp_s0': (1, 0, 'ssbo')})
+        self.assertTrue(got['vp_s0'] and [r for r in dmsh_spv.resources(self.module('vs_cbuf')) if r['name'] == 'vp_s0'][0]['writable'])
+        got = {r['name']: (r['set'], r['binding']) for r in dmsh_spv.resources(self.module('ps_cbuf'))}
+        self.assertEqual({k: got[k] for k in ('fp_c1', 'fp_c4')}, {'fp_c1': (0, 1 + 4 * 18 + 1), 'fp_c4': (0, 1 + 4 * 18 + 4)})
+        res = json.loads((self.work / 'vs_cbuf.res.json').read_text())
+        self.assertEqual([(b['set'], b['binding'], b['cb_slot'], b['cb_offset']) for b in res['sbufs']], [(1, 0, 0, 0x110 // 4)])
+
+    @unittest.skipIf(missing(SPIRV_CROSS), 'needs ' + missing(SPIRV_CROSS))
+    def test_same_decisions_as_metal_reflect(self):   # the Vulkan reflection's kinds and slots are what dmsh_reflect.py reflect (the Metal reflection) makes of the analysis rendering of the same module
+        import dmsh_reflect
+        scope = types.SimpleNamespace(s=dmsh_build_vk.shared(dmsh_build_vk.Build.scope()))   # XC, the analysis rendering's options, as the build takes them
+        compared = 0
+        for job in self.jobs:
+            if job['stage'] not in ('vs', 'ps', 'cs'): continue
+            spv = self.work / (job['key'] + '.spv'); flat = self.work / (job['key'] + '.flat.spv')
+            dmsh_spv.flatten(dmsh_spv.Module.read(spv)).write(str(flat))
+            r = subprocess.run([SPIRV_CROSS, *scope.s['XC'], str(flat)], capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, job['key'] + ': ' + r.stderr)
+            res = json.loads((self.work / (job['key'] + '.res.json')).read_text())
+            # reflect reads each uniform slot's fixed reads from the Metal translator's cbufs (Program.cs), which the Vulkan translator does not report: none, for the comparison
+            metal_res = dict(res, cbufs=[dict(b, fixed=b.get('fixed', 0)) for b in res['cbufs']])
+            metal = {(b['msl_name'][:-5] if b['msl_name'].endswith('Smplr') else b['msl_name'], b['kind'], b.get('reg'), b.get('off')) for b in dmsh_reflect.reflect(job['key'], job['stage'], r.stdout, metal_res)}
+            vk = {(b['name'], b['kind'], b.get('reg'), b.get('off')) for b in dmsh_build_vk.Build.bindings(scope, job['stage'], dmsh_spv.Module.read(spv), res)}
+            self.assertEqual(vk, metal, job['key']); compared += len(vk)
+        print(f'\nreflection: {compared} bindings decided as dmsh_reflect.py reflect decides them on the analysis MSL')
+
+    def test_target_neutral_atomics(self):   # no Metal image-atomics guard: the coordinate is not compared with the image size before the atomic
+        m = self.module('cs_dim_2d_0')
+        self.assertTrue(m.of(dmsh_spv.IMAGE_TEXEL_POINTER)); self.assertFalse(m.of(dmsh_spv.IMAGE_QUERY_SIZE))
+
+    def test_precise(self):
+        m = self.module('ps_minmax'); g = m.glsl_set()
+        before = sorted(i[4] for i in m.of(dmsh_spv.EXT_INST) if i[3] == g and i[4] in (37, 40, 43, 79, 80, 81))
+        self.assertTrue(set(before) & {37, 40}, before)
+        dmsh_spv.precise(m)
+        after = sorted(i[4] for i in m.of(dmsh_spv.EXT_INST) if i[3] == g and i[4] in (37, 40, 43, 79, 80, 81))
+        self.assertFalse(set(after) & {37, 40, 43}); self.assertTrue({79, 80} <= set(after))
+
+    def test_invariant_and_vs_init(self):
+        for key in [k for k, v in GRAPHICS.items() if v[0] == 'vs']:
+            m = self.module(key); dmsh_spv.apply(m, 'vs')
+            dec, mdec = m.decorations(), m.member_decorations()
+            pos = [v for v, _, _ in m.variables(dmsh_spv.SC_OUTPUT) if dec.get(v, {}).get(dmsh_spv.D_BUILTIN) == [0]]
+            members = [k for k, d in mdec.items() if d.get(dmsh_spv.D_BUILTIN) == [0]]
+            self.assertTrue(all(dmsh_spv.D_INVARIANT in dec[v] for v in pos) and all(dmsh_spv.D_INVARIANT in mdec[k] for k in members) and (pos or members), key)
+            outs = {x['id'] for x in dmsh_spv.interface(m) if x['storage'] == 'out'}
+            self.assertEqual({v for v, _ in first_stores(m)}, outs, key)
+
+    def test_vs_basic_output_default(self):   # output 0 is written in x and y only: z and w read (0, 1) from the store at entry
+        m = self.module('vs_basic'); dmsh_spv.vs_init(m); defs = m.defs()
+        (var, value), = first_stores(m)
+        parts = defs[value][3:]
+        self.assertEqual([defs[p][3] for p in parts], [0, 0, 0, 0x3f800000])
+
+    def test_transform_feedback(self):
+        m = self.module('vs_tf')
+        self.assertIn(53, [i[1] for i in m.of(dmsh_spv.CAPABILITY)])                    # TransformFeedback
+        self.assertIn(11, [i[2] for i in m.of(dmsh_spv.EXECUTION_MODE)])                # Xfb
+        xfb = {d: v for d, v in next(d for v, d in m.decorations().items() if 36 in d).items() if d in (35, 36, 37)}
+        self.assertEqual(xfb, {36: [0], 37: [16], 35: [0]})                            # XfbBuffer 0, XfbStride 16, Offset 0
+
+    def test_subgroup_in_vertex_stage(self):
+        caps = {i[1] for i in self.module('vs_vote').of(dmsh_spv.CAPABILITY)}
+        self.assertTrue(caps & {61, 64}, caps)                                          # GroupNonUniform(Ballot / Vote)
+
+    def test_fp64_variant(self):
+        self.assertTrue(dmsh_spv.uses_float64(self.module('vs_fp64')))
+        self.assertFalse(dmsh_spv.uses_float64(self.module('vs_fp64', '_fp32')))
+        self.assertFalse((self.work / 'vs_basic_fp32.spv').exists())
+
+    def test_geometry_is_ordinary(self):   # passthrough reported unsupported: a geometry entry point, no passthrough decoration (PassthroughNV, 5250)
+        m = self.module('gs_pass')
+        self.assertEqual(m.entry_points()[0][0], 'gs'); self.assertFalse([i for i in m.of(dmsh_spv.DECORATE) if i[2] == 5250])
+        self.assertFalse((self.work / 'gs_pass.reader.spv').exists())
+
+    def test_census_reads_bits(self):
+        rows = dmsh_spv.census(self.module('ps_tex'))
+        self.assertEqual([(r['op'], r['use']) for r in rows], [('sample', 'bits')])
+        self.assertEqual([r['use'] for r in dmsh_spv.census(self.module('ps_minmax'))], [])
+
+    def test_shadow_inputs(self):   # an integer input (translated as uint) gets a float shadow at 16 and a signed one at 17
+        job = next(j for j in self.jobs if j['key'] == 'vs_int')
+        with tempfile.TemporaryDirectory() as d:
+            j = dict(job, key='vs_int_u', attr={'1': 'uint'}); (Path(d) / 'j.json').write_text(json.dumps([j]))
+            subprocess.run([*XLATE_CMD, str(Path(d) / 'j.json'), d], check=True, capture_output=True)
+            m = dmsh_spv.Module.read(Path(d) / 'vs_int_u.spv'); dmsh_spv.apply(m, 'vs')
+            ins = {x['location']: x['base'] for x in dmsh_spv.interface(m) if x['storage'] == 'in'}
+            self.assertEqual(ins.get(1), 'uint')
+            sh = dmsh_spv.shadow_inputs(m)
+            self.assertEqual(sh, [{'location': 1, 'float': 16, 'sint': 17}])
+            p = Path(d) / 'bv.spv'; m.write(str(p)); ok, why = dmsh_spv.validate(str(p)); self.assertTrue(ok, why)
+            ins = {x['location']: x['base'] for x in dmsh_spv.interface(m) if x['storage'] == 'in'}
+            self.assertEqual((ins[16], ins[17]), ('float', 'sint'))
+            self.assertEqual(dmsh_spv.shadow_inputs(dmsh_spv.Module.read(self.work / 'vs_basic.spv')), 'no integer input')
+
+
+def tlds1d(d, a, handle): return base('Tlds') | d | (a << 8) | (PT << 16) | (RZ << 20) | (RZ << 28) | (handle << 36) | (1 << 50)   # TLDS.1D.LZ Rd, Ra, slot handle (red)
+
+
+@unittest.skipUnless(dmsh_chain_vk.published() and XLATE.is_file(), 'XLATE_VK names no published translator (dm/tools/publish_port_tools.sh)')
+class Published(unittest.TestCase):
+    """A published translator where it runs, with no dotnet and no SPIR-V tools (the Windows PC's runner: run_win64_tests.ps1 -PortTools): the lock's row of this platform, the
+    source it embeds, and three shapes translated into SPIR-V modules and reflections, among them a 1D texel fetch, whose fetch1d slot a trimmed or AOT build once failed to write"""
+    def test_lock_row_and_source(self):
+        self.assertEqual(tool_lock.sha16(str(XLATE)), dmsh_chain_vk.lock().get('dmsh_xlate_vk_' + dmsh_chain_vk.plat()), 'not the translator dmsh_chain_vk.lock fingerprints')
+        r = subprocess.run([*XLATE_CMD, '--source-sha'], capture_output=True, text=True, timeout=60)
+        self.assertEqual(r.stdout.strip(), dmsh_chain_vk.xlate_source_sha())
+
+    def test_translates(self):
+        with tempfile.TemporaryDirectory() as d:
+            work = Path(d); jobs = [j for j in jobs_for(work) if j['key'] in ('vs_basic', 'ps_tex')]
+            (work / 'ps_fetch1d.bin').write_bytes(code([ipa(0, GENERIC0), tlds1d(0, 0, 8)], sph(5, omap=0xF, imap=[(0, FLAT)])))
+            jobs.append(dict(key='ps_fetch1d', stage='ps', code=str(work / 'ps_fetch1d.bin'), tex={'0': '1d'}, img={}, attr={}, fout={}, debug=True, reduced=True))
+            (work / 'jobs.json').write_text(json.dumps(jobs))
+            r = subprocess.run([*XLATE_CMD, str(work / 'jobs.json'), str(work)], capture_output=True, text=True, timeout=300)
+            self.assertEqual((r.returncode, r.stdout.strip()), (0, 'translated: 3 ok, 0 failed'), r.stderr)
+            for j in jobs:
+                self.assertEqual((work / f'{j["key"]}.spv').read_bytes()[:4], b'\x03\x02\x23\x07', j['key'])   # the SPIR-V magic
+                self.assertEqual(json.loads((work / f'{j["key"]}.res.json').read_text())['key'], j['key'])
+            self.assertEqual(json.loads((work / 'ps_fetch1d.res.json').read_text()).get('fetch1d'), [0])
+            print(f'\npublished translator {XLATE}: {len(jobs)} shapes translated without dotnet')
+
+
+GAME_ID = '0100FFFFFFFF0000'   # a title ID no game has: the synthetic profile
+
+
+def record(data, stage, key, tf=None):
+    """A shader package record (dmsh_build.py record_index / job_for): the magic, the shader's key at +0x08 (shader_split.py writes it there; the build finds a record by it), a header
+    to +0x38, the code area (graphics: a 0x30-byte header, then the program), the control section"""
+    ctl = bytearray(0x880); ctl[0:4] = bytes.fromhex('34127698')
+    for b, e in enumerate(tf or []):
+        if not e: continue
+        struct.pack_into('<H', ctl, 0x6dc + 2 * b, e['stride']); ctl[0x6e8 + b] = len(e['outputs'])
+        for k, (loc, n) in enumerate(e['outputs']): ctl[0xdc + 0x80 * b + k] = 0x20 + loc; ctl[0x4dc + 0x80 * b + k] = n
+    return b'BTCDBTCD' + bytes.fromhex(key) + bytes(0x28) + (data if stage == 'cs' else bytes(0x30) + data) + bytes(ctl)
+
+
+@unittest.skipIf(missing('xlate', 'spirv-val', 'spirv-link', SPIRV_CROSS), 'needs ' + missing('xlate', 'spirv-val', 'spirv-link', SPIRV_CROSS))
+class Build(unittest.TestCase):
+    """dmsh_build_vk.py end to end on a synthetic package and profile: the outputs, the reflection, the stamp and tables, the census, the cache"""
+    @classmethod
+    def setUpClass(cls):
+        cls.tmp = tempfile.TemporaryDirectory(prefix='dm-vk-build-'); t = Path(cls.tmp.name)
+        cls.profile = t / 'games' / GAME_ID; cls.profile.mkdir(parents=True); cls.pkg = t / 'pkg'; cls.pkg.mkdir(); cls.cache = t / 'cache'
+        (cls.profile / 'game.tsv').write_text('# synthetic profile of dm/gfx/tests/test_dmsh_vk.py\nname\tsynthetic\n')
+        shapes = {k: (v[0], v[1], v[2]) for k, v in GRAPHICS.items()}
+        shapes.update({k: ('cs', d, {'img': {'0': {'type': image, 'fmt': fmt}}, 'local': [1, 1, 1]}) for k, (d, image, fmt) in list(compute_shapes().items())[:4]})
+        cls.keys = {}
+        rows, facts, packs = [], [], {}
+        for n, (name, (stage, data, f)) in enumerate(shapes.items()):
+            key = '%016x' % (0xa0 + n); cls.keys[name] = key
+            packs.setdefault(stage, []).append(record(data, stage, key, TF if name == 'vs_tf' else None))
+            rows.append(f'{stage}.bin\t{len(packs[stage]) - 1}\t{stage}\t{key}\tsynthetic {name}')
+            if f: facts.append(f'{key}\t{json.dumps(f, sort_keys=True, separators=(",", ":"))}')
+        for stage, recs in packs.items(): (cls.pkg / f'{stage}.bin').write_bytes(b''.join(recs))
+        (cls.profile / 'shader_map.tsv').write_text('package\tindex\tstage\tdm_ctl_sha16\tsource\n' + '\n'.join(rows) + '\n')
+        (cls.profile / 'shader_map.tsv.conflicts.tsv').write_text('')
+        (cls.profile / 'shader_facts.tsv').write_text('# synthetic answer table\n' + '\n'.join(facts) + '\n')
+        (cls.profile / 'shader_pairs.tsv').write_text(f'{cls.keys["vs_basic"]}\t{cls.keys["ps_mixed"]}\n')   # ps_mixed reads input 1, which vs_basic does not write: vs_pad
+        cls.env = dict(os.environ, DM_GAME=str(cls.profile), J='4')
+        cls.run1 = subprocess.run([sys.executable, str(TOOLS / 'dmsh_build_vk.py'), str(cls.pkg), str(cls.cache)], env=cls.env, capture_output=True, text=True)
+        cls.lib = cls.cache / (dmsh_chain_vk.PREFIX + dmsh_chain_vk.version())
+
+    @classmethod
+    def tearDownClass(cls): cls.tmp.cleanup()
+
+    def refl(self, name): return json.loads((self.lib / (self.keys[name] + '.json')).read_text())
+
+    def test_build(self):
+        self.assertEqual(self.run1.returncode, 0, self.run1.stdout + self.run1.stderr)
+        print('\n' + self.run1.stdout)
+        valid = 0
+        for name, key in self.keys.items():
+            for sfx in ('', '_bv', '_fp32'):
+                p = self.lib / f'{key}{sfx}.spv'
+                if p.exists(): ok, why = dmsh_spv.validate(str(p)); self.assertTrue(ok, f'{name}{sfx}: {why}'); valid += 1
+        print(f'build outputs spirv-val clean: {valid}')
+
+    def test_reflection(self):
+        for name in self.keys:
+            r = self.refl(name)
+            self.assertEqual((r['chain'], r['target'], r['dm_ctl']), (dmsh_chain_vk.version(), 'vk', self.keys[name]))
+            self.assertFalse([b for b in r['bindings'] if b['kind'] not in dmsh_build_vk.KINDS], name)
+            for b in r['bindings']: self.assertTrue(isinstance(b['set'], int) and isinstance(b['binding'], int))
+        tex = [(b['kind'], b.get('reg'), b['set'], b['binding']) for b in self.refl('ps_tex')['bindings'] if b['set'] == 2]
+        self.assertEqual(tex, [('tex', 0, 2, 2048), ('samp_tex', 0, 2, 2048)])
+        img = [(b['kind'], b.get('reg'), b.get('atomic'), b['rw']) for b in self.refl('cs_return_buffer')['bindings'] if b['set'] == 3]
+        self.assertEqual(img, [('img', 0, True, True)])
+        self.assertEqual(self.refl('ps_mixed')['interp']['flat'], 0b10)
+
+    def test_buffers(self):
+        b = {(x['kind'], x.get('reg')): x for x in self.refl('vs_cbuf')['bindings']}
+        self.assertEqual((b[('cbuf', 0)]['binding'], b[('c1', None)]['binding'], b[('sbuf', 0)]['set'], b[('sbuf', 0)]['rw']), (4, 2, 1, True))
+        c1 = (self.profile / 'c1_full_vk.tsv').read_text().splitlines()[1:]
+        self.assertEqual(c1, [self.keys['ps_cbuf']])   # c1 + 0 lies in the 256 bytes a shared bank gives any shader, c1 + 0x200 does not (c1_guard.py)
+        ext = dict(l.split('\t') for l in (self.profile / 'cb_extent_vk.tsv').read_text().splitlines()[2:])
+        self.assertEqual((ext[self.keys['vs_cbuf']], ext[self.keys['ps_cbuf']]), ('0:32', '1:48'))
+
+    def test_integer_outputs(self):   # every pixel shader with a colour output gets main_u, as dmsh_entry.py fs_uint gives every one main0_u; no build-time mask, so no main_m
+        for name in ('ps_uint', 'ps_mixed', 'ps_minmax', 'ps_tex', 'ps_cbuf'):
+            r = self.refl(name)
+            self.assertEqual((r['entries'], r.get('entry_u'), 'entry_m' in r), (['main', 'main_u'], 'main_u', False), name)
+        m = dmsh_spv.Module.read(self.lib / (self.keys['ps_mixed'] + '.spv'))
+        self.assertEqual(sorted(e[1] for e in m.entry_points()), ['main', 'main_u'])
+        r = self.refl('ps_mixed')['raster']
+        self.assertEqual((r['colors'], r['omap']), ([0, 1], 0xFF))   # the raster facts of dmsh_reflect.py raster_facts and the output map of dmsh_build.py ps_omap
+
+    def test_integer_inputs(self):
+        r = self.refl('vs_int')
+        self.assertEqual(r['int_inputs'], [1]); self.assertEqual({v['location']: v['type'] for v in r['vertex_inputs']}, {0: 'float', 1: 'uint'})
+        self.assertEqual(r['vin']['shadow'], [{'location': 1, 'float': 16, 'sint': 17}])
+        self.assertTrue((self.lib / (self.keys['vs_int'] + '_bv.spv')).exists())
+
+    def test_pad_and_variants(self):
+        self.assertEqual(self.refl('vs_basic')['vs_pad'], [1])
+        self.assertEqual(self.refl('vs_fp64')['fp32'], self.keys['vs_fp64'] + '_fp32')
+        self.assertEqual(self.refl('vs_tf')['tf_strides'], [16, 0, 0, 0])
+        m = dmsh_spv.Module.read(self.lib / (self.keys['vs_tf'] + '.spv'))   # the layout from the control section (tf_layout) reached the translator: Xfb decorations
+        self.assertEqual(sorted({d for d in (i[2] for i in m.of(dmsh_spv.DECORATE)) if d in (36, 37)}), [36, 37])
+        self.assertFalse(self.refl('gs_pass')['analysis'])
+
+    def test_stamp_and_tables(self):
+        sys.path.insert(0, str(ROOT / 'dm/games')); import game
+        self.assertEqual(shader_lib.read_stamp(str(self.lib)), {'game': GAME_ID, 'inputs': dmsh_chain.inputs(game.load(str(self.profile)))})
+        for t in ('c1_full_vk.tsv', 'cb_extent_vk.tsv'):
+            self.assertTrue((self.profile / t).read_text().startswith(f'# chain {self.lib.name} inputs '), t)
+
+    def test_steps_and_store(self):   # each step's count to its end and the times line; every content-store entry holds its library file's bytes, a hard link where the volume has them
+        for step in ('preparing', 'translating', 'analysing', 'translating again', 'finishing'):
+            self.assertRegex(self.run1.stdout, rf'(?m)^progress: {step} (\d+)/\1$')
+        self.assertRegex(self.run1.stdout, r'(?m)^times: preparing [\d.]+ s, translating [\d.]+ s, analysing [\d.]+ s, translating again [\d.]+ s, finishing [\d.]+ s, tables [\d.]+ s$')
+        with tempfile.TemporaryDirectory(dir=self.tmp.name) as d:   # whether this volume has hard links
+            try: os.link(self.lib / '_vk_build.json', Path(d) / 'l'); links = True
+            except OSError: links = False
+        n = 0
+        for digest in (self.cache / 'cas/vk/shader').iterdir():
+            for f in digest.rglob('*'):
+                if not f.is_file(): continue
+                g = self.lib / f.relative_to(digest); n += 1
+                self.assertEqual(f.read_bytes(), g.read_bytes(), f)
+                if links and f.suffix != '.json': self.assertTrue(os.path.samefile(f, g), f)   # a cache hit (test_cache_hit) writes the library's json anew
+        self.assertEqual(n, sum(1 for p in self.lib.rglob('*') if re.fullmatch(r'[0-9a-f]{16}(_bv|_fp32|_b)?\.(spv|json|metal)', p.name)))
+
+    def test_census(self):
+        r = subprocess.run([sys.executable, str(TOOLS / 'dmsh_build_vk.py'), '--census', str(self.cache)], env=self.env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stderr); print('\n' + r.stdout.strip())
+        rows = [l.split('\t') for l in (self.lib / 'census.tsv').read_text().splitlines()[2:]]
+        self.assertEqual([(x[0], x[2], x[3], x[8]) for x in rows], [(self.keys['ps_tex'], 'tex', '0', 'bits')])
+
+    def test_cache_hit(self):   # a second build takes every shader from the content-addressed cache, with the same outputs
+        before = {p.name: p.read_bytes() for p in self.lib.glob('*.spv')}
+        r = subprocess.run([sys.executable, str(TOOLS / 'dmsh_build_vk.py'), str(self.pkg), str(self.cache)], env=self.env, capture_output=True, text=True)
+        self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+        self.assertIn(f'shader cache: hit {len(self.keys)}, built 0', r.stdout)
+        self.assertEqual({p.name: p.read_bytes() for p in self.lib.glob('*.spv')}, before)
+
+    def test_records_by_key(self):   # a shader's record is the one its key names (dmsh_build.py record_index), not the map row's index (issue #1841); a key the package lacks stops the build
+        key = self.keys['ps_tex']; data = (self.pkg / 'ps.bin').read_bytes()
+        offs = [m.start() for m in re.finditer(b'BTCDBTCD', data)] + [len(data)]
+        recs = [data[a:b] for a, b in zip(offs, offs[1:])]
+        with tempfile.TemporaryDirectory(dir=self.tmp.name) as d:
+            d = Path(d); pkg = d / 'pkg'; shutil.copytree(self.pkg, pkg)
+            build = [sys.executable, str(TOOLS / 'dmsh_build_vk.py'), str(pkg), str(d / 'cache'), key]
+            (pkg / 'ps.bin').write_bytes(b''.join(reversed(recs)))   # every pixel shader at another index than its map row's
+            r = subprocess.run(build, env=self.env, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stdout + r.stderr)
+            self.assertEqual((d / 'cache' / self.lib.name / (key + '.spv')).read_bytes(), (self.lib / (key + '.spv')).read_bytes())
+            (pkg / 'ps.bin').write_bytes(b''.join(x for x in recs if x[8:16] != bytes.fromhex(key)))
+            r = subprocess.run(build, env=self.env, capture_output=True, text=True)
+            self.assertEqual(r.returncode, 1); self.assertIn(f'holds no record of shader {key}', r.stderr)
+
+
+if __name__ == '__main__':
+    unittest.main()

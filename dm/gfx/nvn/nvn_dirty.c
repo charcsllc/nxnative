@@ -2,15 +2,16 @@
 // before use, check the write generation of the covered pages and re-upload if newer than at upload time. NVN semantics: a texture descriptor points to pool memory, and the GPU reads the current content every time
 // (measured: the game writes streamed assets into texture storage that is still being sampled, without re-registering).
 // Signal handler constraint: the page-fault path uses only atomic operations and mprotect, no allocation, no locks.
+// The protection and the clock go through the platform layer (plat.h, step M6): plat_vm_protect is mprotect on Apple and Linux (async-signal-safe, as before) and VirtualProtect on
+// Windows; plat_now_ns is mach_absolute_time scaled to nanoseconds on Apple, the monotonic clock elsewhere (no lock, no allocation once its timebase is read, when the host loads: dirty_init); the kernel's protection of a page a fault no range claims is plat_vm_query (vm_region_64 on Apple)
 #include "nvn_dirty.h"
 #include "../../host/dm.h"
 #include <stdatomic.h>
 #include <pthread.h>
-#include <sys/mman.h>
-#include <unistd.h>
-#include <mach/mach_time.h>
-#include <mach/mach.h>
 #include <sched.h>
+#if defined(__APPLE__)
+#include <mach/mach.h>   // nvn_dirty_describe: vm_region_64's region information (shared, reserved)
+#endif
 
 // Order of page state and mprotect: the side changing protection first sets the state to BUSY and sets the final state only after mprotect has landed; other threads wait when they see BUSY.
 //   set read-only: NONE -> BUSY -> mprotect(read-only) -> PROT; unprotect: PROT -> BUSY -> mprotect(writable) -> NONE.
@@ -52,23 +53,22 @@ static pthread_mutex_t g_slot_mu = PTHREAD_MUTEX_INITIALIZER;   // Pool creation
 // epoch odd while changing descriptors, invalidating every thread's lookup cache.
 // This only validates selections: lock-free users still pin the selected range.
 static _Atomic uint64_t g_range_epoch;
-static _Atomic uint64_t g_mp_calls, g_mp_pages, g_mp_ticks;   // This module's mprotect: call count, pages covered, time spent (mach timebase, safe in the page-fault path too)
+static _Atomic uint64_t g_mp_calls, g_mp_pages, g_mp_ns;   // This module's mprotect: call count, pages covered, time spent (nanoseconds, plat_now_ns: safe in the page-fault path too)
 static _Atomic uint64_t g_mp_begun, g_mp_done;   // this module's protection changes begun and finished: on_fault tells from them whether its scan saw the protection as it is
 static void mp(uintptr_t a, size_t len, int prot) {
     atomic_fetch_add(&g_mp_begun, 1);
-    uint64_t t = mach_absolute_time(); mprotect((void *)a, len, prot); atomic_fetch_add(&g_mp_done, 1);
-    atomic_fetch_add(&g_mp_ticks, mach_absolute_time() - t); atomic_fetch_add(&g_mp_calls, 1); atomic_fetch_add(&g_mp_pages, len >> g_shift);
+    uint64_t t = plat_now_ns(); plat_vm_protect((void *)a, len, prot); atomic_fetch_add(&g_mp_done, 1);
+    atomic_fetch_add(&g_mp_ns, plat_now_ns() - t); atomic_fetch_add(&g_mp_calls, 1); atomic_fetch_add(&g_mp_pages, len >> g_shift);
 }
 
-static mach_timebase_info_data_t g_tb;   // obtained when the host loads (dirty_init; the fault path only multiplies and divides)
 static _Atomic int g_busy_red;
-// Wait for this page to leave BUSY. Returns 1 = it has left; 0 = waited past the limit (reported red once). Usable in a signal handler: only atomic reads, mach_absolute_time and sched_yield
+// Wait for this page to leave BUSY. Returns 1 = it has left; 0 = waited past the limit (reported red once). Usable in a signal handler: only atomic reads, plat_now_ns and sched_yield
 static int busy_wait(range_t *r, uintptr_t p) {
     uint64_t t0 = 0;
     for (unsigned n = 1; atomic_load(&r->state[p]) == PG_BUSY; n++) {
         if (n & 0x3ff) continue;
-        uint64_t now = mach_absolute_time(); if (!t0) t0 = now;
-        if ((now - t0) * g_tb.numer / g_tb.denom > (uint64_t)BUSY_WAIT_MS * 1000000ull) {
+        uint64_t now = plat_now_ns(); if (!t0) t0 = now;
+        if (now - t0 > (uint64_t)BUSY_WAIT_MS * 1000000ull) {
             if (!atomic_exchange(&g_busy_red, 1)) LOG("[RED] dirty-page tracking: page %p stuck 'busy' for over %d ms (the thread changing its protection has not finished), no longer waiting", (void *)(rb(r) + (p << g_shift)), BUSY_WAIT_MS);
             return 0; }
         sched_yield();
@@ -198,7 +198,7 @@ uint64_t nvn_dirty_own_writes(void) { return atomic_load(&g_own_writes); }
 static _Atomic uint64_t g_sparse_writes;   // writes to pages protected for a placement sparse tile (nvn_dirty_sparse_writes)
 static void sparse_note(range_t *r, uintptr_t p) { _Atomic uint8_t *sp = atomic_load(&r->sparse); if (sp && atomic_exchange(&sp[p], 0)) atomic_fetch_add(&g_sparse_writes, 1); }
 static void unprotect_page(range_t *r, uintptr_t p) {   // The caller has already changed the state from PROT to BUSY
-    mp(rb(r) + (p << g_shift), g_pg, PROT_READ | PROT_WRITE);
+    mp(rb(r) + (p << g_shift), g_pg, PLAT_PROT_READ | PLAT_PROT_WRITE);
     stamp_page(r, p); sparse_note(r, p); own_note();
     atomic_store(&r->state[p], PG_NONE);
 }
@@ -218,11 +218,11 @@ static int release_page(range_t *r, uintptr_t p, _Atomic uint64_t *count) {
         if (!busy_wait(r, p)) return 0;
     }
 }
-// The kernel's protection of the host page at a now: writable (and not executable). One vm_region call, made only for a fault no range claimed
+// The kernel's protection of the host page at a now: writable (and not executable). One vm_region call (plat_vm_query), made only for a fault no range claimed
 static int page_writable(uintptr_t a) {
-    vm_address_t pg = a & ~(g_pg - 1), va = pg; vm_size_t vs = 0; vm_region_basic_info_data_64_t bi; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj = MACH_PORT_NULL;
-    if (vm_region_64(mach_task_self(), &va, &vs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&bi, &cnt, &obj) != KERN_SUCCESS || va > pg) return 0;
-    return (bi.protection & (VM_PROT_WRITE | VM_PROT_EXECUTE)) == VM_PROT_WRITE;
+    uint64_t pg = a & ~(g_pg - 1), va = 0, vs = 0; int prot = 0;
+    if (plat_vm_query(pg, &va, &vs, &prot) || va > pg) return 0;
+    return (prot & (PLAT_PROT_WRITE | PLAT_PROT_EXEC)) == PLAT_PROT_WRITE;
 }
 // A write that faulted on a protected page may be handled only after a pool over it was retired: nvn_dirty_remove_range makes the pages writable, then drops the range, and the
 // scan then found no range to claim the fault, so the crash handler stopped the host on a write that was the tracker's (t_dirty_reuse). So a fault no range claims is re-executed
@@ -250,7 +250,7 @@ static void release_pages(range_t *r, uintptr_t p, uintptr_t q, _Atomic uint64_t
         uint8_t st = PG_NONE; int took = i <= q && take_page(r, i, &st);
         if (took) { if (!open) { run = i; open = 1; } continue; }
         if (open) {
-            mp(rb(r) + (run << g_shift), (i - run) << g_shift, PROT_READ | PROT_WRITE);
+            mp(rb(r) + (run << g_shift), (i - run) << g_shift, PLAT_PROT_READ | PLAT_PROT_WRITE);
             for (uintptr_t k = run; k < i; k++) { stamp_page(r, k); sparse_note(r, k); atomic_store(&r->state[k], PG_NONE); }
             if (count) atomic_fetch_add(count, i - run);
             open = 0;
@@ -279,7 +279,7 @@ static void prep_write(void *addr, size_t len) {
 // at that moment could get zero geometry or return before the hooks existed, and a host write into guest memory (hle_fs.c reading a file on a game thread) read crash.c's
 // hook table while it grew (PR #2225). With no pool registered the hooks scan an empty table, so a game that never makes one pays nothing for them
 __attribute__((constructor)) static void dirty_init(void) {
-    g_pg = (uintptr_t)getpagesize(); g_shift = __builtin_ctzl(g_pg); mach_timebase_info(&g_tb);
+    g_pg = (uintptr_t)plat_page_size(); g_shift = __builtin_ctzl(g_pg); (void)plat_now_ns();   // plat_now_ns: its timebase is read here, before a fault needs it
     dm_fault_hook_register(on_fault); dm_guest_write_prep_register(prep_write);
 }
 
@@ -391,7 +391,7 @@ void nvn_dirty_open(const void *addr, size_t len) {
     for (size_t j = 0; j < g_nopen; ) {
         range_t *r = g_open[j].r; size_t s = j++;
         while (j < g_nopen && g_open[j].r == r && g_open[j].p == g_open[s].p + (j - s)) j++;
-        mp(rb(r) + (g_open[s].p << g_shift), (j - s) << g_shift, PROT_READ | PROT_WRITE);
+        mp(rb(r) + (g_open[s].p << g_shift), (j - s) << g_shift, PLAT_PROT_READ | PLAT_PROT_WRITE);
         for (size_t k = s; k < j; k++) atomic_store(&r->state[g_open[k].p], PG_OPEN);
     }
     atomic_fetch_add(&g_opened, g_nopen);
@@ -403,7 +403,7 @@ void nvn_dirty_close(void) {
         range_t *r = g_open[j].r; size_t s = j;
         for (uint8_t st = PG_OPEN; j < g_nopen && g_open[j].r == r && g_open[j].p == g_open[s].p + (j - s) && atomic_compare_exchange_strong(&r->state[g_open[j].p], &st, PG_BUSY); st = PG_OPEN) j++;
         if (j == s) { j++; continue; }
-        mp(rb(r) + (g_open[s].p << g_shift), (j - s) << g_shift, PROT_READ);   // protected again first: a write from here on faults as usual, and the bytes stay as hashed below
+        mp(rb(r) + (g_open[s].p << g_shift), (j - s) << g_shift, PLAT_PROT_READ);   // protected again first: a write from here on faults as usual, and the bytes stay as hashed below
         for (size_t k = s; k < j; k++) atomic_store(&r->state[g_open[k].p], PG_PROT);
         for (size_t k = s; k < j; k++)
             if (page_hash((const void *)(rb(r) + (g_open[k].p << g_shift))) != g_open[k].h) { stamp_page(r, g_open[k].p); sparse_note(r, g_open[k].p); changed++; }
@@ -435,7 +435,7 @@ void nvn_dirty_protect(const void *addr, size_t len) {
         uint8_t st = PG_NONE;
         int took = i <= q && atomic_compare_exchange_strong(&r->state[i], &st, PG_BUSY);
         if (took && !open) { run = i; open = 1; }
-        if (!took && open) { mp(rb(r) + (run << g_shift), (i - run) << g_shift, PROT_READ); for (uintptr_t k = run; k < i; k++) atomic_store(&r->state[k], PG_PROT); open = 0; }
+        if (!took && open) { mp(rb(r) + (run << g_shift), (i - run) << g_shift, PLAT_PROT_READ); for (uintptr_t k = run; k < i; k++) atomic_store(&r->state[k], PG_PROT); open = 0; }
         if (!took && i <= q && st == PG_BUSY && busy_wait(r, i)) i--;   // this page again
     }
     pthread_mutex_unlock(&g_slot_mu);
@@ -532,6 +532,7 @@ void nvn_dirty_describe(const void *addr, const void *span, char *out, size_t n)
         if (w > 0) o += (size_t)w;
     }
     if (!found && o < n) { int w = snprintf(out + o, n - o, "no live range"); if (w > 0) o += (size_t)w; }
+#if defined(__APPLE__)
     vm_address_t va = a & ~(g_pg - 1); vm_size_t vs = 0; vm_region_basic_info_data_64_t bi; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj = MACH_PORT_NULL;
     kern_return_t kr = vm_region_64(mach_task_self(), &va, &vs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&bi, &cnt, &obj);
     if (o < n) {
@@ -539,6 +540,13 @@ void nvn_dirty_describe(const void *addr, const void *span, char *out, size_t n)
         else snprintf(out + o, n - o, "; kernel: %s%s%s%s", bi.protection & VM_PROT_READ ? "r" : "-", bi.protection & VM_PROT_WRITE ? "w" : "-", bi.shared ? " shared" : "",
                       bi.reserved ? " reserved" : "");
     }
+#else   // the protection through the platform layer; whether the region is shared or reserved is Mach's region information, which the other kernels' queries do not give
+    uint64_t va = 0, vs = 0; int prot = 0, kr = plat_vm_query(a & ~(g_pg - 1), &va, &vs, &prot);
+    if (o < n) {
+        if (kr || va > (a & ~(g_pg - 1))) snprintf(out + o, n - o, "; kernel: not mapped");
+        else snprintf(out + o, n - o, "; kernel: %s%s", prot & PLAT_PROT_READ ? "r" : "-", prot & PLAT_PROT_WRITE ? "w" : "-");
+    }
+#endif
 }
 void nvn_dirty_slot_stats(int *live, int *used_slots, uint64_t *adds_total) {
     int n = atomic_load(&g_nr), active = 0;
@@ -547,6 +555,5 @@ void nvn_dirty_slot_stats(int *live, int *used_slots, uint64_t *adds_total) {
 }
 void nvn_dirty_stats(uint64_t *faults, uint64_t *preps) { *faults = atomic_load(&g_faults); *preps = atomic_load(&g_preps); }
 void nvn_dirty_mp_stats(uint64_t *calls, uint64_t *pages, uint64_t *ns) {
-    static mach_timebase_info_data_t tb; if (!tb.denom) mach_timebase_info(&tb);
-    *calls = atomic_load(&g_mp_calls); *pages = atomic_load(&g_mp_pages); *ns = atomic_load(&g_mp_ticks) * tb.numer / tb.denom;
+    *calls = atomic_load(&g_mp_calls); *pages = atomic_load(&g_mp_pages); *ns = atomic_load(&g_mp_ns);
 }

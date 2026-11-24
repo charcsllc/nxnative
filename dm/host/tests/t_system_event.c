@@ -3,7 +3,6 @@
 // destruction and address / handle reuse always happen before the first tick.
 #include "../hle_thread.c"
 #include <assert.h>
-#include <mach-o/getsect.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
 #include <unistd.h>
@@ -20,8 +19,7 @@ static int test_create(pthread_t *th, const pthread_attr_t *attr, void *(*fn)(vo
     jobs[njobs] = fn; args[njobs++] = arg; return 0;
 }
 static int test_detach(pthread_t th) { (void)th; return 0; }
-static int test_sleep(const struct timespec *ts, struct timespec *left) {
-    (void)left;
+static void test_sleep(uint64_t ns) {   // the vsync worker's sleep (plat_sleep_ns)
     // Bound an old worker that incorrectly follows a replacement event: inspect
     // its first tick, then destroy the replacement so even that worker can exit.
     if (sleeps++ && observe && observe->wh) {
@@ -29,16 +27,15 @@ static int test_sleep(const struct timespec *ts, struct timespec *left) {
         destroy_event(observe);
     }
     assert(sleeps < 4);
-    clock_ns += (uint64_t)ts->tv_sec * 1000000000ull + ts->tv_nsec;
-    return 0;
+    clock_ns += ns;
 }
 #define pthread_create test_create
 #define pthread_detach test_detach
-#define nanosleep test_sleep
+#define plat_sleep_ns test_sleep
 #include "../hle_sdk16.c"
 #undef pthread_create
 #undef pthread_detach
-#undef nanosleep
+#undef plat_sleep_ns
 void dm_applet_enter(const char *name) { (void)name; }   // hle_oe.c: the shop stand-ins hold the game out of focus
 void dm_applet_leave(void) {}
 
@@ -63,6 +60,16 @@ int dm_game_imports(const char *prefix) { (void)prefix; return 1; }
 module_t *module_of(const void *p) { (void)p; return NULL; }
 void dm_backtrace(uint64_t fp) { (void)fp; }
 uint32_t hle_hid_connected_npad(void) { return 0; }
+#if !DM_NATIVE_EXEC
+// The x86-64 execution engine's side of hle_thread.c (aot_thread.c), which this test does not link: no thread here runs recompiled guest code
+dm_guest_state *dm_aot_thread_begin(void) { return NULL; }
+int dm_aot_thread_run(uint64_t entry, uint64_t arg, uint64_t sp) { (void)entry; (void)arg; (void)sp; abort(); }
+void dm_aot_thread_end(void) {}
+void dm_aot_thread_exiting(void) {}
+void dm_aot_thread_poke(dm_guest_state *st) { (void)st; }
+void dm_aot_thread_dump(dm_guest_state *st, uint32_t handle) { (void)st; (void)handle; }
+int dm_aot_stop_status(void) { return -1; }   // the process never stops here
+#endif
 uint32_t dm_native_image_blank(uint32_t w, uint32_t h) { (void)w; (void)h; return 0; }   // hle_codec_video.c: GameChat's camera storage
 void dm_native_image_blank_free(uint32_t handle) { (void)handle; }
 static uint32_t create_event(void *p, int mode, int interprocess) {
@@ -154,11 +161,11 @@ static void transfer_memory_handles(void) {
     regs[0] = other; assert(svc_thread(0x16, regs) && !regs[0]);
     regs[0] = event; assert(svc_thread(0x16, regs) && !regs[0]);
 }
+PLAT_TABLE_DEFINE(swforce)   // plat_table_swforce below
 // Resolve exactly the SDK imports the service watcher calls, through the host's normal force-hook table.
 static void *purchase_hook(const char *name) {
-    extern const struct mach_header_64 _mh_execute_header;
-    unsigned long bytes = 0;
-    const hle_force_ent *entries = (const hle_force_ent *)getsectiondata(&_mh_execute_header, "__DATA", "swforce", &bytes);
+    size_t bytes = 0;
+    const hle_force_ent *entries = (const hle_force_ent *)plat_table_swforce(&bytes);   // the host's forced registrations (plat.h; getsectiondata on Apple)
     for (size_t i = 0; i < bytes / sizeof *entries; i++) if (!strcmp(entries[i].name, name)) return (void *)entries[i].fn;
     fprintf(stderr, "missing purchased-item hook: %s\n", name); abort();
 }

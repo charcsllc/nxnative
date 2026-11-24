@@ -1,0 +1,397 @@
+// The lifter's lowering of one region (src/lift/lifter.h), shared by its source files: lifter.cpp (regions, terminals, registers, flags, integer
+// and memory operations), lower_fp.cpp (floating point, scalar and vector, with the NaN chains of aot-recompiler.md section 7.3), lower_vector.cpp
+// (integer vector and saturating operations), lower_crypto.cpp (AES, SHA-256, SM4) and lower_calls.cpp (function mode: calls, returns, tail
+// calls, the inline caches, host calls; sections 2.3, 3.3, 4). Internal to src/lift.
+#pragma once
+
+#include <array>
+#include <functional>
+#include <map>
+#include <optional>
+#include <set>
+#include <string>
+#include <unordered_map>
+#include <utility>
+#include <vector>
+
+#include <llvm/Analysis/InstSimplifyFolder.h>
+#include <llvm/IR/IRBuilder.h>
+#include <llvm/IR/Module.h>
+
+#include "dynarmic/ir/acc_type.h"
+#include "dynarmic/ir/basic_block.h"
+#include "dynarmic/ir/cond.h"
+#include "dynarmic/ir/microinstruction.h"
+#include "dynarmic/ir/opcodes.h"
+#include "lift/lifter.h"
+#include "nxaot/guest_state.h"
+
+namespace nxaot::lift::detail {
+
+using llvm::BasicBlock;
+using llvm::ConstantInt;
+using llvm::Value;
+namespace IR = Dynarmic::IR;
+
+// The four flags as i1 values
+struct Flags {
+    Value* n = nullptr;
+    Value* z = nullptr;
+    Value* c = nullptr;
+    Value* v = nullptr;
+};
+
+// What set the flags, when the block shows it: conditions then compare the operands directly (section 9.2) instead of combining flag bits
+enum class OriginKind { None, Sub, Logic };
+struct Origin {
+    OriginKind kind = OriginKind::None;
+    Value* a = nullptr;    // Sub: the operands of a - b (carry in 1)
+    Value* b = nullptr;
+    Value* res = nullptr;  // Sub and Logic: the result
+};
+
+// A value of a NaN chain (section 7.3): an operation whose result is bit-identical on Arm and x86 unless it is a NaN. `fast` is the native
+// result; `exact` rebuilds the Arm result from the exact values of the operands (on the cold path, after a check on an escaping value found a NaN)
+struct ChainNode {
+    std::vector<IR::Value> args;      // the operands of the IR instruction (the floating-point ones are looked up as chain values)
+    std::vector<bool> fp_arg;         // which operands are floating-point values of the chain's width
+    std::function<Value*(const std::vector<Value*>& exact_args)> exact;
+    Value* fast = nullptr;
+    llvm::Type* type = nullptr;       // float, double, <4 x float>, <2 x double>
+    bool dn_select = false;           // with FPCR.DN, the exact result is the default NaN exactly where the fast one is a NaN
+    bool exact_flags = false;         // its exact path (or a predecessor's) raises FPSR bits the fast one does not: with FPCR.DN too, an escape
+                                      // that sees a NaN takes the cold block instead of the default-NaN select
+    Value* escaped = nullptr;         // the exact value, once a use outside the chain asked for it
+};
+
+class FunctionLifter {
+public:
+    FunctionLifter(llvm::Module& module, const Region& region, const decode::CodeReader& read, const LiftOptions& options);
+
+    Lifted Run(const std::string& name);
+    std::string Dump();
+
+    // ---- Phase 1: translate the region's blocks and check their opcodes ----
+    void Discover(Lifted& out);
+    static void Successors(const IR::Terminal& t, const IR::Block& block, std::vector<uint64_t>& out);
+    bool InRegion(uint64_t pc) const {
+        if (pc >= region.lo && pc < region.hi) return true;
+        for (const auto& [lo, hi] : region.extra) {
+            if (pc >= lo && pc < hi) return true;
+        }
+        return false;
+    }
+    // Function mode: the translation stops before an observation gate's instruction, which then starts a block (the gate comes before it)
+    decode::StopBefore GateStops(uint64_t delta = 0) const;
+
+    // ---- Phase 2: lowering ----
+    void Prologue();
+    void Epilogue();
+    void LowerBlock(IR::Block& block);
+    void LowerInst(IR::Inst& inst);
+    void LowerTerminal(const IR::Terminal& t);
+    void Goto(Value* target);
+    void Exit(Value* pc, uint32_t reason, Value* arg);
+    Value* Opaque(llvm::Type* t);  // an unknown value of type t (the registers a call may change, Region::calls)
+    bool LowerContext(IR::Inst& inst);
+    bool LowerFlags(IR::Inst& inst);
+    bool LowerInteger(IR::Inst& inst);
+    bool LowerMemory(IR::Inst& inst);
+    bool LowerVectorRegisters(IR::Inst& inst);
+    bool LowerFP(IR::Inst& inst);         // lower_fp.cpp: scalar floating point
+    bool LowerFPVector(IR::Inst& inst);   // lower_fp.cpp: vector floating point
+    bool LowerVector(IR::Inst& inst);     // lower_vector.cpp
+    bool LowerSaturated(IR::Inst& inst);  // lower_vector.cpp: scalar and vector saturating arithmetic
+    bool LowerCrypto(IR::Inst& inst);     // lower_crypto.cpp
+
+    // ---- Values ----
+    Value* Get(const IR::Value& v);                  // the raw value; a chain value escapes (its exact value)
+    Value* Arg(const IR::Inst& inst, size_t i);      // converted to the natural type of the IR argument (integers, <2 x i64> for U128)
+    Value* ArgAs(const IR::Inst& inst, size_t i, llvm::Type* t);  // bit-cast to t (same size)
+    const Flags& FlagsArg(const IR::Inst& inst, size_t i);
+    void Def(const IR::Inst& inst, Value* v) { values[&inst] = v; }
+    llvm::Type* TypeOf(IR::Type t);
+    Value* As(Value* v, llvm::Type* t);              // bit-cast (or i128 <-> vector) to a type of the same size
+    Value* Field(size_t offset) { return B.CreateConstInBoundsGEP1_64(B.getInt8Ty(), st, offset); }
+    Value* LoadField(llvm::Type* ty, size_t offset) { return B.CreateAlignedLoad(ty, Field(offset), llvm::Align(ty->getPrimitiveSizeInBits() / 8)); }
+    void StoreField(Value* v, size_t offset) { B.CreateAlignedStore(v, Field(offset), llvm::Align(v->getType()->getPrimitiveSizeInBits() / 8)); }
+    Value* I(unsigned bits, uint64_t v) { return ConstantInt::get(B.getIntNTy(bits), v); }
+    Value* SignBit(Value* v) { return B.CreateICmpSLT(v, llvm::Constant::getNullValue(v->getType())); }
+    static unsigned Bits(Value* v) { return v->getType()->getScalarSizeInBits(); }
+    llvm::Function* Intrinsic(llvm::Intrinsic::ID id, llvm::ArrayRef<llvm::Type*> types = {});
+    Value* Call(llvm::Intrinsic::ID id, llvm::ArrayRef<llvm::Type*> types, llvm::ArrayRef<Value*> args);
+
+    // Vector types: n lanes of an integer of bits, of a float of bits (16, 32, 64)
+    llvm::FixedVectorType* VecI(unsigned bits) { return llvm::FixedVectorType::get(B.getIntNTy(bits), 128 / bits); }
+    llvm::FixedVectorType* VecF(unsigned bits) { return llvm::FixedVectorType::get(FloatTy(bits), 128 / bits); }
+    llvm::Type* FloatTy(unsigned bits);
+    llvm::Type* V128() { return VecI(64); }
+    Value* ArgVec(const IR::Inst& inst, size_t i, unsigned esize) { return ArgAs(inst, i, VecI(esize)); }
+    Value* Splat(unsigned esize, uint64_t v) { return llvm::ConstantVector::getSplat(llvm::ElementCount::getFixed(128 / esize), ConstantInt::get(B.getIntNTy(esize), v)); }
+    Value* SplatOf(Value* lanes_like, uint64_t v);  // a constant of v in every lane of the integer vector type of lanes_like (or the scalar)
+    Value* Shuffle(Value* a, Value* b, llvm::ArrayRef<int> mask) { return B.CreateShuffleVector(a, b, mask); }
+    Value* ZeroUpper(Value* v128);  // the low 64 bits kept, the high 64 zero
+
+    // ---- Flags and conditions ----
+    Flags CurrentFlags();
+    void SetFlags(const Flags& f, const Origin& origin);
+    Value* Cond(IR::Cond cond);
+    Flags FlagsFromOp(const IR::Inst& producer, Origin* origin);
+    Value* CarryOf(const IR::Inst& producer);
+    Value* OverflowOf(const IR::Inst& producer);
+    Value* PackNzcv(const Flags& f);
+    Flags UnpackNzcv(Value* packed);
+    Origin OriginOf(const IR::Inst& producer);  // FlagsFromOp's origin, no instruction made
+    // Function mode: the GetNZCVFromOp whose flags A64SetNZCV set last in the block and the allocas do not hold yet (lazily materialised NZCV,
+    // README.md, "Phase 5d"); MaterializeNzcv computes and stores them, before anything reads the allocas (CurrentFlags, GetCFlag), and at the
+    // block's end when NZCV is live after it (nzcv_live_out). While the terminator is lowered (in_terminator) a path that needs them makes
+    // them on that path and leaves them deferred for the others
+    const IR::Inst* deferred_nzcv = nullptr;
+    bool in_terminator = false;
+    void MaterializeNzcv();
+
+    // ---- Integer helpers ----
+    Value* Shift(IR::Opcode op, Value* v, Value* amount);
+    Value* FunnelRight(Value* hi, Value* lo, Value* amount);  // fshr; shifts and an or by a constant amount
+    Value* SignedField(const IR::Inst& or_inst);              // sbfm's or of a replicated bit and a field: a shift pair, or null
+    Value* Div(bool is_signed, Value* a, Value* b);
+    Value* Crc32Iso(Value* crc, Value* data, unsigned bytes);
+    Value* Crc32c(Value* crc, Value* data, unsigned bits);
+
+    // ---- Memory helpers ----
+    Value* GuestPtr(Value* vaddr) { return B.CreateIntToPtr(vaddr, B.getPtrTy()); }
+    llvm::Instruction* Mark(llvm::Instruction* i);
+    static bool Ordered(IR::AccType acc) { return acc == IR::AccType::ORDERED || acc == IR::AccType::ORDEREDRW || acc == IR::AccType::LIMITEDORDERED; }
+
+    // ---- FPSR: QC and the cumulative exception bits the lowering raises itself (section 7.4) ----
+    void OrQC(Value* saturated);                 // i1
+    void OrFpsrBits(Value* bits);                // i32 of FPSR cumulative bits (IOC 1, DZC 2, OFC 4, UFC 8, IXC 0x10, IDC 0x80)
+    Value* FpsrPtr() { return Field(offsetof(dm_guest_state, fpsr)); }
+    void FlushFpsr();                            // the accumulated QC and bits into st->fpsr (before a helper call, an FPSR read, an exit)
+    std::vector<llvm::StoreInst*> flushes;       // the stores to st->fpsr FlushFpsr made (FnCleanup erases them when nothing raised a bit)
+    Value* MxcsrFlags();                         // the native operations' flags as FPSR bits (stmxcsr)
+    void SetMxcsr(Value* fpcr, bool clear_flags);
+
+    // ---- Floating point (lower_fp.cpp) ----
+    uint32_t Fpcr() const { return fpcr; }
+    bool DN() const { return (fpcr >> 25) & 1; }
+    bool FZ() const { return (fpcr >> 24) & 1; }   // FZ specialised (LiftOptions::fz_runtime false); with FZ a run-time state, always false
+    // FZ as a run-time state (7.1; LiftOptions::fz_runtime): whether family's lowering tests FZ at run time; FzNow, FPCR.FZ of the moment (an i1 from
+    // st->fpcr, or the specialisation's constant); FpcrArg, the FPCR a helper is given (the specialisation's mode bits with FZ of the moment);
+    // SpecMask, the FPCR bits code is specialised on (kFpcrSpecMask, or kFpcrModeMask with FZ specialised)
+    bool FzTest(uint32_t family) const { return opts.fz_runtime && !(opts.fz_off & family); }
+    Value* FzNow(uint32_t family);
+    Value* FpcrArg(uint32_t family = kFzHelpers);
+    uint32_t SpecMask() const { return opts.fz_runtime ? kFpcrSpecMask : kFpcrModeMask; }
+    Value* FzMulAddFix(Value* r, Value* addend, Value* op1, Value* op2, bool sub);   // lower_fp.cpp: FZ of the moment on a fused multiply-add's result
+    llvm::Function* FzFmaFunction(llvm::Type* t, bool shared, bool define);          // its cold part, out of line (as NaNFunction)
+    bool AHP() const { return (fpcr >> 26) & 1; }
+    bool FZ16() const { return (fpcr >> 19) & 1; }
+    unsigned RMode() const { return (fpcr >> 22) & 3; }
+    Value* FArg(const IR::Inst& inst, size_t i, unsigned fsize);        // an exact scalar float operand
+    Value* FVecArg(const IR::Inst& inst, size_t i, unsigned fsize);     // an exact float vector operand
+    Value* ChainArg(const IR::Inst& inst, size_t i, llvm::Type* t);     // the fast value of a chain operand (a P operation or a compare)
+    void DefChain(const IR::Inst& inst, ChainNode node);
+    Value* Escape(ChainNode& node);
+    Value* Exact(const IR::Inst* inst, std::unordered_map<const IR::Inst*, Value*>& memo);
+    bool IsChain(const IR::Value& v) const { return !v.IsImmediate() && chain.count(v.GetInst()); }
+    // Integer-domain classification of float bits (no FP flags): t is an integer or integer vector type of the float's width
+    Value* IsNaN(Value* bits);
+    Value* IsSNaN(Value* bits);
+    Value* IsQNaN(Value* bits);
+    Value* IsDenormal(Value* bits);
+    Value* IsZeroF(Value* bits);
+    Value* IsInfF(Value* bits);
+    Value* Quiet(Value* bits);
+    Value* DefaultNaN(llvm::Type* int_type);
+    Value* FlushDenormal(Value* bits);           // FPCR.FZ: a denormal becomes a zero of its sign
+    Value* NaN2(Value* a, Value* b, Value* r);   // Arm's FPProcessNaNs for two operands, else r (with FPCR.DN the default NaN), on integer bits
+    Value* NaN3(Value* a, Value* b, Value* c, Value* r);
+    bool cold_exact = false;                     // lowering a chain's cold recompute (Escape): NaN1 / NaN2 / NaN3 call NaNCall
+    Value* NaNCall(unsigned arity, llvm::ArrayRef<Value*> args);  // the call of NaN<arity>'s out-of-line form for the arguments' type
+    // That form: nxaot.nan<arity>.<type>, a unit's own linkonce_odr copy, or a pack's shared one (declared, or defined: DefineNaNHelpers)
+    llvm::Function* NaNFunction(unsigned arity, llvm::Type* t, bool shared, bool define);
+    void DefineNaNHelpers();  // every shared form (lifter.h, DefineNaNHelpers)
+    // FPMulAdd's invalid case: a quiet NaN addend with infinity times zero (zero as FPCR.FZ reads it), per lane; raises IOC when the flags are
+    // modelled (x86's FMA returns the quiet NaN and raises nothing)
+    Value* MulAddInvalid(Value* addend_bits, Value* op1_bits, Value* op2_bits);
+    Value* NaN1(Value* a, Value* r);
+    Value* NaNResult(Value* r);                  // r, or the default NaN where r is a NaN (an invalid operation)
+    Value* AnyLane(Value* i1_or_vector);
+    Value* AsInt(Value* fp);                     // float bits as the integer (vector) type of the same width
+    Value* AsFloat(Value* bits);
+    llvm::RoundingMode RoundingOf(unsigned arm_rounding);
+    Value* RoundIntegral(Value* x, unsigned arm_rounding);   // to integral, no Inexact raised (floor, ceil, trunc, roundeven, ties away)
+    Value* HelperCall(const char* name, llvm::Type* ret, llvm::ArrayRef<Value*> args);
+    Value* PerLane(Value* vec_bits, unsigned esize, const std::function<Value*(Value* lane)>& fn);
+    // The exact lowerings shared by the scalar and vector forms; operands and results are integer bits (scalars or vectors)
+    Value* MinMax(bool is_max, bool numeric, Value* a, Value* b);
+    Value* StepFused(bool rsqrt, unsigned bits, Value* a, Value* b);
+    Value* StepSpecial(bool rsqrt, unsigned bits, Value* a, Value* b, Value* neg_a, Value* t, Value* special, Value* native);  // dynarmic's fallback
+    Value* Estimate(bool rsqrt, unsigned bits, Value* x, unsigned lanes);   // FRECPE / FRSQRTE of single and double precision, by the tables
+    llvm::GlobalVariable* EstimateTable(bool rsqrt);
+    llvm::Function* LanesFunction(uint32_t which, llvm::Type* t);   // the helper's lanes out of line (nxaot.fplanes), the unit's own copy
+    Value* HelperLanes(uint32_t which, Value* x, Value* y, Value* r, Value* mask, Value* fpcr);  // a call of it
+    Value* RoundInt(unsigned bits, Value* x, unsigned rounding, bool exact);
+    Value* ToFixed(Value* x, unsigned fsize, unsigned isize, bool is_unsigned, unsigned fbits, unsigned rounding);
+    Value* FromFixed(Value* x, unsigned isize, bool is_unsigned, unsigned to, unsigned fbits);  // a float value
+
+    llvm::Module& M;
+    llvm::LLVMContext& C;
+    // The builder folds what InstSimplify folds as each instruction is made (an add of 0, a shift by 0, a select on a constant, a zext of a
+    // trunc of a zext...): dynarmic's IR spells every mov, address and carry-less add that way, and InstCombine, the largest optimisation pass
+    // of tier W, otherwise removes them again (README.md, "Pack throughput", phase 5b). InstCombine applies the same folds, so the code is the same
+    llvm::IRBuilder<llvm::InstSimplifyFolder> B;
+    const Region& region;
+    const decode::CodeReader& read;
+    const LiftOptions opts;
+    const uint32_t fpcr;  // the FPCR the region is specialised for, as dynarmic's location descriptor keeps it (mode bits only)
+
+    std::map<uint64_t, IR::Block> blocks;
+    std::map<uint64_t, BasicBlock*> bbs;
+    std::map<uint64_t, CallEffect> call_effects;  // blocks ending in a call the region continues past (Region::calls), by block start
+    std::map<uint64_t, std::vector<uint64_t>> table_targets;  // blocks ending in a br with a known jump table (Region::tables), by block start
+    llvm::Function* F = nullptr;
+    Value* st = nullptr;
+    BasicBlock* exit_bb = nullptr;
+    std::array<llvm::AllocaInst*, 31> x{};
+    std::array<llvm::AllocaInst*, 32> vreg{};
+    llvm::AllocaInst* sp = nullptr;
+    std::array<llvm::AllocaInst*, 4> flag{};  // N, Z, C, V
+    llvm::AllocaInst* check_bit = nullptr;
+    llvm::AllocaInst* qc = nullptr;           // i1: saturation since the last flush
+    llvm::AllocaInst* fpsr_bits = nullptr;    // i32: cumulative bits the lowering raised since the last flush
+    std::array<bool, 31> wrote_x{};
+    std::array<bool, 32> wrote_v{};
+    bool wrote_sp = false, wrote_nzcv = false, uses_fpsr = false;
+
+    // Per block
+    std::unordered_map<const IR::Inst*, Value*> values;
+    std::unordered_map<const IR::Inst*, Flags> flag_values;
+    std::unordered_map<const IR::Inst*, Origin> origins;
+    std::unordered_map<const IR::Inst*, ChainNode> chain;
+    std::unordered_map<const IR::Inst*, std::vector<const IR::Inst*>> users;
+    Origin cur_origin;
+    uint64_t cur_end = 0;                   // the pc after the block's last instruction
+    const CallEffect* cur_call = nullptr;   // the block's call effects, when it ends in a call the region continues past
+    const std::vector<uint64_t>* cur_table = nullptr;  // the block's jump-table targets, when it ends in a br with a known table
+    Value* last_pc = nullptr;
+    Value* new_fpcr = nullptr;  // the value an msr fpcr of the block wrote (its terminal checks it)
+    bool terminated = false;
+    std::string error;
+    std::set<int> issues;            // DynarmicIssue values met (Lifted::dynarmic_issues)
+    void Note(int issue) { issues.insert(issue); }
+    // Arm's Input Denormal (IDC) under FPCR.FZ for the operands of an operation that unpacks them (FPUnpack): x86's DAZ flushes silently
+    void InputDenormal(std::initializer_list<Value*> operand_bits);
+    void NativeInputDenormal(std::initializer_list<Value*> operand_bits);   // the same for an operation dynarmic computes natively (lower_fp.cpp)
+    // The 64-bit vector forms (2S, 4H): the result's only uses keep its low 64 bits (VectorZeroUpper, SetD), so the upper lanes, zeros from
+    // GetD, are computed by nobody on Arm and must raise no exception here
+    bool LowHalfOnly(const IR::Inst& inst) const;
+
+    // ---- Function mode (lower_calls.cpp; LiftOptions::plan, lifter.h) ----
+    const FunctionPlan* plan = nullptr;
+    bool Fn() const { return plan != nullptr; }
+    enum class EndKind : uint8_t { Other, Bl, Blr, Ret, Br };  // how a block's last guest instruction leaves it
+    struct End {
+        EndKind kind = EndKind::Other;
+        uint64_t target = 0;  // Bl: the callee's offset
+    };
+    std::map<uint64_t, End> ends;                       // per block start
+    std::map<uint64_t, std::vector<uint64_t>> succs;    // per block start: the successors inside the function
+    std::map<uint64_t, Regs> gen;                       // per block start: the registers it writes
+    std::map<uint64_t, Regs> dirty_in;                  // per block start: the registers newer than their copy in the block at its start
+    std::map<uint64_t, Regs> entry_stores;              // loop heads whose every iteration calls: what an edge from outside the loop stores
+                                                        // (FnLoopHeads; FnGoto stores it on every edge, empty on the back edges)
+    std::set<uint64_t> svc_blocks;                      // blocks that end in svc (it stores the whole register file)
+    std::set<uint64_t> nzcv_live;                       // block starts where NZCV is live (some path reads it before writing it): a poll there
+                                                        // stores it, elsewhere it is dead and a poll leaves its block copy as it was
+    std::set<uint64_t> nzcv_live_out;                   // block starts whose block may have NZCV read after its end (a successor's live-in, a
+                                                        // call, return, svc or anything leaving the function)
+    std::set<std::pair<const IR::Inst*, size_t>> relative;  // immediate arguments that are module offsets (base-relative addresses)
+    decode::InstPcs inst_pcs;                           // the guest offset each IR instruction came from
+    std::unordered_map<Value*, uint64_t> rel_values;    // the base + offset values made for relative immediates, with their offsets
+    Value* base = nullptr;                              // the module's base address, loaded once at the entry
+    Value* entry_lr = nullptr;                          // the lr the function was entered with (section 3.3)
+    llvm::Instruction* init_after = nullptr;            // the registers' first values are stored after it (FnInitRegisters)
+    Regs cur_dirty;                                     // the block's dirty set at its end (dirty_in | gen)
+    Regs restore_block;                                 // restored registers whose block copy the function changed: stored again at returns
+    const IR::Inst* cur_inst = nullptr;                 // the instruction being lowered (relative immediates, line table, debug locations)
+    uint64_t cur_start = 0;                             // the block being lowered
+    Lifted* stats = nullptr;
+    unsigned lines_ = 0;
+
+    void FnClassify(uint64_t pc, const IR::Block& block, std::vector<uint64_t>& next);  // Discover: the block's end and successors
+    void FnRelative(uint64_t pc, IR::Block& block, const std::function<void(IR::Block&)>& passes);  // the base-relative immediates
+    void FnDataflow();
+    // The loop heads FnDataflow lets edges from outside store into (entry_stores) and, per head, which of its predecessors are in its loop
+    std::map<uint64_t, std::set<uint64_t>> FnLoopHeads();
+    void FnPrologue();
+    void FnInitRegisters();  // after the body: the first values of the registers it reads
+    void FnCleanup();        // then: the FPSR flushes of a function that raises no bit, and the allocas nothing loads (lifter.cpp)
+    void FnLowerTerminal(const IR::Terminal& t);
+    void FnGoto(Value* target);
+    void FnExit(Value* pc, uint32_t reason);
+    Value* Rel(uint64_t offset);                 // base + offset, remembered as an offset
+    std::optional<uint64_t> OffsetOf(Value* v);  // the module offset of a constant or base + offset value
+    uint64_t CurOffset() const;                  // the guest offset of the instruction being lowered
+    void LineEntry(llvm::Instruction* i, uint64_t offset);  // !pcsections: a line-table entry for i (section 3.5)
+    void StoreRegs(const Regs& r);
+    void ReloadRegs(const Regs& r);
+    std::vector<Value*> CallArgs(const CalleeView& c, llvm::FunctionType* type, Value* lr);
+    llvm::CallInst* EmitCall(const CalleeView& c, llvm::FunctionType* type, Value* callee, Value* lr, bool tail);
+    void FnCall(const CalleeView& c, llvm::FunctionType* type, Value* callee, uint64_t call_pc);
+    void FnCallDirect(uint64_t target, uint64_t call_pc);
+    void FnAfterCall();
+    void FnCallIndirect(Value* target, uint64_t call_pc);
+    void FnTail(const CalleeView& c, llvm::FunctionType* type, Value* callee);
+    void FnTailDirect(uint64_t target);
+    void FnTailIndirect(Value* target, uint64_t site);
+    void FnSplit(uint64_t target, bool store);  // to a block of another part of a split function (FunctionPlan::part_of)
+    void FnReturn(Value* target);
+    void FnTrap(Value* pc, uint32_t reason);
+    void FnSvc(Value* number, Value* next_pc);
+    Value* FnDispatch(Value* target, uint64_t site);  // the inline cache: the native standard entry of a guest address
+    // A guarded site (FunctionPlan::guarded, design 12's hot indirect targets): the view of the target its guard calls directly, null when it has none (or, for a call,
+    // when that target does not return)
+    const CalleeView* Guarded(uint64_t site, bool call) const;
+    void FnCallGuarded(Value* target, uint64_t call_pc, uint64_t to, const CalleeView& c);  // blr: the compare, the direct call, the inline cache
+    std::set<uint64_t> guarded_sites;                 // the sites lowered with a guard (Lifted::guarded)
+    llvm::Value* RetValue();                          // {x0, x1, v0..v3} of the current registers (poison outside self.rv)
+    // The end of every call site's pending path (FnCall): the function's own return taken from a pending transfer (README.md, "A return no native frame
+    // took": the return convention's registers from the block and a native return), else a return at once that writes nothing (propagation); one block
+    // per LLVM function, made at its first use
+    BasicBlock* OwnReturn();
+    BasicBlock* own_return_bb = nullptr;
+    // The JIT fallback (section 11): a call or tail call to a target that is no compiled entry goes through plan->jit_entry; a continuation the
+    // compiled code cannot run (FPCR away from the specialisation, an untranslated encoding, code that runs into no entry) is handed to
+    // plan->rt_jit with the function's own return as the stop, and the function then returns what the JIT left in the block
+    void FnJitCall(uint64_t target, uint64_t call_pc);
+    void FnJitTail(Value* target);
+    void FnJitContinue(Value* pc, uint32_t reason);
+    void JitContinue(Value* pc, uint32_t reason);   // FnJitContinue's code, not counted as a trap
+    // A guest b or br that leaves the function (a tail call) is a native tail call only when x30 is this function's entry lr, the return its native
+    // caller waits for (section 3.3): the compare, and on another x30 the transfer handed to the JIT with that return as its stop (JitContinue at the
+    // target, reason the JIT's miss there). Leaves the insert point where x30 is the entry's lr
+    void FnTailLr(Value* target, uint32_t reason);
+    // A safepoint poll (section 6.2): one compare and branch on st->poll; the cold path stores the dirty registers and pc (the block then holds
+    // the whole register file) and calls plan->rt_safepoint
+    enum class PollKind : uint8_t { Entry, Back, Table, Split };
+    void FnPoll(Value* pc, const Regs& dirty, PollKind kind, uint64_t site = 0, uint64_t target = 0);
+    struct PollSite {
+        PollKind kind;
+        uint64_t site = 0, target = 0;     // Back: the branch's guest offset and the block it goes back to
+        llvm::LoadInst* flag = nullptr;    // the load of st->poll
+        llvm::BranchInst* br = nullptr;    // the compare's branch: to cold (the flag set) or cont
+        BasicBlock* cold = nullptr;        // the stores, pc and the call of rt_safepoint
+        BasicBlock* cont = nullptr;        // where both go on
+    };
+    std::vector<PollSite> polls;
+    // After the body (Run): the polls of backward branches whose loop needs none, left out (lower_calls.cpp: the rule and its proof)
+    void FnElidePolls();
+    // A gate of design 1.1 (FunctionPlan::obs_gates, spin_gates): the dirty registers and pc to the block (it then holds the whole register file),
+    // plan->rt_gate(st, site), and with reload x0..x29 from the block again (an observer may change them)
+    void FnGate(uint64_t site, Value* pc, const Regs& dirty, bool reload);
+    std::set<uint64_t> gates_emitted;                   // the gate sites the function's code calls (Lifted::gates)
+};
+
+}  // namespace nxaot::lift::detail

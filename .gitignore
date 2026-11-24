@@ -2,12 +2,30 @@
 .iosdd/
 .iosdd_mac/
 .iosdd_*/
+# CMake build trees of the Linux / Windows host (docker/README.md)
+/build/
+# Host test logs are committed on purpose when a run fails (logs/README.md): never ignored, also not by a global *.log rule (this file takes precedence over it)
+!/logs/
+!/logs/**
 .DS_Store
 __pycache__/
 # Made from each shader build's Mac outputs (c1_guard.py, cb_extent.py; the NSP script makes them), not committed
 dm/games/*/c1_full.tsv
 dm/games/*/cb_extent.tsv
+# The same tables of the Vulkan chain (dmsh_build_vk.py)
+dm/games/*/c1_full_vk.tsv
+dm/games/*/cb_extent_vk.tsv
+
+.vscode/
+# Agent worktrees (CLAUDE.md): never committed
+/.claude/worktrees/
+
+Mario-vs-Donkey-Kong.xci
+
+/prod_keys_firmware/
 # coverage.py data and its JSON report (pyproject.toml, [tool.coverage.run])
 .coverage
 .coverage.*
 /coverage.json
+
+CLAUDE.md

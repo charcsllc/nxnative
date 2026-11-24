@@ -1,11 +1,15 @@
 """Needle's embedded NVN shader records, without game data."""
 from pathlib import Path
+import os
 import struct
 import sys
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'tools'))
+_had = os.environ.get('DM_GAME'); os.environ.setdefault('DM_GAME', '010015100B514000')   # shader_split loads a profile at import; these tests use no game's data, so any
+# profile does (tests.yml sets one for the CI); without DM_GAME, the CI's profile, set for the import only (other tests expect no default game)
 import shader_split as split
+if _had is None: del os.environ['DM_GAME']
 
 
 def shader(stage):
@@ -96,6 +100,10 @@ def pacx403(blocks, types=b'VertexShader\0PixelShader\0', deps=0):
     return bytes(head + data + b''.join(c for c, _, _ in rch))
 
 
+import importlib.util  # noqa: E402
+NO_LZ4 = '' if importlib.util.find_spec('lz4') else 'the PACx403 cases build and read LZ4 chunks: the lz4 Python module is not installed (pip install lz4)'
+
+
 class NeedleTests(unittest.TestCase):
     def test_nvn2_records(self):
         data = b'prefix\0' + container('vs', 'ps', 'cs', record=shader2) + b'suffix'
@@ -113,6 +121,7 @@ class NeedleTests(unittest.TestCase):
         with self.assertRaisesRegex(SystemExit, 'control length'):
             split.needle_shaders(data, 'bad control length')
 
+    @unittest.skipIf(NO_LZ4, NO_LZ4)
     def test_pacx403_blocks(self):
         # two blocks over several chunks (one of them stored), the second with the Needle container; the archive's raw bytes hold no readable container
         a = b'PACx402L' + bytes(0x28) + bytes(0x18000)
@@ -124,20 +133,24 @@ class NeedleTests(unittest.TestCase):
                 self.assertEqual([s for _, s, _, _ in found], ['vs', 'ps', 'cs'])
                 self.assertTrue(all(label.startswith('/raw/x.pac/shaders.001#NEEDLE@') for label, *_ in found))
 
+    @unittest.skipIf(NO_LZ4, NO_LZ4)
     def test_pacx403_resources_in_the_root(self):
         found = []
         split.scan_blob(pacx403([], types=b'ComputeShader\0' + container('cs', record=shader2)), '/raw/y.pac', found)
         self.assertEqual([(label.split('#')[0], s) for label, s, _, _ in found], [('/raw/y.pac/root', 'cs')])
 
+    @unittest.skipIf(NO_LZ4, NO_LZ4)
     def test_pacx403_without_shader_types_is_not_opened(self):
         d = pacx403([(b'stage.000', b'PACx402L' + bytes(0x28) + container('vs', record=shader2))], types=b'Texture\0Model\0')
         self.assertEqual(split.pacx4_parts(d, 'stage.pac'), [])
 
+    @unittest.skipIf(NO_LZ4, NO_LZ4)
     def test_pacx403_cut_short(self):
         d = pacx403([(b'shaders.000', b'PACx402L' + bytes(0x28))])
         with self.assertRaisesRegex(SystemExit, 'lie outside'):
             split.pacx4_parts(d[:-1], 'cut.pac')   # the root's last chunk cut short
 
+    @unittest.skipIf(NO_LZ4, NO_LZ4)
     def test_pacx403_truncated_header_and_root_chunk_table(self):
         deps = 0x18
         d = pacx403([], deps=deps)
@@ -145,6 +158,7 @@ class NeedleTests(unittest.TestCase):
             with self.subTest(length=length), self.assertRaisesRegex(SystemExit, f'PACx 403 {section}: .*lie outside'):
                 split.scan_blob(d[:length], 'cut.pac', [])
 
+    @unittest.skipIf(NO_LZ4, NO_LZ4)
     def test_pacx403_truncated_shader_root_header(self):
         root = b'PACx402LShader'
         d = bytearray(0x3c)

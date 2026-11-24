@@ -11,15 +11,31 @@
 // All waits hang on one global lock G, with one condition variable per thread; correctness first, performance to be measured later.
 #include <unistd.h>
 #include "dm.h"
+#define DM_HLE_THREAD_C 1   // for a test that includes this file and hle_sdk16.c in one unit (t_system_event): hle_sdk16.c's weak dm_detclock_vsync_event steps aside
 #include <errno.h>
 #include <sched.h>
 #include <signal.h>
-#include <sys/mman.h>
+#include <stdarg.h>
 #include <time.h>
-#include <mach/mach.h>
-#include <pthread/qos.h>
-#include <dlfcn.h>
 #include <stdatomic.h>
+#if DM_NATIVE_EXEC
+// Reading the registers of a running guest thread (pausing it for GetThreadContext3, the hitch and crash dumps) is tied to native execution: Mach thread states and the
+// SIGUSR2 handler's ucontext. Without it those parts compile out; the x86-64 execution engine (Phase 2) will provide the guest context from its own state
+#include <sys/mman.h>
+#include <mach/mach.h>
+#include <dlfcn.h>
+#endif
+#if !DM_NATIVE_EXEC
+#include "aot.h"   // the x86-64 execution engine (aot_*.c): a guest thread's state block, its safepoints, process stop
+#endif
+// A guest function this file calls (docs/design/aot-recompiler.md 2.4): the plain call where the guest's code runs natively (Apple), or where a unit test supplies it
+// as a C function (DM_TEST_GUEST_C); on the x86-64 engine a guest call on the calling thread (aot.h DM_GUEST_CALL: nested inside the host call it is answering)
+#if DM_NATIVE_EXEC || defined(DM_TEST_GUEST_C)
+#define GUEST_CALL(f, ...) f(__VA_ARGS__)
+#else
+#include "aot.h"
+#define GUEST_CALL DM_GUEST_CALL
+#endif
 
 #define R_TIMEOUT     0xEA01u   // Kernel module 1, description 117
 #define R_CANCELLED   0xEC01u   // 118
@@ -50,7 +66,9 @@ static void se_unbind(uint32_t wh) {   // caller holds G
     for (int i = 0; i < g_nse; ) if (g_se[i].wh == wh) g_se[i] = g_se[--g_nse]; else i++;
     pthread_mutex_unlock(&g_se_lock);
 }
-typedef struct event { int signaled; int refs; } event_t;
+// host: a service-layer SystemEvent, which host code signals (hle_bind_system_event); vsync: vi's vsync event, which under DM_DETCLOCK the guest clock signals at each vsync time,
+// the next one vnext (dm_detclock_vsync_event)
+typedef struct event { int signaled; int refs; int host; int vsync; uint64_t vnext; } event_t;
 typedef struct thr {
     uint32_t handle; uint64_t id;
     uint64_t entry, arg, stack_top; int prio, core; uint64_t mask;
@@ -67,7 +85,15 @@ typedef struct thr {
     struct { struct thr *by; uint64_t epoch; } hand[4]; int nhand;   // the handoffs this thread was made runnable for (its waker's, then those the waker belonged to), until it blocks (note_runnable / hand_leave)
     _Atomic int *host_work;    // points at the thread's dm_host_work (registered when the thread starts)
     int native_wait;          // nesting depth of a blocking native HLE wait (G held)
+    int nw_hold;               // of those, the waits that hold DM_DETCLOCK's guest clock as if the thread ran (dm_host_lock)
     int host_owned;            // a guest thread the host created itself (dm_guest_thread_spawn): it waits in host code and is not one of the game's threads
+    // DM_DETCLOCK (G held): the guest-clock deadline of the current timed wait or sleep (0 = none), a sleep on the guest clock (gdisp: the acquire's wait for the display), and a
+    // stop by SetThreadActivity waiting for the resume: what det_idle needs to tell whether a thread can run
+    uint64_t gdl; int gsleep, gdisp, pstop;
+    // DM_DETCLOCK: a host-owned thread that runs on the guest clock (dm_detclock_pace_thread: the audio renderer's, the movie decoder's deferred events), counted as a game thread,
+    // its next period's start and the period, a wake that its next sleep on the guest clock takes (dm_detclock_paced_wake)
+    int det_paced, det_wake; uint64_t det_next, det_period;
+    _Atomic int dt_read;       // DM_DETCLOCK_TRACE: host code let this thread go, and its next reading of the clock is traced (dt_wake, dm_detclock_trace_read)
     uint64_t wseq;             // Sequence number of wait registration: at equal priority first come, first woken (same order as the Horizon kernel's KThread wait tree)
     struct thr *next;          // Wait chain
     struct thr *all;           // All-threads chain (for the state dump)
@@ -83,7 +109,7 @@ typedef struct thr {
     uint64_t yrun_clk;                        // dm_clock_reads at the last yield: a pass that read the clock since makes the yield a clock wait (thr_yield)
     uint64_t cw_sig, cw_run, cw_last, cw_end, cw_per, cw_per2, cw_wake, ncwpred, ncwpred_seen;   // The clock wait followed (clock_wait): its x19–x28, the run it was last seen in, when its last yield returned,
     int cw_ok, cw_pred, cw_after, cw_trip;    // when its last wait ended, the last two periods between ends, when the predicted sleep ended, predicted sleeps (and at the last power report); periods in a row that matched, a predicted sleep in this run, yields after it, waits in a row that ended at the first poll after it
-    mach_port_t mport;         // Host thread port (to get CPU time)
+    plat_thread_t mport;       // Host thread (Apple: its Mach port), for its CPU time
     _Atomic int qos_pending;   // SetThreadPriority from another thread changed prio: the thread applies the new class at its next SVC (only a thread can set its own QoS)
     uint32_t qos;
     // Pausing (SetThreadActivity, used by IL2CPP's garbage collector to stop the world): pause_req = requested, paused = stopped for the current request; when stopped inside an SVC the context comes from the gate frame svc_regs (registered on SVC entry),
@@ -96,10 +122,19 @@ typedef struct thr {
     sync_ref_t wobjs[MAX_SYNC_OBJECTS]; int wn, widx;   // WaitSynchronization's retained objects (the first wn) and the index the completing signal recorded, independent of handle reuse and guest memory (Horizon: KThread's sync object buffer)
     int ctx_ok; uint64_t ctx_x[29], ctx_fp, ctx_lr, ctx_sp, ctx_pc; uint32_t ctx_pstate, ctx_fpcr, ctx_fpsr; __uint128_t ctx_v[32];
     pthread_cond_t pcv;
+#if !DM_NATIVE_EXEC
+    // The x86-64 execution engine: the thread's state block (aot_thread.c), which holds its whole register file wherever it is stopped (at a safepoint poll,
+    // inside an SVC, in the JIT: design 6.2) and which SetThreadActivity pokes and GetThreadContext3 reads, under G. NULL before the thread runs guest code and
+    // once it exited (thread_exit clears it under G before the block goes)
+    dm_guest_state *st;
+#endif
     _Atomic int sig_pend;   // wakes of this thread signalled after G is let go and not signalled yet (g_unlock): thr_free waits for them
 } thr_t;
 static thr_t *g_all;
 extern __thread _Atomic int dm_host_work;   // declared in hle.h too; defined in hle_nvn.c
+static void dt_wake(thr_t *t, char was);   // DM_DETCLOCK_TRACE (below)
+static void dt_block(const thr_t *t);
+_Atomic int dm_detclock_tracing;           // DM_DETCLOCK_TRACE is open: the trace's hooks run (a flag check where it is off)
 static _Atomic uint64_t g_preempt_n, g_preempt_ns;   // same-core handoffs: count and total wait (svc_thread)
 static int g_core_preempt;   // also check already-runnable peers after every thread SVC (profile / DM_PREEMPT)
 
@@ -164,7 +199,11 @@ static thr_t *cur(void) {
 // the caller's core runs until it blocks before the signalling thread continues.
 // See docs/reference/threads.md, "Same-core wake handoffs", for the movie lifetime failure this prevents.
 // svc_thread calls it after waking such a thread. Wait for guest blocking, not a host dispatch snapshot or a wall-clock deadline: neither establishes that the work has finished.
-void dm_thread_mark_host(void) { thr_t *t = pthread_getspecific(g_keythr); if (t) t->host_owned = 1; }
+static void det_idle(void);   // DM_DETCLOCK: the guest clock's idle jump (below)
+void dm_thread_mark_host(void) {
+    thr_t *t = pthread_getspecific(g_keythr); if (!t) return;
+    g_lock(); t->host_owned = 1; if (dm_detclock_enabled()) det_idle(); g_unlock();   // it no longer counts among the game's threads
+}
 // Holding G. wake() clears wkind before the pthread resumes; it must already count as runnable in that window, even if Mach still reports WAITING / STOPPED.
 // Explicit host GPU work and contended native codec locks do not occupy a guest core. Ordinary host dispatch delays and HLE calls do, until a guest wait / sleep / exit or a service request (dm_thread_service_request) says otherwise.
 static int thr_runnable(const thr_t *t) {
@@ -208,9 +247,9 @@ void dm_thread_service_connect(void) {
         for (thr_t *t = g_all; t; t = t->all) if (t->started && !t->entered && !t->exited && !t->host_owned) waiting = 1;
         g_unlock();
         if (!waiting || now_ns() >= end) break;
-        usleep(50);
+        plat_sleep_ns(50000);
     }
-    usleep(200);
+    plat_sleep_ns(200000);
 }
 #define SERVICE_START_WAIT_NS 5000000
 #define SERVICE_ROUND_TRIP_NS 200000
@@ -227,25 +266,30 @@ void dm_thread_service_request(void) {
     while (me->start_by && now_ns() - t0 < SERVICE_START_WAIT_NS) {
         if (atomic_load(&me->start_by->hand_epoch) != epoch) { back = 1; break; }
         g_unlock();
-        { struct timespec ts = {0, 50000}; nanosleep(&ts, 0); }
+        plat_sleep_ns(50000);
         g_lock();
     }
     me->start_by = NULL; me->native_wait--;
     g_unlock();
-    if (back) { struct timespec ts = {0, SERVICE_ROUND_TRIP_NS}; nanosleep(&ts, 0); }
+    if (back) plat_sleep_ns(SERVICE_ROUND_TRIP_NS);
 }
 // A native HLE condition wait is a guest blocking boundary, like a kernel wait.
 // Called with the HLE's condition mutex held: the waiter cannot miss a signal
 // between publishing its blocked state and pthread_cond_wait releasing that
 // mutex. On return it is runnable before it goes back to guest code.
-void dm_thread_native_wait(int entering) {
+// hold: under DM_DETCLOCK the wait holds the guest clock as if the thread ran (dm_host_lock below)
+static void native_wait(int entering, int hold) {
     thr_t *t = pthread_getspecific(g_keythr);
     if (!t) return;
     g_lock();
-    if (entering) { t->native_wait++; hand_leave(t); }
-    else { if (!t->native_wait) die("unbalanced native HLE wait"); t->native_wait--; }
+    if (entering) { t->native_wait++; t->nw_hold += hold; hand_leave(t);
+                    if (atomic_load_explicit(&dm_detclock_tracing, memory_order_relaxed)) dt_block(t);
+                    if (dm_detclock_enabled()) det_idle(); }
+    else { if (!t->native_wait) die("unbalanced native HLE wait"); t->native_wait--; t->nw_hold -= hold;
+           if (!hold && atomic_load_explicit(&dm_detclock_tracing, memory_order_relaxed)) dt_wake(t, 'n'); }
     g_unlock();
 }
+void dm_thread_native_wait(int entering) { native_wait(entering, 0); }
 
 // The peers a handoff waits for are the ones it made runnable, not every runnable higher-priority thread of the core. The host runs a
 // lower-priority thread beside busy higher-priority threads of its core all the time (it has no per-core scheduler; core_preempt aside),
@@ -297,18 +341,282 @@ int dm_yield_to_core_peers(int all) {
 // Take a host lock that an HLE call holds while it runs guest code. A guest thread waiting for it is in a native HLE wait (dm_thread_native_wait), blocked as it would be
 // on the guest-visible lock the SDK's own code uses there, so it does not hold a same-core handoff: Kirby and the Forgotten Land's guide movies froze the game when the movie decoder's decode lock was held across the
 // "input available" SignalEvent, the signal woke the priority-44 movie threads of core 0, and the signaller (a priority-46 job worker) waited for its woken input thread,
-// which was itself waiting for that lock (hle_movie.c md_pump)
+// which was itself waiting for that lock (hle_movie.c md_pump).
+// Under DM_DETCLOCK the wait holds the guest clock: its holder is a thread that runs (a game thread, or a host-owned one on the guest clock, which holds it while it signals) or
+// host work, and the release comes when that work ends, not at a guest time. Counted as blocked, the waiter let the clock jump on while a host-owned thread held the lock, and in
+// the moment between the holder's release and the waiter's return the holder's next wait could jump it too: a different guest time in each run (Mario vs. Donkey Kong's movie
+// thread at its deferred "input available"; docs/reference/threads.md, "Two runs under DM_DETCLOCK part from the boot")
 void dm_host_lock(pthread_mutex_t *m) {
     if (!pthread_mutex_trylock(m)) return;
-    dm_thread_native_wait(1);
+    native_wait(1, 1);
     pthread_mutex_lock(m);
-    dm_thread_native_wait(0);
+    native_wait(0, 1);
 }
 
 // ---------- Wait primitives (called holding G) ----------
 static void wait_unlink(thr_t *t) {
     for (thr_t **p = &g_wait; *p; p = &(*p)->next) if (*p == t) { *p = t->next; break; }
     t->next = NULL;
+}
+
+// ---------- The deterministic guest clock's idle jump (DM_DETCLOCK; called holding G) ----------
+// Under the switch the guest clock is virtual time (hle_os.c): a present moves it a step, and nothing else did, so a thread that presents only after a thread that sleeps on the
+// guest clock never presented again (Mario vs. Donkey Kong stopped at frame 1: its main thread waited for workers in SleepThread). Now, when no game thread can run, the last one
+// to block moves the clock to the earliest guest-clock deadline and wakes the threads due, as a kernel's timer would with every core idle. The move happens at a guest event (that
+// block), never while a game thread runs, so two runs with the same inputs read the same clock values at the same guest events. What can run, and so holds the clock:
+//   · a game thread that runs guest code or host code: an SVC, an HLE call, a submit or a present (dm_host_work), file I/O, a wait in host code outside the kernel's bookkeeping
+//     that ends by itself (a GPU fence), a yield or spin back-off (a poll), a thread just woken or started that has not returned yet;
+//   · a guest thread the host made for itself that runs on the guest clock (det_paced: the audio renderer's render thread, dm_detclock_pace_thread), while it renders.
+// What cannot: a kernel wait (lock, condition variable, address, synchronization objects), a sleep on the guest clock (gsleep), a native HLE wait (the notification queue:
+// blocked as on the guest-visible object the SDK would use; a wait for a host lock in dm_host_lock holds the clock, nw_hold), a stop by SetThreadActivity (pstop), a thread
+// created and not started, an exited one.
+// Not counted at all: host threads (the window's presenter, vsync, audio output, movie decoders) and the other guest threads the host made for itself (host_owned). They run on
+// the wall clock and signal guest events; a game thread waiting for them is blocked like any other.
+// The audio renderer's render thread rendered when the output handed a buffer back, every 5 ms of wall time, and signalled the game's renderer event then: the game's audio thread
+// woke at a guest time the host's pace chose, and a load that waits for it took a different guest time in each run (Mario vs. Donkey Kong's boot: 104 to 686 ms; docs/reference/
+// threads.md, "Two runs under DM_DETCLOCK part from the boot"). Under the switch it renders every 5 ms of guest time, as a Switch's DSP does, and holds the clock while it renders.
+// vi's vsync event is the display's, and comes on the guest clock at each vsync time (dm_detclock_vsync_event): a game thread waiting on it has the next one as its deadline, and
+// reaching it signals the event (det_expire). A host thread signalled it at 60 Hz of wall time before, which tied the frames of a game that paces itself on it to the host's pace.
+// One exception keeps the clock where it is: no jump while the game thread that presents waits only on events host code signals (det_host_wait), since that host signal and the
+// present after it move the clock; otherwise another thread's short timed waits would run the clock ahead until the host signal came, at the host's pace.
+static uint64_t (*g_det_jump)(uint64_t to);   // hle_os.c det_jump, registered when the switch takes the clock over (the host's start)
+static thr_t *g_presenter;                    // the game thread that presented last (dm_detclock_presented); NULL once freed
+static uint64_t g_vorigin, g_vstep;           // the vsync times: g_vorigin + k × g_vstep (the clock's origin, DM_DETCLOCK's step)
+static event_t *g_vsync[8]; static int g_nvsync;   // vi's vsync events (dm_detclock_vsync_event)
+static uint64_t det_vnext(uint64_t now) { return g_vorigin + ((now - g_vorigin) / g_vstep + 1) * g_vstep; }   // the first vsync time after now
+static void dt_open(uint64_t origin, uint64_t step);   // DM_DETCLOCK_TRACE (below)
+void dm_detclock_set_jump(uint64_t (*jump)(uint64_t to), uint64_t origin, uint64_t step) {
+    g_lock();
+    g_vorigin = origin; g_vstep = step ? step : 1; g_det_jump = jump;
+    for (int i = 0; i < g_nvsync; i++) g_vsync[i]->vnext = det_vnext(origin);
+    dt_open(origin, g_vstep);
+    g_unlock();
+}
+// vi's vsync event (hle_sdk16.c GetDisplayVsyncEvent, once it is bound): under DM_DETCLOCK the guest clock signals it at each vsync time, and the host's vsync thread no longer does
+// (hle_signal_system_event_binding). Without the switch it only marks the event
+void dm_detclock_vsync_event(void *ev) {
+    g_lock();
+    pthread_mutex_lock(&g_se_lock); uint32_t wh = se_find(ev); pthread_mutex_unlock(&g_se_lock);
+    event_t *e = wh ? h_peek(wh, O_EVENT_W) : NULL;
+    if (e && !e->vsync && g_nvsync < (int)(sizeof g_vsync / sizeof g_vsync[0])) {
+        e->vsync = 1; g_vsync[g_nvsync++] = e;
+        if (g_det_jump) e->vnext = det_vnext(guest_ns());
+    }
+    g_unlock();
+}
+static void vsync_forget(event_t *e) {   // holding G: the event is freed
+    for (int i = 0; i < g_nvsync; ) if (g_vsync[i] == e) g_vsync[i] = g_vsync[--g_nvsync]; else i++;
+}
+static int det_vsync_wait(const thr_t *t, uint64_t *next) {   // holding G: t waits on a vsync event (WaitSynchronization); *next = the earliest of their next vsync times
+    if (t->wkind != 4 || t->woke || t->wn <= 0) return 0;
+    int any = 0;
+    for (int i = 0; i < t->wn; i++) {
+        event_t *e = t->wobjs[i].type == O_EVENT_R ? t->wobjs[i].obj : NULL;
+        if (e && e->vsync && e->vnext && (!any || e->vnext < *next)) { *next = e->vnext; any = 1; }
+    }
+    return any;
+}
+// A kernel timeout's guest-clock deadline: Horizon's kernel counts a timeout on the system counter (19.2 MHz), from the tick of the call, the timeout in ticks rounded up, plus 2
+// (mesosphère's WaitSynchronization, WaitProcessWideKeyAtomic and SleepThread: GetTick() + Tick(ns) + 2), and the wait ends when the counter reaches that tick: here the first
+// nanosecond of it on the guest clock, whose tick the guest then reads (guest_ns * 12 / 625). The deadline used to be the call's clock + ns, which can fall in the tick before the
+// one the SDK's own deadline names: its timer wait then saw "not due yet, zero time left", polled without an SVC, and, as nothing moves the clock while a thread runs, polled for
+// ever (Mario vs. Donkey Kong's rmbl::VibrationThread in nn::os::WaitTimerEvent; docs/reference/threads.md, "A timer wait polls for ever under DM_DETCLOCK")
+static uint64_t det_deadline(uint64_t now, uint64_t ns) {
+    unsigned __int128 tick = (unsigned __int128)now * 12 / 625 + ((unsigned __int128)ns * 12 + 624) / 625 + 2, d = (tick * 625 + 11) / 12;
+    return d > UINT64_MAX / 2 ? UINT64_MAX / 2 : (uint64_t)d;   // a timeout of centuries is a deadline never reached
+}
+// The threads whose guest-clock deadline has come (now) wake as their timeout: unlinked and runnable at once, before they return, so that a later det_idle counts them as running.
+// A vsync time that has come signals vi's vsync event, once however many passed, as the display's would be until a wait takes it
+static void wake_sync_waiters(const void *obj);
+static void det_expire(uint64_t now) {
+    for (int i = 0; i < g_nvsync; i++) {
+        event_t *e = g_vsync[i];
+        if (e->vnext && e->vnext <= now) { e->signaled = 1; e->vnext = det_vnext(now); wake_sync_waiters(e); }
+    }
+    for (thr_t *t = g_all; t; t = t->all) {
+        if (!t->gdl || t->gdl > now) continue;
+        if (t->gsleep) { t->gsleep = 0; t->sleeping = 0; }
+        else if (t->wkind && !t->woke) { wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = R_TIMEOUT; }
+        else continue;   // already woken: it clears its deadline itself
+        t->gdl = 0; pthread_cond_signal(&t->cv);
+    }
+}
+// t waits only on events host code signals (service-layer SystemEvents but vi's vsync event), in WaitSynchronization: wobjs holds the objects it retains while it waits
+// (wake_sync_waiters reads them too)
+static int det_host_wait(const thr_t *t) {
+    if (t->wkind != 4 || t->woke || t->wn <= 0) return 0;
+    for (int i = 0; i < t->wn; i++) {
+        const event_t *e = t->wobjs[i].type == O_EVENT_R ? t->wobjs[i].obj : NULL;
+        if (!e || !e->host || e->vsync) return 0;
+    }
+    return 1;
+}
+// ---------- DM_DETCLOCK_TRACE=<file> (with DM_DETCLOCK): one line per event that moves the guest clock or feeds it ----------
+// Two runs with the same input must write the same lines; dm/tools/detclock_trace_cmp.py prints the first that differs (docs/reference/threads.md, the DM_DETCLOCK entry). A line is
+// its kind, the idle jumps so far, the guest time in ns from the clock's origin, then the event's fields; a thread is its handle and its state (dt_state: r runs, s sleeps on the
+// guest clock, d waits for the display, l c a w v waits on a lock, a condition variable, an address, objects, vi's vsync event, n a native HLE wait, h a wait for a host lock,
+// which holds the clock, p stopped, x exited):
+//   O <origin ns> <step ns>                the switch took the clock over (the times below count from the origin)
+//   J <from> <to> <blocked last> <due>     an idle jump: the thread that ran det_idle (- for host code) and the thread whose deadline the clock reached
+//   P <frame> <thread> <interval>          a present (interval 0: a layer whose present moves the clock)
+//   E <event> <source>                     host code signalled a guest event (its write handle); source: host (a host thread) or the host-owned guest thread's handle
+//   H <thread> <source>                    host code woke a game thread from a kernel wait (the thread's state before the wake)
+//   N <thread>                             a game thread left a native HLE wait (not a host lock's), which host code ends
+//   R <thread>                             that thread's first reading of the clock after an H or N
+//   B <thread> <deadline>                  a game thread blocks (its state: the wait it enters), until a guest time (from the origin) or - for none
+//   T <thread> <priority> <name>           a thread starts (its name from the SDK's ThreadType)
+//   I <frame> <thread> <buttons> <sticks>  the scripted input changed (DM_CTL, DM_KEYS: a host thread, 0), after that frame's present
+//   K <frame> <thread> <buttons> <sticks>  a game thread read a changed input state for the first time
+// Host-owned threads on the guest clock (det_paced) are the guest's own: their signals and wakes are not traced, their blocks are. Lines at one guest time come in the order the
+// host ran their threads, which two runs need not share: the compare script compares each time's lines as a set.
+// The file is flushed at each present. Off, the hooks cost a flag check where a thread blocks, is woken or leaves a native wait, and where the guest reads the clock under the switch
+static FILE *g_dtf; static pthread_mutex_t g_dt_mu = PTHREAD_MUTEX_INITIALIZER; static uint64_t g_dt_base; static _Atomic uint64_t g_dt_jumps;
+static const char *thr_name(thr_t *t, char *nb, size_t n);
+static __thread int t_dt_own;   // the trace reads the clock itself: not the thread's reading
+static void dt_line(char kind, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+static void dt_line(char kind, const char *fmt, ...) {
+    t_dt_own = 1; uint64_t t = guest_ns() - g_dt_base; t_dt_own = 0;
+    va_list ap; va_start(ap, fmt);
+    pthread_mutex_lock(&g_dt_mu);
+    if (g_dtf) { fprintf(g_dtf, "%c %llu %llu ", kind, (unsigned long long)atomic_load(&g_dt_jumps), (unsigned long long)t); vfprintf(g_dtf, fmt, ap); fputc('\n', g_dtf);
+                 if (kind == 'P') fflush(g_dtf); }
+    pthread_mutex_unlock(&g_dt_mu);
+    va_end(ap);
+}
+static char dt_state(const thr_t *t) {   // holding G
+    uint64_t v;
+    if (!t) return '-';
+    if (t->exited) return 'x';
+    if (t->gsleep) return t->gdisp ? 'd' : 's';
+    if (t->wkind && !t->woke) return t->wkind == 1 ? 'l' : t->wkind == 2 ? 'c' : t->wkind == 3 ? 'a' : det_vsync_wait(t, &v) ? 'v' : 'w';
+    if (t->native_wait) return t->nw_hold ? 'h' : 'n';
+    if (t->pstop) return 'p';
+    return 'r';
+}
+static const char *dt_src(char *b, size_t n) {   // the calling thread as a source of host events: host, or a host-owned guest thread's handle; NULL for a game thread
+    thr_t *s = pthread_getspecific(g_keythr);
+    if (!s) return "host";
+    if (!s->host_owned || s->det_paced) return NULL;   // a thread on the guest clock is the guest's own
+    snprintf(b, n, "%#x", s->handle); return b;
+}
+static void dt_open(uint64_t origin, uint64_t step) {   // holding G (dm_detclock_set_jump)
+    const char *p = getenv("DM_DETCLOCK_TRACE");
+    if (!p || !*p || g_dtf) return;
+    FILE *f = fopen(p, "w");
+    if (!f) { LOG("[RED] DM_DETCLOCK_TRACE: cannot write %s", p); return; }
+    setvbuf(f, NULL, _IOFBF, 1 << 20);
+    g_dt_base = origin; g_dtf = f; atomic_store(&dm_detclock_tracing, 1);
+    LOG("DM_DETCLOCK_TRACE: the guest clock's events go to %s", p);
+    fprintf(f, "O 0 0 %llu %llu\n", (unsigned long long)origin, (unsigned long long)step);
+}
+// t was let go by host code (holding G for a kernel wait; was: its state before, 'n' when it left a native wait itself)
+static void dt_wake(thr_t *t, char was) {
+    char b[24]; const char *src = was == 'n' ? "" : dt_src(b, sizeof b);
+    if (!src || t->host_owned || !g_det_jump) return;   // a game thread's wake by a game thread is the guest's own
+    if (was == 'n') dt_line('N', "%#x", t->handle);
+    else dt_line('H', "%#x:%c %s", t->handle, was, src);
+    atomic_store(&t->dt_read, 1);
+}
+// hle_os.c's guest_ns under the switch while the trace is open: the calling thread's first reading after host code let it go
+void dm_detclock_trace_read(void) {
+    thr_t *t = t_dt_own ? NULL : pthread_getspecific(g_keythr);
+    if (t && atomic_load_explicit(&t->dt_read, memory_order_relaxed) && atomic_exchange(&t->dt_read, 0)) dt_line('R', "%#x", t->handle);
+}
+static void dt_block(const thr_t *t) {   // holding G: t enters a wait (its state set)
+    if (!g_det_jump || (t->host_owned && !t->det_paced)) return;
+    if (t->gdl) dt_line('B', "%#x:%c %llu", t->handle, dt_state(t), (unsigned long long)(t->gdl - g_dt_base));
+    else dt_line('B', "%#x:%c -", t->handle, dt_state(t));
+}
+static void dt_thread(thr_t *t) {   // holding G: t starts
+    char nb[48];
+    if (g_det_jump) dt_line('T', "%#x %d %s", t->handle, t->prio, thr_name(t, nb, sizeof nb));
+}
+static _Atomic uint64_t g_dt_frame;   // the last present's frame (dm_detclock_presented, under the switch)
+// hle_hid.c: the scripted input changed (I: DM_CTL's or DM_KEYS' host thread), or a game thread read a changed state for the first time (K)
+void dm_detclock_trace_input(char kind, uint64_t buttons, uint64_t axes) {
+    if (!atomic_load_explicit(&dm_detclock_tracing, memory_order_relaxed) || !g_det_jump) return;
+    thr_t *t = pthread_getspecific(g_keythr);
+    dt_line(kind, "%llu %#x %#llx %#llx", (unsigned long long)atomic_load(&g_dt_frame), t ? t->handle : 0, (unsigned long long)buttons, (unsigned long long)axes);
+}
+static void dt_signal(uint32_t wh) {   // host code signals the event whose write end is wh
+    char b[24]; const char *src = dt_src(b, sizeof b);
+    if (src && g_det_jump) dt_line('E', "%#x %s", wh, src);
+}
+
+// Frame-counted input from the host (DM_CTL's and DM_KEYS' thread, hle_hid.c): the control thread presses and releases keys after given frames. It did so when it saw the frame
+// counter move, polling every millisecond of wall time, so a change fell at another guest time in each run (one 0.1 ms apart in Mario vs. Donkey Kong's boot), and whether a
+// game thread's input read came before or after it was the host's pace (docs/reference/threads.md, "Two runs under DM_DETCLOCK part from the boot"). Under the switch it is made where the guest is
+// quiescent: the control thread waits until its frame has been presented and no game thread can run, det_idle holds the clock there instead of jumping, the thread makes its
+// changes and lets the clock go on with its next frame registered at once (dm_detclock_frame_wait), so the game reads every change at the same guest time in every run
+static uint64_t g_bar_frame;   // the frame the control thread waits for (0: none)
+static int g_bar_hit;          // the guest is held there
+static pthread_cond_t g_bar_cv = PTHREAD_COND_INITIALIZER;
+static void det_idle(void) {
+    if (!g_det_jump) return;
+    uint64_t dl = UINT64_MAX, v; const thr_t *due = NULL;
+    for (thr_t *t = g_all; t; t = t->all) {
+        if (!t->started || t->exited) continue;
+        int waits = t->gsleep || (t->wkind && !t->woke);
+        if (waits && t->gdl && t->gdl < dl) { dl = t->gdl; due = t; }   // a host-owned thread's guest-clock deadline is one too
+        if (waits && det_vsync_wait(t, &v) && v < dl) { dl = v; due = t; }   // a wait on vi's vsync event lasts until the next vsync time
+        if (t->host_owned && !t->det_paced) continue;
+        if (waits || (t->native_wait && !t->nw_hold) || t->pstop) continue;
+        return;   // it runs
+    }
+    if (g_bar_frame && atomic_load(&g_dt_frame) >= g_bar_frame) {   // the control thread's frame: held for its changes
+        if (!g_bar_hit) { g_bar_hit = 1; pthread_cond_broadcast(&g_bar_cv); }
+        return;
+    }
+    if (dl == UINT64_MAX || (g_presenter && det_host_wait(g_presenter))) return;
+    t_dt_own = 1; uint64_t from = guest_ns(); t_dt_own = 0;
+    uint64_t to = g_det_jump(dl);
+    if (to != from && atomic_load_explicit(&dm_detclock_tracing, memory_order_relaxed)) {
+        atomic_fetch_add(&g_dt_jumps, 1);
+        const thr_t *me = pthread_getspecific(g_keythr);
+        char a[24], b[24];
+        if (me) snprintf(a, sizeof a, "%#x:%c", me->handle, dt_state(me)); else snprintf(a, sizeof a, "-");
+        snprintf(b, sizeof b, "%#x:%c", due->handle, dt_state(due));
+        dt_line('J', "%llu %llu %s %s", (unsigned long long)(from - g_dt_base), (unsigned long long)(to - g_dt_base), a, b);
+    }
+    det_expire(to);
+}
+// The guest clock moved or runs again: the threads due wake, and threads that all blocked meanwhile may jump it
+void dm_guest_clock_advanced(void) {
+    if (!dm_detclock_enabled()) return;
+    g_lock();
+    det_expire(guest_ns()); det_idle();
+    g_unlock();
+}
+void dm_detclock_presented(uint64_t frame, int itv) {
+    if (!dm_detclock_enabled()) return;
+    thr_t *me = pthread_getspecific(g_keythr);
+    g_lock();
+    if (me && !me->host_owned && g_presenter != me) {
+        static int n; if (n++ < 4) LOG("DM_DETCLOCK: thread %#x presents", me->handle);
+        g_presenter = me;
+    }
+    atomic_store(&g_dt_frame, frame);
+    if (atomic_load_explicit(&dm_detclock_tracing, memory_order_relaxed)) dt_line('P', "%llu %#x %d", (unsigned long long)frame, me ? me->handle : 0, itv);
+    det_expire(guest_ns()); det_idle();
+    g_unlock();
+}
+// The control thread (a host thread): under DM_DETCLOCK, wait until `frame` has been presented and no game thread can run, and keep the guest there until the next call
+// or dm_detclock_frame_release (det_idle above). Its previous hold ends here, after the new frame is set, so no frame passes between the two. 0 without the switch (the caller
+// waits as before)
+int dm_detclock_frame_wait(uint64_t frame) {
+    if (!dm_detclock_enabled()) return 0;
+    g_lock();
+    g_bar_frame = frame ? frame : 1; g_bar_hit = 0;
+    det_idle();   // a guest held at the previous frame goes on; one already quiescent past this frame is held at once
+    while (!g_bar_hit && g_bar_frame) g_cond_wait(&g_bar_cv, NULL);
+    g_unlock();
+    return 1;
+}
+void dm_detclock_frame_release(void) {   // the control thread has nothing more to do at a frame: the guest goes on
+    if (!dm_detclock_enabled()) return;
+    g_lock();
+    if (g_bar_frame) { g_bar_frame = 0; g_bar_hit = 0; det_expire(guest_ns()); det_idle(); }
+    g_unlock();
 }
 // Pick a waiter in kernel order: numerically lower priority first, at equal priority the earlier registered first (holding G). kind 1 matches by lock address, 2 by condition key, 3 by address
 static uint64_t g_wseq;
@@ -339,15 +647,28 @@ static void wake_queue(thr_t *t) {
     else pthread_cond_signal(&t->cv);
 }
 static void wake(thr_t *t, int64_t res) {
+    char was = atomic_load_explicit(&dm_detclock_tracing, memory_order_relaxed) ? dt_state(t) : 0;
     wait_unlink(t); t->wkind = 0; t->woke = 1; t->wres = res; wake_queue(t);
     note_runnable(t);
+    if (was) dt_wake(t, was);
 }
-// Suspend until woken or timed out (ns<0 infinite, 0 immediate timeout); returns wres or R_TIMEOUT.
-// Relative timeouts use host time even in replay: this wait may hold up the next present that advances the guest clock.
-static int64_t block(thr_t *t, int kind, int64_t ns) {
+// Suspend until woken or timed out (ns<0 infinite, 0 immediate timeout); returns wres or R_TIMEOUT. until: under DM_DETCLOCK the guest-clock deadline a caller keeps across its
+// waits (WaitSynchronization), 0 = the kernel's deadline for ns from now
+static int64_t block(thr_t *t, int kind, int64_t ns, uint64_t until) {
     t->wkind = kind; t->woke = 0; t->next = g_wait; g_wait = t; t->wseq = ++g_wseq;
     if (ns == 0) { wait_unlink(t); t->wkind = 0; return R_TIMEOUT; }
     hand_leave(t);
+    if (dm_detclock_enabled()) {   // DM_DETCLOCK: the timeout counts on the guest clock, which a present or the last game thread to block moves (det_idle), waking this one (det_expire)
+        t->gdl = ns > 0 ? (until ? until : det_deadline(guest_ns(), (uint64_t)ns)) : 0;
+        if (atomic_load_explicit(&dm_detclock_tracing, memory_order_relaxed)) dt_block(t);
+        det_idle();
+        while (!t->woke) {
+            if (t->gdl && guest_ns() >= t->gdl) { wait_unlink(t); t->wkind = 0; t->gdl = 0; return R_TIMEOUT; }
+            g_cond_wait(&t->cv, NULL);
+        }
+        t->gdl = 0;
+        return t->wres;
+    }
     struct timespec dl;
     if (ns > 0) { clock_gettime(CLOCK_REALTIME, &dl); dl.tv_sec += ns / 1000000000; dl.tv_nsec += ns % 1000000000;
                   if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; } }
@@ -400,16 +721,16 @@ static void qos_map_init(void) {
     if (g_qos_map) LOG("DM_QOS_MAP=1: guest threads get QoS by priority (≤%d interactive, ≤%d user-initiated, the rest utility)", g_qos_e1, g_qos_e2);
 }
 int dm_qos_map_on(void) { return g_qos_map; }
-static qos_class_t prio_qos(int prio) {
-    if (!g_qos_map) return QOS_CLASS_USER_INTERACTIVE;
-    return prio <= g_qos_e1 ? QOS_CLASS_USER_INTERACTIVE : prio <= g_qos_e2 ? QOS_CLASS_USER_INITIATED : QOS_CLASS_UTILITY;
+static plat_qos_t prio_qos(int prio) {
+    if (!g_qos_map) return PLAT_QOS_USER_INTERACTIVE;
+    return prio <= g_qos_e1 ? PLAT_QOS_USER_INTERACTIVE : prio <= g_qos_e2 ? PLAT_QOS_USER_INITIATED : PLAT_QOS_UTILITY;
 }
 static void qos_apply(thr_t *t) {   // on the thread itself, holding G (prio and qos are shared with scheduler readers)
-    qos_class_t q = prio_qos(t->prio);
-    if ((uint32_t)q != t->qos && !pthread_set_qos_class_self_np(q, 0)) t->qos = (uint32_t)q;
+    plat_qos_t q = prio_qos(t->prio);
+    if ((uint32_t)q != t->qos && !plat_qos_set_self(q)) t->qos = (uint32_t)q;
 }
 // A host helper thread (audio notify / silent sink, vsync, movie decode) created from a guest thread inherits that thread's class; under DM_QOS_MAP it sets its own instead
-void dm_host_helper_qos(qos_class_t q) { if (g_qos_map) pthread_set_qos_class_self_np(q, 0); }
+void dm_host_helper_qos(plat_qos_t q) { if (g_qos_map) plat_qos_set_self(q); }
 static const char *thr_name(thr_t *t, char *buf, size_t n);
 static void thread_exit(thr_t *t);
 static void *thread_main(void *p) {
@@ -417,10 +738,9 @@ static void *thread_main(void *p) {
     pthread_setspecific(g_keythr, t);
     // CreateThread may already have linked t into g_all: readers and SetThreadPriority hold G.
     g_lock();
-    pthread_set_qos_class_self_np(prio_qos(t->prio), 0);
-    qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
-    pthread_get_qos_class_np(pthread_self(), &qc, &rp); t->qos = (uint32_t)qc;
-    t->mport = pthread_mach_thread_np(pthread_self()); t->host_work = &dm_host_work;
+    plat_qos_set_self(prio_qos(t->prio));
+    t->qos = (uint32_t)plat_qos_self();
+    t->mport = plat_thread_self(); t->host_work = &dm_host_work;
     g_unlock();
     crash_thread_init();
     guest_thread_init(); guest_thread_set_id(t->id);
@@ -429,10 +749,20 @@ static void *thread_main(void *p) {
     // Without this the pthread and its 1 MB stack waited for ever, and the object kept a slot of the thread limit (thr_limit_used counts it as not exited)
     g_lock(); while (!t->started && !t->closed) g_cond_wait(&t->cv, NULL);
     int run = t->started; if (run) t->entered = 1; g_unlock();
-    if (!run) thread_exit(t);   // never reaches guest code; StartThread before the close still runs it
-    { char nb[48], hn[64]; snprintf(hn, sizeof hn, "%#x %s", t->handle, thr_name(t, nb, sizeof nb)); pthread_setname_np(hn); }   // the guest's name (set before StartThread) for sample / Instruments
+    if (!run) { thread_exit(t); return NULL; }   // never reaches guest code; StartThread before the close still runs it (on the x86-64 engine thread_exit returns, and t may be gone)
+    { char nb[48], hn[64]; snprintf(hn, sizeof hn, "%#x %s", t->handle, thr_name(t, nb, sizeof nb)); plat_thread_set_name(hn); }   // the guest's name (set before StartThread) for sample / Instruments
+#if DM_NATIVE_EXEC || defined(DM_TEST_THREAD_ENTER)   // the notification scheduler test supplies a C entry for real thread SVCs
     dm_thread_enter(t->entry, t->arg, t->stack_top);   // Does not return: the guest must exit through ExitThread
     die("guest thread entry returned");
+#else
+    // The x86-64 execution engine: the thread's state block, published under G for SetThreadActivity and GetThreadContext3, then its entry through
+    // dm_guest_call on this thread's native stack (aot_thread.c). It comes back when the thread left its guest code: through ExitThread (thread_exit then
+    // marked it exited, and t may be gone), or through a process stop or a fault, which mark it here
+    { dm_guest_state *st = dm_aot_thread_begin(); g_lock(); t->st = st; g_unlock(); }
+    if (dm_aot_thread_run(t->entry, t->arg, t->stack_top) != DM_AOT_LEFT_EXIT) thread_exit(t);
+    dm_aot_thread_end();
+    return NULL;
+#endif
 }
 static void thr_free(thr_t *t) {   // Holding G; unlink from the all-threads chain and free
     for (int i = 0; i < t_nwdef; ) if (t_wdef[i] == t) { atomic_fetch_sub_explicit(&t->sig_pend, 1, memory_order_relaxed); t_wdef[i] = t_wdef[--t_nwdef]; } else i++;   // its own list: nothing left to wake
@@ -443,6 +773,7 @@ static void thr_free(thr_t *t) {   // Holding G; unlink from the all-threads cha
         for (int i = 0; i < u->nhand; ) if (u->hand[i].by == t) u->hand[i] = u->hand[--u->nhand]; else i++;
         if (u->start_by == t) u->start_by = NULL;
     }
+    if (g_presenter == t) g_presenter = NULL;
     pthread_cond_destroy(&t->cv); pthread_cond_destroy(&t->pcv); if (t->hcv_init) pthread_cond_destroy(&t->hcv); free(t);
 }
 static void thr_put(thr_t *t) {   // Holding G; drop a reference taken with t->refs++ (a wait, a pause): the last holder of a closed, exited thread frees it
@@ -456,10 +787,18 @@ static void thread_exit(thr_t *t) {
     t->exited = 1;
     hand_signal(t);         // a handoff it held ends here
     wake_sync_waiters(t);   // Complete synchronization waits on this thread
+    if (dm_detclock_enabled()) det_idle();   // it may have been the last game thread that could run
     pthread_setspecific(g_keythr, NULL);
+#if !DM_NATIVE_EXEC
+    t->st = NULL;   // its state block goes once the thread has left its guest code (aot_thread.c)
+#endif
     if (t->closed && !t->refs) thr_free(t);
     g_unlock();
+#if DM_NATIVE_EXEC || defined(DM_TEST_THREAD_ENTER)
     pthread_exit(NULL);
+#else
+    dm_aot_thread_exiting();   // the x86-64 engine: the thread leaves its guest code when this SVC returns (aot_run.c), and thread_main ends it
+#endif
 }
 void dm_thread_returned(void) { die("guest thread entry function returned (Horizon requires ExitThread)"); }
 
@@ -472,6 +811,7 @@ void dm_thread_returned(void) { die("guest thread entry function returned (Horiz
 //     A thread stopped inside an SVC leaves by the lock-free exit once resumed; with the flag left set, the next pause returned at once while the thread ran guest code, with an empty context
 //     (Aokana: FMOD's stream thread decoded while IL2CPP's liveness pass had set bit 0 of the class words of the objects it used, and jumped through one).
 module_t *module_of(const void *p);
+#if DM_NATIVE_EXEC
 static void on_pause_sig(int sig, siginfo_t *si, void *uc_) {
     (void)sig; (void)si;
     thr_t *t = pthread_getspecific(g_keythr);
@@ -488,16 +828,22 @@ static void on_pause_sig(int sig, siginfo_t *si, void *uc_) {
         t->ctx_fp = __darwin_arm_thread_state64_get_fp(*ss); t->ctx_lr = __darwin_arm_thread_state64_get_lr(*ss);
         t->ctx_sp = __darwin_arm_thread_state64_get_sp(*ss) - 32; t->ctx_pc = __darwin_arm_thread_state64_get_pc(*ss); t->ctx_pstate = ss->__cpsr;
         memcpy(t->ctx_v, uc->uc_mcontext->__ns.__v, sizeof t->ctx_v); t->ctx_fpcr = uc->uc_mcontext->__ns.__fpcr; t->ctx_fpsr = uc->uc_mcontext->__ns.__fpsr;
-        t->ctx_ok = 1;
+        t->ctx_ok = 1; t->pstop = 1;
+        if (dm_detclock_enabled()) det_idle();   // stopped: it may have been the last game thread that could run
         while (t->pause_req) { t->paused = 1; pthread_cond_broadcast(&t->pcv); g_cond_wait(&t->pcv, NULL); }
-        t->paused = 0; t->ctx_ok = 0;
+        t->paused = 0; t->ctx_ok = 0; t->pstop = 0;
     }
     g_unlock();
 }
+#endif
 // called by the gate on SVC entry / exit (gate_dispatch in hle.c)
 void thr_svc_enter(uint64_t *regs, uint64_t pc) {
     thr_t *t = pthread_getspecific(g_keythr); if (!t) return;
+#if DM_NATIVE_EXEC
     t->svc_pc = pc; t->svc_x18 = (uint64_t)(uintptr_t)pthread_getspecific(g_key18); atomic_store(&t->svc_regs, regs); atomic_fetch_or(&t->svc_state, 1);
+#else
+    t->svc_pc = pc; atomic_store(&t->svc_regs, regs); atomic_fetch_or(&t->svc_state, 1);   // the x86-64 engine: regs is the state block (x at its offset 0), x18 an ordinary register in it
+#endif
     if (atomic_load_explicit(&t->qos_pending, memory_order_relaxed) && atomic_exchange(&t->qos_pending, 0)) {
         g_lock(); qos_apply(t); g_unlock();
     }
@@ -507,20 +853,42 @@ void thr_svc_leave(void) {
     thr_t *t = pthread_getspecific(g_keythr); if (!t) return;
     int in = 1; if (atomic_compare_exchange_strong(&t->svc_state, &in, 0)) { atomic_store(&t->svc_regs, NULL); return; }   // no pause requested: G is not needed (every other thread's SVC takes it)
     g_lock();
-    while (t->pause_req) { t->paused = 1; pthread_cond_broadcast(&t->pcv); g_cond_wait(&t->pcv, NULL); }
-    t->paused = 0; atomic_fetch_and(&t->svc_state, ~1); atomic_store(&t->svc_regs, NULL);
+    if (t->pause_req && dm_detclock_enabled()) { t->pstop = 1; det_idle(); }   // stopped: it may have been the last game thread that could run
+    while (t->pause_req) { t->paused = 1; t->pstop = 1; pthread_cond_broadcast(&t->pcv); g_cond_wait(&t->pcv, NULL); }
+    t->paused = 0; t->pstop = 0; atomic_fetch_and(&t->svc_state, ~1); atomic_store(&t->svc_regs, NULL);
     g_unlock();
 }
 static void pause_install(void) {
+#if DM_NATIVE_EXEC
     struct sigaction sa = {.sa_sigaction = on_pause_sig, .sa_flags = SA_SIGINFO | SA_ONSTACK | SA_RESTART};
     sigemptyset(&sa.sa_mask);
     sigaction(SIGUSR2, &sa, NULL);
+#endif   // otherwise a thread running guest code pauses at its next SVC (thr_svc_enter); the engine's own stop points come with it (Phase 2)
+}
+// Ask a thread that runs guest code to stop where it is (the pause signal); without native execution it stops at its next SVC
+static void pause_poke(thr_t *t) {
+#if DM_NATIVE_EXEC
+    pthread_kill(t->pt, SIGUSR2);
+#else
+    // The x86-64 engine: the poll byte its compiled code reads at function entries and loop back-edges, and its JIT instance halted (design 6.2). Under G,
+    // which thread_exit holds while it clears t->st before the block goes
+    g_lock(); dm_aot_thread_poke(t->st); g_unlock();
+#endif
 }
 // Horizon svc::ThreadContext (arm64, 0x320 bytes)
 typedef struct { uint64_t r[29], fp, lr, sp, pc; uint32_t pstate, pad; __uint128_t v[32]; uint32_t fpcr, fpsr; uint64_t tpidr; } hz_ctx_t;
 _Static_assert(sizeof(hz_ctx_t) == 0x320, "ThreadContext");
 static void ctx_fill(const thr_t *t, hz_ctx_t *o) {   // holding G, t is stopped
     memset(o, 0, sizeof *o);
+#if !DM_NATIVE_EXEC
+    // The x86-64 engine: the state block holds the whole register file of a thread stopped at a poll, inside an SVC or in the JIT (design 2.1, 6.2), x18 included
+    const dm_guest_state *s = t->st;
+    if (s) {
+        for (int i = 0; i < 29; i++) o->r[i] = s->x[i];
+        o->fp = s->x[29]; o->lr = s->x[30]; o->sp = s->sp; o->pc = s->pc; o->pstate = s->nzcv;
+        memcpy(o->v, s->v, sizeof o->v); o->fpcr = s->fpcr; o->fpsr = s->fpsr; o->tpidr = s->tpidr_el0;
+    }
+#else
     const uint64_t *r = atomic_load(&t->svc_regs);
     if (r) {   // gate frame: x0..x30 at +0, q0..q31 at +256, nzcv / fpsr / fpcr at +768 / +776 / +784, the gate block's sp at +792 (the guest's sp before the gate block's push less 16)
         for (int i = 0; i < 29; i++) o->r[i] = r[i];
@@ -531,6 +899,7 @@ static void ctx_fill(const thr_t *t, hz_ctx_t *o) {   // holding G, t is stopped
         memcpy(o->r, t->ctx_x, sizeof o->r); o->fp = t->ctx_fp; o->lr = t->ctx_lr; o->sp = t->ctx_sp; o->pc = t->ctx_pc; o->pstate = t->ctx_pstate;
         memcpy(o->v, t->ctx_v, sizeof o->v); o->fpcr = t->ctx_fpcr; o->fpsr = t->ctx_fpsr;
     }
+#endif
 }
 
 // DM_HITCH_DUMP=<ms>[:<s>] (diagnostic): when no frame has been presented for <ms>, from <s> seconds after the start on, log every guest thread once per stall: priority, core and
@@ -551,6 +920,7 @@ static void hitch_grab(thr_t *t, hitch_t *h) {
     h->handle = t->handle; h->svc = t->last_svc; h->prio = t->prio; h->core = t->core; h->mask = t->mask; h->wkind = t->wkind & 7; h->waddr = t->waddr; h->wkey = t->wkey;
     h->lr = t->last_lr; h->sleeping = t->sleeping; h->host_work = t->host_work && *t->host_work; h->rs = -1;
     char nb[48]; snprintf(h->name, sizeof h->name, "%s", thr_name(t, nb, sizeof nb));
+#if DM_NATIVE_EXEC
     if (!t->mport) return;
     thread_basic_info_data_t bi; mach_msg_type_number_t c = THREAD_BASIC_INFO_COUNT;
     if (thread_info(t->mport, THREAD_BASIC_INFO, (thread_info_t)&bi, &c) == KERN_SUCCESS) h->rs = bi.run_state;
@@ -567,6 +937,7 @@ static void hitch_grab(thr_t *t, hitch_t *h) {
         }
     }
     thread_resume(t->mport);
+#endif   // otherwise the line has no registers (the engine's guest context, Phase 2)
 }
 static void hitch_log(const hitch_t *h) {
     static const char *kinds[] = {"run", "mutex", "condvar", "address", "sync"};
@@ -576,10 +947,10 @@ static void hitch_log(const hitch_t *h) {
             for (int i = 0; i < 7; i++) q += (size_t)snprintf(w + q, n - q, " x%d=%#llx", 19 + i, (unsigned long long)h->x[3 + i]);
             q += (size_t)snprintf(w + q, n - q, "]"); }
         for (int k = 0, g = 0; k < h->npc && g < 8 && q < n - 80; k++) {
-            uint64_t a = h->pc[k]; module_t *m = module_of((void *)a); Dl_info di;
+            uint64_t a = h->pc[k]; module_t *m = module_of((void *)a); const char *sn;
             if (m) { q += (size_t)snprintf(w + q, n - q, " %s+%#llx", m->name, (unsigned long long)(a - (uint64_t)m->base)); g++; }
             else if (k > 5) continue;
-            else if (dladdr((void *)a, &di) && di.dli_sname) q += (size_t)snprintf(w + q, n - q, " %s", di.dli_sname);
+            else if ((sn = plat_addr_symbol((void *)a, NULL))) q += (size_t)snprintf(w + q, n - q, " %s", sn);
             else q += (size_t)snprintf(w + q, n - q, " %#llx", (unsigned long long)a);
         }
     }
@@ -589,13 +960,13 @@ static void hitch_log(const hitch_t *h) {
         (unsigned long long)(m ? h->lr - (uint64_t)m->base : h->lr), w);
 }
 static void *hitch_main(void *arg) {
-    pthread_setname_np("dm hitch dump");
+    plat_thread_set_name("dm hitch dump");
     const char *e = arg; uint64_t lim = (uint64_t)atoi(e) * 1000000ull, seen = 0, skip = 0; int n = 0;
     if (strchr(e, ':')) skip = (uint64_t)atoi(strchr(e, ':') + 1) * 1000000000ull;
     extern uint64_t g_t0_ns;
     static hitch_t hs[256];
     while (n < 24) {
-        { struct timespec ts = {0, 2000000}; nanosleep(&ts, 0); }
+        plat_sleep_ns(2000000);
         uint64_t p = atomic_load(&dm_present_ns), now = now_ns();
         if (!p || p == seen || now - p < lim || now - g_t0_ns < skip) continue;
         seen = p; n++;
@@ -614,6 +985,7 @@ static void hitch_init(void) {
 // Register the main thread and return its handle (passed to nnosInitialize as the main thread handle)
 uint32_t svc_thread_main_init(void) {
     pthread_key_create(&g_keythr, NULL);
+    dm_detclock_enabled();   // DM_DETCLOCK takes the guest clock over here, before any guest code reads it (hle_os.c; it takes G, which nothing holds yet)
     qos_map_init();
     { const char *e = getenv("DM_PREEMPT"); g_core_preempt = e ? atoi(e) != 0 : DM_GAME_CORE_PREEMPT; }
     { const char *e = getenv("DM_WAKE_UNLOCKED"); if (e) g_wake_unlocked = atoi(e) != 0; }
@@ -622,16 +994,18 @@ uint32_t svc_thread_main_init(void) {
     thr_t *t = calloc(1, sizeof *t);
     pthread_cond_init(&t->cv, NULL); pthread_cond_init(&t->pcv, NULL);
     // Its affinity is its ideal core alone, as Horizon creates every thread (Mesosphere KThread::Initialize); it was 7, which a same-core handoff now takes for a thread that can run elsewhere (dm_yield_to_core_peers)
-    t->started = t->entered = 1; t->prio = 44; t->core = 0; t->mask = 1; t->pt = pthread_self(); t->mport = pthread_mach_thread_np(t->pt); t->host_work = &dm_host_work;
+    t->started = t->entered = 1; t->prio = 44; t->core = 0; t->mask = 1; t->pt = pthread_self(); t->mport = plat_thread_self(); t->host_work = &dm_host_work;
     // The iOS boot pthread inherits default QoS. Apply the guest policy before
     // publishing the main thread, just as workers do before running guest code.
     qos_apply(t);
-    qos_class_t qc = QOS_CLASS_UNSPECIFIED; int rp = 0;
-    pthread_get_qos_class_np(pthread_self(), &qc, &rp); t->qos = (uint32_t)qc;
+    t->qos = (uint32_t)plat_qos_self();
+#if !DM_NATIVE_EXEC
+    t->st = dm_aot_thread_begin();   // the x86-64 engine: the main thread's state block (aot_thread.c)
+#endif
     g_lock(); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; t->all = g_all; g_all = t; g_unlock();
     pthread_setspecific(g_keythr, t);
     guest_thread_set_id(t->id);   // main.c ran guest_thread_init before this, and no guest code has run yet
-    pthread_setname_np("0x1001 main thread");
+    plat_thread_set_name("0x1001 main thread");
     LOG("main guest thread QoS %#x (priority %d)", t->qos, t->prio);
     return t->handle;
 }
@@ -639,7 +1013,7 @@ uint32_t svc_thread_main_init(void) {
 static uint64_t g_main_yield_n, g_main_yield_ns;   // Written only by the guest main thread; the diagnostic line reads it on the same thread
 void dm_main_yield_stats(uint64_t *n, uint64_t *ns) { *n = g_main_yield_n; *ns = g_main_yield_ns; }
 uint32_t dm_guest_work_qos(unsigned *count) {
-    uint32_t qos = QOS_CLASS_UNSPECIFIED; unsigned n = 0;
+    uint32_t qos = PLAT_QOS_UNSPECIFIED; unsigned n = 0;
     g_lock();
     for (thr_t *t = g_all; t; t = t->all) {
         if (t->handle == 0x1001) continue;
@@ -667,7 +1041,7 @@ static void sync_close(sync_ref_t ref) {   // holding G
     if (ref.type == O_THREAD) thr_put(ref.obj);
     else {
         event_t *e = ref.obj;
-        if (!--e->refs) free(e);
+        if (!--e->refs) { if (e->vsync) vsync_forget(e); free(e); }   // the last reference: vi's vsync table (DM_DETCLOCK) forgets it, as CloseHandle's does
     }
 }
 static int sync_signaled(sync_ref_t ref) {   // holding G
@@ -683,12 +1057,15 @@ static void wake_sync_waiters(const void *obj) {
             }
         w = n; }
 }
+
+static int64_t now_mono_ns(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return ts.tv_sec * 1000000000ll + ts.tv_nsec; }
+
 // Handle thread / synchronization SVCs; returns 1 = handled
 static const char *thr_name(thr_t *t, char *nb, size_t n) {   // SDK ThreadType+0x1a0 = name pointer
     if (!t->arg) return t->handle == 0x1001 ? "main thread" : "?";
-    uint64_t np = 0; vm_size_t got = 0;
-    if (vm_read_overwrite(mach_task_self(), t->arg + 0x1a0, 8, (vm_address_t)&np, &got) || !np ||
-        vm_read_overwrite(mach_task_self(), np, n - 1, (vm_address_t)nb, &got)) return "?";
+    uint64_t np = 0; size_t got = 0;
+    if (plat_mem_read(t->arg + 0x1a0, &np, 8, &got) || !np ||
+        plat_mem_read(np, nb, n - 1, &got)) return "?";
     nb[got] = 0; return nb;
 }
 // All live guest threads (used by the sampler DM_SAMPLE=ms:*): fill the pthreads into out, return the count
@@ -737,6 +1114,11 @@ int thr_find_by_name(const char *name, pthread_t *out) {
 // State dump (called from crash.c on watchdog / crash; read-only, takes no lock): what each guest thread is waiting on and where its most recent SVC was issued from
 // During a state dump, take the backtrace of other guest threads: suspend → read registers → walk the frame pointer chain (both guest code and gate blocks keep the x29 chain) → resume; only main / sdk frames are printed
 static void thr_bt(thr_t *t) {
+#if !DM_NATIVE_EXEC
+    // The x86-64 engine: a thread that runs (no wait, no SVC, no sleep) gives its guest registers at its next safepoint (aot.h dm_aot_thread_dump, which checks that
+    // the block is still a live thread's before it reads anything); a thread in an SVC has its lines above
+    if (!t->wkind && !t->exited && !t->sleeping && !atomic_load(&t->svc_regs) && t->st) dm_aot_thread_dump(t->st, t->handle);
+#else
     if (!t->mport || t->exited || t->mport == mach_thread_self()) return;
     if (thread_suspend(t->mport) != KERN_SUCCESS) return;
     arm_thread_state64_t st; mach_msg_type_number_t n = ARM_THREAD_STATE64_COUNT;
@@ -769,6 +1151,7 @@ static void thr_bt(thr_t *t) {
         fprintf(stderr, "%s\n", line);
     }
     thread_resume(t->mport);
+#endif
 }
 void svc_thread_dump(void) {
     static const char *kinds[] = {"running/not waiting", "mutex", "condvar", "address", "sync object"};
@@ -781,20 +1164,20 @@ void svc_thread_dump(void) {
         // Thread name: SDK ThreadType+0x1a0 is the name pointer (ThreadManager::SetInitialThreadNameUnsafe 0x34a2a4); x2 of CreateThread = ThreadType*
         char nb[32]; const char *nm = thr_name(t, nb, sizeof nb);
         double cpu = -1;
-        if (t->mport && !t->exited) { thread_basic_info_data_t bi; mach_msg_type_number_t n = THREAD_BASIC_INFO_COUNT;
-            if (thread_info(t->mport, THREAD_BASIC_INFO, (thread_info_t)&bi, &n) == KERN_SUCCESS)
-                cpu = bi.user_time.seconds + bi.user_time.microseconds / 1e6 + bi.system_time.seconds + bi.system_time.microseconds / 1e6; }
-        char own[96] = ""; if (t->wkind == 1 && t->waddr) { uint32_t w = 0; vm_size_t g2 = 0;   // 0x40000000 | Lock wait: lock word = owner handle | 0x40000000
-            if (!vm_read_overwrite(mach_task_self(), t->waddr, 4, (vm_address_t)&w, &g2)) snprintf(own, sizeof own, " owner %#x", w & ~WAITERS_BIT); }
-        if (t->wkind == 2 && t->waddr) { uint32_t w = 0, k = 0; vm_size_t g2 = 0;              // Condition wait: current values of the associated lock word and the condition key (the deadlock dump lacked this item)
-            vm_read_overwrite(mach_task_self(), t->waddr, 4, (vm_address_t)&w, &g2); vm_read_overwrite(mach_task_self(), t->wkey, 4, (vm_address_t)&k, &g2);
-            snprintf(own, sizeof own, " lock word %#x condvar key %#llx=%#x wait #%llu", w, t->wkey, k, (unsigned long long)t->wseq); }   // wait #: the order the waiters arrived in, which SignalProcessWideKey wakes them in at equal priority
-        uint8_t raw[64]; vm_size_t g3 = 0;                                                   // Raw 64 bytes of the object being waited on (the structure holding the read-write lock / condition variable): to see the counts and the owner
-        int have_raw = (t->wkind == 1 || t->wkind == 2 || t->wkind == 3) && t->waddr && !vm_read_overwrite(mach_task_self(), t->waddr & ~0xfull, 64, (vm_address_t)raw, &g3) && g3 == 64;
+        uint64_t cpu_us; if (t->mport && !t->exited && !plat_thread_cpu_us(t->mport, &cpu_us)) cpu = cpu_us / 1e6;
+        char own[96] = ""; if (t->wkind == 1 && t->waddr) { uint32_t w = 0; size_t g2 = 0;   // 0x40000000 | Lock wait: lock word = owner handle | 0x40000000
+            if (!plat_mem_read(t->waddr, &w, 4, &g2)) snprintf(own, sizeof own, " owner %#x", w & ~WAITERS_BIT); }
+        if (t->wkind == 2 && t->waddr) { uint32_t w = 0, k = 0; size_t g2 = 0;              // Condition wait: current values of the associated lock word and the condition key (the deadlock dump lacked this item)
+            plat_mem_read(t->waddr, &w, 4, &g2); plat_mem_read(t->wkey, &k, 4, &g2);
+            snprintf(own, sizeof own, " lock word %#x condvar key %#llx=%#x wait #%llu", w, (unsigned long long)t->wkey, k, (unsigned long long)t->wseq); }   // wait #: the order the waiters arrived in, which SignalProcessWideKey wakes them in at equal priority
+        uint8_t raw[64]; size_t g3 = 0;                                                      // Raw 64 bytes of the object being waited on (the structure holding the read-write lock / condition variable): to see the counts and the owner
+        int have_raw = (t->wkind == 1 || t->wkind == 2 || t->wkind == 3) && t->waddr && !plat_mem_read(t->waddr & ~0xfull, raw, 64, &g3) && g3 == 64;
         char life[96]; uint64_t nowns = now_ns();
         if (t->exited) snprintf(life, sizeof life, " created at tick %u, exited at tick %u (%.1f s ago)", t->born_tick, t->exit_tick, (nowns - t->exit_ns) / 1e9); else if (!t->born_ns) snprintf(life, sizeof life, " present since process start"); else snprintf(life, sizeof life, " created at tick %u (%.1f s ago)", t->born_tick, (nowns - t->born_ns) / 1e9);
-        fprintf(stderr, "[dm] thread %#x '%s' priority %d core %d mask %#llx CPU %.2fs svc %llu %s%s%s waits:%s addr=%#llx%s last svc %#x lr=%s+%#llx\n", t->handle, nm, t->prio, t->core, (unsigned long long)t->mask,
-                cpu, t->nsvc, t->exited ? "exited" : "", t->started ? "" : "not started", life, kinds[t->wkind & 7], t->waddr, own, t->last_svc,
+        char det[80] = "";   // DM_DETCLOCK: a sleep or timeout on the guest clock, and how far its deadline is
+        if (t->gsleep || t->gdl) snprintf(det, sizeof det, "%s guest-clock deadline in %.3f ms", t->gsleep ? " sleeping," : "", (double)(int64_t)(t->gdl - guest_ns()) / 1e6);
+        fprintf(stderr, "[dm] thread %#x '%s' priority %d core %d mask %#llx CPU %.2fs svc %llu %s%s%s waits:%s%s addr=%#llx%s last svc %#x lr=%s+%#llx\n", t->handle, nm, t->prio, t->core, (unsigned long long)t->mask,
+                cpu, t->nsvc, t->exited ? "exited" : "", t->started ? "" : "not started", life, kinds[t->wkind & 7], det, t->waddr, own, t->last_svc,
                 m ? m->name : "?", m ? t->last_lr - (uint64_t)m->base : t->last_lr);
         if (have_raw) { char hx[200]; int q = 0; for (int i = 0; i < 64; i += 4) q += snprintf(hx + q, sizeof hx - q, "%08x ", *(uint32_t *)(raw + i));
                         fprintf(stderr, "[dm]   %#x waited-for object, 64 bytes from %#llx: %s\n", t->handle, t->waddr & ~0xfull, hx); }
@@ -803,9 +1186,13 @@ void svc_thread_dump(void) {
         // pushed (x30 = the return address into the wrapper's caller, which the backtrace skips: the wrappers are leaf functions), the guest stack at the SVC follows at +16.
         // Read page by page up to the first unreadable one: a thread waiting near its stack top (a shallow worker) has PROT_NONE stack region above it, and one read would fail whole
         uint64_t *sr = atomic_load(&t->svc_regs);
-        if (sr && t->wkind) { uint64_t stk[160]; size_t got = 0; vm_address_t sa = (vm_address_t)sr[99];
-            while (got < sizeof stk) { vm_size_t n = sizeof stk - got, g4 = 0, room = vm_page_size - ((sa + got) & (vm_page_size - 1)); if (n > room) n = room;
-                if (vm_read_overwrite(mach_task_self(), sa + got, n, (vm_address_t)((uint8_t *)stk + got), &g4) || g4 != n) break;
+#if DM_NATIVE_EXEC
+        if (sr && t->wkind) { uint64_t stk[160]; size_t got = 0, pg = plat_page_size(); uint64_t sa = (uint64_t)sr[99];
+#else
+        if (sr && t->wkind) { uint64_t stk[160]; size_t got = 0, pg = plat_page_size(); uint64_t sa = ((const dm_guest_state *)(const void *)sr)->sp;   // x86-64 engine: sr is the state block
+#endif
+            while (got < sizeof stk) { size_t n = sizeof stk - got, g4 = 0, room = pg - ((sa + got) & (pg - 1)); if (n > room) n = room;
+                if (plat_mem_read(sa + got, (uint8_t *)stk + got, n, &g4) || g4 != n) break;
                 got += n; }
             if (got >= 16 && atomic_load(&t->svc_regs) == sr) {   // still in that SVC: the words are its stack, not a later frame's
                 char sl[1100]; int q = snprintf(sl, sizeof sl, "[dm]   %#x guest stack:", t->handle), nfr = 0;
@@ -816,6 +1203,7 @@ void svc_thread_dump(void) {
         thr_bt(t);
     }
     // Threads created by the host itself (graphics present, audio, movie decoding, etc.): not in the guest thread table, enumerated as mach threads, the first 12 frames symbolized with dladdr
+#if DM_NATIVE_EXEC
     thread_act_array_t ths; mach_msg_type_number_t nth = 0;
     if (task_threads(mach_task_self(), &ths, &nth) == KERN_SUCCESS) {
         for (mach_msg_type_number_t i = 0; i < nth; i++) {
@@ -844,6 +1232,7 @@ void svc_thread_dump(void) {
         }
         vm_deallocate(mach_task_self(), (vm_address_t)ths, nth * sizeof *ths);
     }
+#endif
 }
 
 // Same-core wake handoffs apply to every game. core_preempt additionally checks
@@ -877,7 +1266,7 @@ static uint64_t yield_backoff_ns(uint64_t run_ns, int clock) {
 }
 static void sleep_precise(uint64_t dl);
 // One back-off sleep of bo ns, counted for the power line
-static void backoff_sleep(thr_t *me, uint64_t bo) { me->nbackoff++; me->sleeping = 1; struct timespec ts = {0, (long)bo}; nanosleep(&ts, 0); me->sleeping = 0; }
+static void backoff_sleep(thr_t *me, uint64_t bo) { me->nbackoff++; me->sleeping = 1; plat_sleep_ns(bo); me->sleeping = 0; }
 // sched_yield, or a short sleep once the wait has lasted run_ns past the back-off's start
 static void yield_for(thr_t *me, uint64_t run_ns, int clock) {
     uint64_t bo = yield_backoff_ns(run_ns, clock);
@@ -1053,9 +1442,7 @@ void dm_thread_cpu(char *out, size_t n, double secs) {
     g_lock();
     for (thr_t *t = g_all; t; t = t->all) {
         if (!t->mport || t->exited) continue;
-        thread_basic_info_data_t bi; mach_msg_type_number_t c = THREAD_BASIC_INFO_COUNT;
-        if (thread_info(t->mport, THREAD_BASIC_INFO, (thread_info_t)&bi, &c) != KERN_SUCCESS) continue;
-        uint64_t us = (uint64_t)(bi.user_time.seconds + bi.system_time.seconds) * 1000000u + (uint64_t)(bi.user_time.microseconds + bi.system_time.microseconds);
+        uint64_t us; if (plat_thread_cpu_us(t->mport, &us)) continue;
         double ms = t->cpu_seen_us && us > t->cpu_seen_us ? (us - t->cpu_seen_us) / 1e3 / secs : 0; t->cpu_seen_us = us;   // ms per second; a thread's first report only takes its baseline
         band[t->prio <= 44 ? 0 : t->prio < 60 ? 1 : 2] += ms;
         for (int i = 0; i < 3; i++) if (ms > d[i]) { for (int j = 2; j > i; j--) { top[j] = top[j - 1]; d[j] = d[j - 1]; } top[i] = t; d[i] = ms; break; }
@@ -1073,22 +1460,89 @@ static void sleep_precise(uint64_t dl) {
     for (int i = 0; i < 16; i++) {
         uint64_t now = now_ns(); if (now + 20000 >= dl) return;
         uint64_t rem = dl - now, s = rem < 100000 ? rem : rem - rem / 4;
-        struct timespec ts = {(time_t)(s / 1000000000u), (long)(s % 1000000000u)}; nanosleep(&ts, 0);
+        plat_sleep_ns(s);
     }
+}
+// Under DM_DETCLOCK a guest thread's sleep is a wait in the kernel's bookkeeping until the guest clock reaches its deadline gdl (det_idle, det_expire), or, for a thread paced on the
+// guest clock, until dm_detclock_paced_wake (gdl 0: only that); a wake that came while the thread ran ends its next sleep at once. Off a guest thread it polls
+static void det_sleep_until(thr_t *me, uint64_t gdl, int disp) {
+    if (!me) { while (guest_ns() < gdl) plat_sleep_ns(1000000); return; }
+    g_lock();
+    if (!me->det_wake) {
+        me->gdl = gdl; me->gsleep = 1; me->gdisp = disp; me->sleeping = 1;
+        if (atomic_load_explicit(&dm_detclock_tracing, memory_order_relaxed)) dt_block(me);
+        det_idle();
+        while (me->gsleep && (!me->gdl || guest_ns() < me->gdl)) g_cond_wait(&me->cv, NULL);
+    }
+    me->gsleep = 0; me->gdisp = 0; me->sleeping = 0; me->gdl = 0; me->det_wake = 0;
+    g_unlock();
 }
 // SleepThread takes a relative duration. Host time lets the thread resume even if its work is needed to present the next frame.
 // Also used by host hooks that block on hardware (hle_net.c: Poll / Select with nothing to wait on).
 void dm_guest_sleep_ns(int64_t ns) {
     if (ns <= 0) return;
-    thr_t *me = pthread_getspecific(g_keythr); if (me) me->sleeping = 1;
+    thr_t *me = pthread_getspecific(g_keythr);
+    if (dm_detclock_enabled()) { det_sleep_until(me, det_deadline(guest_ns(), (uint64_t)ns), 0); return; }   // the kernel's deadline (det_deadline), as SleepThread counts it
+    if (me) me->sleeping = 1;
     sleep_precise(now_ns() + (uint64_t)ns);
     if (me) me->sleeping = 0;
+}
+// Under DM_DETCLOCK, the thread that presents waits for the display until guest time `at` (hle_nvn.c's window acquire: its texture's free time): a wait in the kernel's bookkeeping
+// that the idle jump reaches once the game's other threads wait too, as the display's time passes on a Switch while the game waits for it. Without the switch it does nothing
+void dm_detclock_display_wait(uint64_t at) {
+    if (dm_detclock_enabled() && guest_ns() < at) det_sleep_until(pthread_getspecific(g_keythr), at, 1);
+}
+// Under DM_DETCLOCK, the guest thread the host made for itself whose ThreadType is tt (dm_guest_thread_spawn's result) runs on the guest clock from now on: det_idle counts it as
+// a game thread, so the clock does not move while it works, and it waits on the guest clock, in periods of `period` ns from now (dm_detclock_period_wait) or until a time or a
+// wake of its own (dm_detclock_paced_sleep, dm_detclock_paced_wake). Called by the thread that spawned it, before that one returns to guest code: the clock cannot have moved
+// since the spawn. The SDK hands the ThreadType to CreateThread as the thread's argument (thr_name reads its name there). 1 under the switch, 0 without it or with no such thread
+static thr_t *paced_of(void *tt) {   // holding G
+    for (thr_t *t = g_all; t; t = t->all) if (t->arg == (uint64_t)(uintptr_t)tt && !t->exited) return t;
+    return NULL;
+}
+int dm_detclock_pace_thread(void *tt, uint64_t period) {
+    if (!dm_detclock_enabled() || !tt) return 0;
+    g_lock();
+    thr_t *t = paced_of(tt);
+    if (t) { t->det_paced = 1; t->det_period = period; t->det_next = guest_ns(); }
+    g_unlock();
+    return t != NULL;
+}
+// The calling thread, paced by dm_detclock_pace_thread, waits on the guest clock for its next period's start; 0 for any other thread (it paces itself as before)
+int dm_detclock_period_wait(void) {
+    thr_t *me = pthread_getspecific(g_keythr);
+    if (!me || !dm_detclock_enabled()) return 0;
+    g_lock();
+    int paced = me->det_paced; uint64_t at = me->det_next; me->det_next += me->det_period;
+    g_unlock();
+    if (!paced) return 0;
+    if (guest_ns() < at) det_sleep_until(me, at, 0);
+    return 1;
+}
+// The calling paced thread waits on the guest clock until `at` (0: no time) or until dm_detclock_paced_wake wakes it, whichever comes first
+void dm_detclock_paced_sleep(uint64_t at) {
+    thr_t *me = pthread_getspecific(g_keythr);
+    if (me && me->det_paced && dm_detclock_enabled() && (!at || guest_ns() < at)) det_sleep_until(me, at, 0);
+}
+// Wake the paced thread whose ThreadType is tt: it counts as running from here, so the clock waits for it (a wake while it runs ends its next sleep at once)
+void dm_detclock_paced_wake(void *tt) {
+    if (!dm_detclock_enabled() || !tt) return;
+    g_lock();
+    thr_t *t = paced_of(tt);
+    if (t && t->det_paced) { t->det_wake = 1; if (t->gsleep) { t->gsleep = 0; t->gdl = 0; t->sleeping = 0; pthread_cond_signal(&t->cv); } }
+    g_unlock();
 }
 // A host hook's bounded wait on a host condition variable (m held), a sleep to a garbage collector's pause like dm_guest_sleep_ns; the caller checks its condition and the clock
 void dm_guest_cond_wait_ns(pthread_cond_t *c, pthread_mutex_t *m, int64_t ns) {
     thr_t *me = pthread_getspecific(g_keythr); if (me) me->sleeping = 1;
+#if defined(__APPLE__)
     struct timespec ts = {ns / 1000000000, ns % 1000000000};
     pthread_cond_timedwait_relative_np(c, m, &ts);
+#else   // no relative wait outside Apple: the same wait to an absolute real-time deadline
+    struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += (time_t)(ns / 1000000000); ts.tv_nsec += (long)(ns % 1000000000);
+    if (ts.tv_nsec >= 1000000000) { ts.tv_sec++; ts.tv_nsec -= 1000000000; }
+    pthread_cond_timedwait(c, m, &ts);
+#endif
     if (me) me->sleeping = 0;
 }
 int svc_thread(int num, uint64_t *regs) {
@@ -1117,7 +1571,11 @@ static int svc_thread_impl(int num, uint64_t *regs) {
         t->prio = (int)regs[4]; t->core = (int)regs[5] >= 0 ? (int)regs[5] : 0; t->mask = 1ull << t->core;
         t->born_ns = now_ns(); t->born_tick = dm_thread_tick_fn ? dm_thread_tick_fn() : 0;
         g_lock(); t->handle = h_new(O_THREAD, t); t->id = g_next_id++; g_unlock();
+#if DM_NATIVE_EXEC
         pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 1 << 20);
+#else
+        pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 8 << 20);   // x86-64 engine: guest code's own frames are on this native stack (design 3.2, 6.1: at least 8 MB)
+#endif
         pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED);   // Host resources are reclaimed on exit (the guest waits through the handle, no join)
         pthread_t pt; int rc = pthread_create(&pt, &a, thread_main, t); if (rc) die("pthread_create for guest thread %#x: %s", t->handle, strerror(rc));   // EAGAIN: no room for its 1 MB stack or a thread limit (the crash's address space line)
         pthread_attr_destroy(&a);
@@ -1133,6 +1591,7 @@ static int svc_thread_impl(int num, uint64_t *regs) {
             t->started = 1; wake_queue(t); note_runnable(t);
             thr_t *self = pthread_getspecific(g_keythr);
             if (self && self->yield_pending) { t->start_by = self; t->start_epoch = atomic_load(&self->hand_epoch); }   // this start holds its caller: dm_thread_service_request
+            if (atomic_load_explicit(&dm_detclock_tracing, memory_order_relaxed)) dt_thread(t);
         }
         g_unlock();
         regs[0] = t ? 0 : R_BAD_HANDLE; return 1;
@@ -1189,8 +1648,12 @@ static int svc_thread_impl(int num, uint64_t *regs) {
             uint64_t t0 = now_ns(); int warned = 0;
             // The loop lets go of G (the signal, the timed wait): hold a reference so that an exit and a CloseHandle meanwhile cannot free t under it
             t->refs++;
+#if DM_NATIVE_EXEC
             while (!t->paused && !t->exited) {
-                g_unlock(); pthread_kill(t->pt, SIGUSR2); g_lock();
+#else
+            while (!t->paused && !t->exited && dm_aot_stop_status() < 0) {   // x86-64 engine: a process stop ends this wait too (the thread leaves its guest code)
+#endif
+                g_unlock(); pause_poke(t); g_lock();
                 if (t->paused || t->exited) break;
                 struct timespec dl; clock_gettime(CLOCK_REALTIME, &dl); dl.tv_nsec += 100000; if (dl.tv_nsec >= 1000000000) { dl.tv_sec++; dl.tv_nsec -= 1000000000; }
                 g_cond_wait(&t->pcv, &dl);
@@ -1221,9 +1684,9 @@ static int svc_thread_impl(int num, uint64_t *regs) {
             // Under DM_QOS_MAP the owner runs at least at this thread's class until the lock is handed over (the Horizon kernel lends the waiter's priority the same way): a user-interactive
             // waiter is never held up by a utility-class owner on a slow core
             thr_t *o = g_qos_map ? h_peek((uint32_t)regs[0], O_THREAD) : NULL;
-            pthread_override_t ov = o && o->pt && !o->exited && t->qos > o->qos ? pthread_override_qos_class_start_np(o->pt, (qos_class_t)t->qos, 0) : NULL;
-            r = block(t, 1, -1);
-            if (ov) pthread_override_qos_class_end_np(ov); }
+            void *ov = o && o->pt && !o->exited && t->qos > o->qos ? plat_qos_override_start(o->pt, (plat_qos_t)t->qos) : NULL;
+            r = block(t, 1, -1, 0);
+            plat_qos_override_end(ov); }
         g_unlock();
         regs[0] = (uint64_t)r; return 1;
     }
@@ -1249,7 +1712,7 @@ static int svc_thread_impl(int num, uint64_t *regs) {
         st32(key, 1);
         t->wkey = key; t->waddr = addr; t->wtag = (uint32_t)regs[2];
 #endif
-        int64_t r = block(t, 2, poll_wait_begin((int64_t)regs[3]));   // Timeout: the lock is not re-acquired (user mode takes it itself)
+        int64_t r = block(t, 2, poll_wait_begin((int64_t)regs[3]), 0);   // Timeout: the lock is not re-acquired (user mode takes it itself)
         g_unlock();
         poll_wait_end((int64_t)regs[3], r);
         regs[0] = (uint64_t)r; return 1;
@@ -1272,7 +1735,7 @@ static int svc_thread_impl(int num, uint64_t *regs) {
         int ok = type == 3 ? ld64(addr) == regs[2] : type == 2 ? (int32_t)v == val : (int32_t)v < val;
         if (ok && type == 1) { while (!cas32(addr, &v, v - 1)) if (!((int32_t)v < val)) { ok = 0; break; } }
         if (!ok) r = R_BAD_STATE;
-        else { t->waddr = addr; r = block(t, 3, poll_wait_begin((int64_t)regs[3])); }
+        else { t->waddr = addr; r = block(t, 3, poll_wait_begin((int64_t)regs[3]), 0); }
         g_unlock();
         if (ok) poll_wait_end((int64_t)regs[3], r);
         regs[0] = (uint64_t)r; return 1;
@@ -1312,7 +1775,7 @@ static int svc_thread_impl(int num, uint64_t *regs) {
                    : (h_peek(h, O_EVENT_W) ? h_peek(h, O_EVENT_W) : h_peek(h, O_EVENT_R));
         int64_t r = 0;
         if (!e) { r = R_BAD_HANDLE; LOG("event SVC %#x invalid handle %#x", num, h); }
-        else if (num == 0x11) { e->signaled = 1; wake_sync_waiters(e); }
+        else if (num == 0x11) { if (atomic_load_explicit(&dm_detclock_tracing, memory_order_relaxed)) dt_signal(h); e->signaled = 1; wake_sync_waiters(e); }   // traced when a host-owned thread signals
         else if (num == 0x17 && !e->signaled) r = R_BAD_STATE;
         else e->signaled = 0;
         g_unlock();
@@ -1335,7 +1798,7 @@ static int svc_thread_impl(int num, uint64_t *regs) {
             else if (t->cancel) { t->cancel = 0; r = R_CANCELLED; }
             else {
                 t->wn = n; t->widx = -1;
-                r = block(t, 4, wait_ns); idx = t->widx;
+                r = block(t, 4, wait_ns, 0);   // under DM_DETCLOCK the kernel's deadline on the guest clock (det_deadline); idx = t->widx;
                 t->wn = 0;
             }
         }
@@ -1356,7 +1819,7 @@ static int svc_thread_impl(int num, uint64_t *regs) {
         unsigned i = (uint32_t)regs[0] - 0x1000;
         if (i > 0 && i < MAX_H && (g_h[i].type == O_EVENT_R || g_h[i].type == O_EVENT_W)) {
             if (g_h[i].type == O_EVENT_W) se_unbind((uint32_t)regs[0]);
-            event_t *e = g_h[i].obj; if (--e->refs == 0) free(e);
+            event_t *e = g_h[i].obj; if (--e->refs == 0) { if (e->vsync) vsync_forget(e); free(e); }
             g_h[i].type = O_FREE; g_h[i].obj = NULL;
         } else if (i > 0 && i < MAX_H && g_h[i].type == O_THREAD) {
             thr_t *t = g_h[i].obj;
@@ -1415,13 +1878,16 @@ void hle_bind_system_event(void *ev, int autoclear) {      // Must be called on 
     static uint32_t (*create)(void *, int, int); static uint32_t (*getw)(const void *);
     if (!create) { create = guest_sym("_ZN2nn2os17CreateSystemEventEPNS0_15SystemEventTypeENS0_14EventClearModeEb");
                    getw = guest_sym("_ZN2nn2os30GetWritableHandleOfSystemEventEPKNS0_15SystemEventTypeE"); }
-    uint32_t r = create(ev, autoclear, 1);
+    uint32_t r = GUEST_CALL(create, ev, autoclear, 1);
     if (r) die("CreateSystemEvent failed %#x", r);
-    wh = getw(ev);
+    wh = GUEST_CALL(getw, ev);
+    g_lock();
+    { event_t *e = h_peek(wh, O_EVENT_W); if (e) e->host = 1; }   // host code signals it: a wait on it alone is a wait for the host (DM_DETCLOCK's det_host_wait)
     pthread_mutex_lock(&g_se_lock);
     if (g_nse >= (int)(sizeof g_se / sizeof g_se[0])) die("SystemEvent binding table full");
     g_se[g_nse].ev = ev; g_se[g_nse].wh = wh; g_se[g_nse++].id = g_next_se_id++;
     pthread_mutex_unlock(&g_se_lock);
+    g_unlock();
 }
 uint32_t hle_dup_readable_handle(uint32_t h) {   // A second read end of the same kernel event, as a service's handle copied to its client: each end closes on its own (refs); 0 if h is no read end
     g_lock();
@@ -1459,7 +1925,10 @@ int hle_signal_system_event_binding(uint64_t binding) {
     for (int i = 0; i < g_nse; i++) if (g_se[i].id == binding) { wh = g_se[i].wh; break; }
     pthread_mutex_unlock(&g_se_lock);
     event_t *e = wh ? h_get(wh, O_EVENT_W) : NULL;
-    if (e) { e->signaled = 1; wake_sync_waiters(e); }
+    if (e && !(e->vsync && g_det_jump)) {   // under DM_DETCLOCK the guest clock signals vi's vsync event (det_expire), not the host's thread
+        if (atomic_load_explicit(&dm_detclock_tracing, memory_order_relaxed)) dt_signal(wh);
+        e->signaled = 1; wake_sync_waiters(e);
+    }
     g_unlock();
     return e != NULL;
 }
@@ -1471,7 +1940,10 @@ void hle_signal_system_event(void *ev) {   // An unbound one is bound on the spo
         if (wh) {
             event_t *e = h_get(wh, O_EVENT_W);
             if (!e) die("SystemEvent write-end handle invalid %#x", wh);
-            e->signaled = 1; wake_sync_waiters(e);
+            if (!(e->vsync && g_det_jump)) {   // as hle_signal_system_event_binding
+                if (atomic_load_explicit(&dm_detclock_tracing, memory_order_relaxed)) dt_signal(wh);
+                e->signaled = 1; wake_sync_waiters(e);
+            }
             g_unlock();
             return;
         }
@@ -1489,7 +1961,7 @@ int hle_signal_bound_system_event(void *ev) {
     g_lock();
     pthread_mutex_lock(&g_se_lock); uint32_t wh = se_find(ev); pthread_mutex_unlock(&g_se_lock);
     event_t *e = wh ? h_get(wh, O_EVENT_W) : NULL;
-    if (e) { e->signaled = 1; wake_sync_waiters(e); }
+    if (e) { if (atomic_load_explicit(&dm_detclock_tracing, memory_order_relaxed)) dt_signal(wh); e->signaled = 1; wake_sync_waiters(e); }
     g_unlock();
     return e != NULL;
 }
@@ -1503,3 +1975,42 @@ void hle_clear_system_event(void *ev) {   // Clear a bound service-layer SystemE
     }
     g_unlock();
 }
+#if !DM_NATIVE_EXEC
+
+// ---------- The x86-64 execution engine's side (aot.h) ----------
+// A poll found the calling thread's poll byte set (aot_run.c nxaot_rt_safepoint, after it cleared the byte): wait here while SetThreadActivity pauses it,
+// as on_pause_sig waits on Apple; its state block holds its whole register file meanwhile. 1 when it waited
+int thr_safepoint(void) {
+    thr_t *t = pthread_getspecific(g_keythr);
+    if (!t || !atomic_load(&t->pause_req)) return 0;
+    int waited = 0;
+    g_lock();
+    if (t->pause_req && dm_detclock_enabled()) { t->pstop = 1; det_idle(); }   // stopped: it may have been the last game thread that could run
+    while (t->pause_req) { t->paused = 1; t->pstop = 1; waited = 1; pthread_cond_broadcast(&t->pcv); g_cond_wait(&t->pcv, NULL); }
+    t->paused = 0; t->pstop = 0;
+    g_unlock();
+    return waited;
+}
+// Process stop (aot_run.c dm_aot_stop): every kernel wait woken and cancelled, every pause released, so that each guest thread reaches the end of its SVC
+// or its next poll and leaves its guest code
+void thr_stop_all(void) {
+    g_lock();
+    for (thr_t *t = g_all; t; t = t->all) {
+        if (t->exited) continue;
+        t->cancel = 1;   // a WaitSynchronization in progress returns ResultCancelled
+        if (t->wkind) wake(t, R_CANCELLED);
+        if (t->gsleep) { t->gsleep = 0; pthread_cond_signal(&t->cv); }   // a sleep on DM_DETCLOCK's guest clock ends too
+        atomic_store(&t->pause_req, 0); atomic_fetch_and(&t->svc_state, ~2); pthread_cond_broadcast(&t->pcv);
+    }
+    g_unlock();
+}
+// The handles of the live guest threads (started, not exited, the handle not closed), but except's: for a host thread that pauses them (the corpus test)
+int thr_handles(uint32_t *out, int max, uint32_t except) {
+    int n = 0;
+    g_lock();
+    for (thr_t *t = g_all; t && n < max; t = t->all)
+        if (t->started && !t->exited && !t->closed && !t->host_owned && t->handle != except) out[n++] = t->handle;
+    g_unlock();
+    return n;
+}
+#endif

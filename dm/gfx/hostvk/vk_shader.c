@@ -1,0 +1,547 @@
+// The Vulkan backend's shaders (docs/design/vulkan-backend.md 2.3, 2.4, 2.6): a program's shaders by content key (prog_key, hle_nvn.c), their stage from the profile's shader map
+// (shader_map.tsv, DM_NVN_SHMAP), their modules and reflection from the Vulkan library: <DM_MSL_DIR or the default shader cache>/vk-<DMSH_CHAIN_VK>/<key>.spv and <key>.json, written
+// by dm/gfx/tools/dmsh_build_vk.py, as the Metal backend reads b-<DMSH_CHAIN>/ beneath the same folder (DM_MSL_DIR is the existing library switch; no new one).
+// The reflection: the Vulkan build writes the neutral binding kinds of nvn_refl.h with each binding's set and binding and its SPIR-V class (2.6), where the Metal build wrote MSL
+// names and types. nvn_refl_from_json_text, the frontend's parser, reads the Metal form; this file rewrites the Vulkan document into that form (route B, the kinds as they are,
+// msl_type made from the class, the image dimension and the sampled type, arg_id the binding's index) and keeps beside it what the Metal form has no field for: each binding's
+// set, binding, descriptor type and count, merging a combined image and its sampler into one descriptor (hvk_binding).
+// The module's capabilities are checked against the features the device layer enabled (vk_device.c hostvk_dev.x): a module that needs one the device lacks is refused with a red
+// line, as a draw with it would fail validation. The counter kernels embedded in games' main (nvn_builtin.h) are the backend's own GLSL (shaders/q_*.comp), found by the same key.
+// The shaders' constants (c1): packed into shared banks as the Metal backend packs them, after the profile's c1_full_vk.tsv beside the shader map, read with the same stamp rule
+// as its c1_full.tsv; the shaders it lists, and all of them without a current table (a [RED] line at the first such c1), get 64 KiB each ("The shaders' constants" below; step D2).
+#include "plat/plat.h"
+#include "vk_backend.h"
+#include "../nvn/dmsh_chain_vk.h"
+#include "../nvn/nvn_builtin.h"
+#include "../nvn/nvn_refl_textype.h"
+#include "../../third_party/cjson/cJSON.h"
+#include "shaders/gen/q_val0.h"
+#include "shaders/gen/q_val8.h"
+#include "shaders/gen/q_dlt0.h"
+#include "shaders/gen/q_dlt8.h"
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+// ---------- The shader map and the library directory ----------
+// Loads are serialized by g_sh_mu: the submit thread's draws and the prewarm's workers (vk_prewarm.c, phase P5) both load shaders by key; a loaded shader is immutable
+typedef struct { char key[17]; int stage; } map_ent;
+static nvn_hmap g_map;            // 16-hex-digit key → map_ent, read without the lock once loaded
+static _Atomic int g_map_loaded;
+static pthread_mutex_t g_sh_mu = PTHREAD_MUTEX_INITIALIZER;
+static char g_dir[1024];
+static int name_index(const char *s, const char *const names[6]) {   // the NVN stage a name of the table gives (0 vertex, 1 fragment, 2 geometry, 3 hull, 4 domain, 5 compute)
+    for (int i = 0; s && i < 6; i++) if (!strcmp(s, names[i])) return i;
+    return -1;
+}
+static int stage_of(const char *s) { static const char *const n[6] = {"vertex", "pixel", "geometry", "hull", "domain", "compute"}; return name_index(s, n); }
+static int stage_of_refl(const char *s) { static const char *const n[6] = {"vs", "ps", "gs", "hs", "ds", "cs"}; return name_index(s, n); }
+static char *read_file(const char *path, size_t *n) {
+    FILE *f = fopen(path, "rb"); if (!f) return NULL;
+    fseek(f, 0, SEEK_END); long len = ftell(f); fseek(f, 0, SEEK_SET);
+    char *b = len >= 0 ? malloc((size_t)len + 1) : NULL;
+    if (b && fread(b, 1, (size_t)len, f) != (size_t)len) { free(b); b = NULL; }
+    fclose(f);
+    if (b) { b[len] = 0; *n = (size_t)len; }
+    return b;
+}
+const char *hvk_shader_dir(void) {
+    if (!g_dir[0]) {
+        const char *m = getenv("DM_MSL_DIR"), *root = getenv("DM_ROOT"); char parent[900];
+        if (m && *m) snprintf(parent, sizeof parent, "%s", m);
+        else if (root && *root) snprintf(parent, sizeof parent, "%s/build/cache/metal_shader_cache", root);
+        else plat_data_path(parent, sizeof parent, "build/cache/metal_shader_cache");
+        snprintf(g_dir, sizeof g_dir, "%s/vk-%s", parent, DMSH_CHAIN_VK);
+    }
+    return g_dir;
+}
+const char *hvk_shader_map_path(void) { const char *p = getenv("DM_NVN_SHMAP"); return p && *p ? p : NULL; }
+static void c1_table_load(const char *map_path, const char *inputs);
+static void map_load_(void);
+static void map_load(void) {
+    if (atomic_load(&g_map_loaded)) return;
+    pthread_mutex_lock(&g_sh_mu);
+    if (!atomic_load(&g_map_loaded)) map_load_();
+    pthread_mutex_unlock(&g_sh_mu);
+}
+static void map_load_(void) {   // under g_sh_mu
+    nvn_hm_init(&g_map, 16);
+    const char *path = getenv("DM_NVN_SHMAP");
+    size_t n = 0; char *txt = path && *path ? read_file(path, &n) : NULL;
+    if (!txt) { hostvk_log("[RED] [hostvk] no shader map (DM_NVN_SHMAP=%s): every game shader is missing", path ? path : "unset"); atomic_store(&g_map_loaded, 1); return; }
+    int count = 0;
+    for (char *ln = txt, *next; ln && *ln; ln = next) {
+        next = strchr(ln, '\n'); if (next) *next++ = 0;
+        size_t l = strlen(ln); if (l && ln[l - 1] == '\r') ln[l - 1] = 0;
+        if (!*ln || *ln == '#' || !strncmp(ln, "package", 7)) continue;
+        char *col[5] = {0}; int c = 0;
+        for (char *p = ln; c < 5 && p; c++) { col[c] = p; p = strchr(p, '\t'); if (p) *p++ = 0; }
+        if (c < 4 || strlen(col[3]) != 16) continue;
+        int st = stage_of(col[2]); if (st < 0) continue;
+        map_ent *e = malloc(sizeof *e); if (!e) break;
+        memcpy(e->key, col[3], 16); e->key[16] = 0; e->stage = st;
+        free(nvn_hm_put(&g_map, e->key, e)); count++;
+    }
+    free(txt);
+    atomic_store(&g_map_loaded, 1);
+    hostvk_log("[hostvk] shader map %s: %d shaders; library %s", path, count, hvk_shader_dir());
+    // The library's stamp (inputs.tsv, written by a full dmsh_build_vk.py run): the game and the digest of the profile inputs it was built from. As on Metal (nvn_mtl.m shmap_load),
+    // it is what ties c1_full_vk.tsv to this library: the table names the inputs of the library it was made from
+    char stamp[1100]; snprintf(stamp, sizeof stamp, "%s/inputs.tsv", hvk_shader_dir());
+    size_t sn; char *st = read_file(stamp, &sn), game[96] = "", inputs[160] = "";
+    for (char *ln = st, *next; ln && *ln; ln = next) {
+        next = strchr(ln, '\n'); if (next) *next++ = 0;
+        size_t l = strlen(ln); if (l && ln[l - 1] == '\r') ln[l - 1] = 0;
+        if (!strncmp(ln, "game\t", 5)) snprintf(game, sizeof game, "%s", ln + 5);
+        else if (!strncmp(ln, "inputs\t", 7)) snprintf(inputs, sizeof inputs, "%s", ln + 7);
+    }
+    if (!st || !inputs[0]) hostvk_log("[RED] [hostvk] the shader library %s has no stamp (inputs.tsv): no full dmsh_build_vk.py run made it as it is, so c1_full_vk.tsv is not taken", hvk_shader_dir());
+    else hostvk_log("[hostvk] shader library stamp: game %s, inputs %s", game[0] ? game : "(none)", inputs);
+    free(st);
+    c1_table_load(path, inputs);
+}
+
+// ---------- Modules ----------
+VkShaderModule hvk_module(const uint32_t *code, size_t bytes) {
+    VkShaderModuleCreateInfo ci = {VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO, NULL, 0, bytes, code};
+    VkShaderModule m = VK_NULL_HANDLE;
+    if (vkCreateShaderModule(hvk.d, &ci, NULL, &m)) return VK_NULL_HANDLE;
+    return m;
+}
+// The capabilities a module declares that the device lacks (OpCapability, opcode 17): a description into why, 0 when it has them all
+static int caps_missing(const uint32_t *w, size_t nw, char *why, size_t n) {
+    why[0] = 0; int bad = 0;
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len) break;
+        if (op == 17 && len >= 2) {
+            uint32_t c = w[i + 1]; const char *need = NULL;
+            switch (c) {
+                case 10: if (!hvk.dev.x.float64) need = "Float64"; break;
+                case 11: if (!hvk.dev.x.int64) need = "Int64"; break;
+                case 22: if (!hvk.dev.x.int16) need = "Int16"; break;
+                case 4427: if (!hvk.dev.x.draw_parameters) need = "DrawParameters (shaderDrawParameters)"; break;
+                case 55: case 56: if (!hvk.dev.x.storage_without_format) need = "StorageImage*WithoutFormat"; break;
+                case 57: if (!hvk.dev.x.multi_viewport) need = "MultiViewport"; break;
+                case 53: if (!hvk.dev.caps.xfb) need = "TransformFeedback"; break;
+                case 54: if (!hvk.dev.x.geometry_streams) need = "GeometryStreams"; break;
+                case 23: case 24: if (!hvk.dev.x.tess_geom_point_size) need = "TessellationPointSize / GeometryPointSize"; break;
+                case 69: if (!hvk.dev.x.output_layer) need = "ShaderLayer (shaderOutputLayer)"; break;
+                case 70: if (!hvk.dev.x.output_viewport) need = "ShaderViewportIndex (shaderOutputViewportIndex)"; break;
+                case 5254: if (!hvk.dev.x.output_layer || !hvk.dev.x.output_viewport) need = "ShaderViewportIndexLayerEXT"; break;
+                default: break;
+            }
+            if (need) { size_t k = strlen(why); snprintf(why + k, n - k, "%s%s", k ? ", " : "", need); bad = 1; }
+        }
+        if (op == 54) break;   // OpFunction: past the capabilities
+        i += len;
+    }
+    return bad;
+}
+
+// What the backend reads from a module's own declarations (step P8), up to its first function: the Xfb execution mode (OpExecutionMode, opcode 16, mode 11: its draws capture
+// while transform feedback is on), the XfbBuffer and XfbStride decorations (OpDecorate 71 / OpMemberDecorate 72, decorations 36 and 37) that give each capture buffer's vertex
+// stride (DrawTransformFeedback's vertex size), a tessellation control shader's OutputVertices (mode 26: the patch size its draws are made with), and whether a fragment
+// shader has an input decorated NoPerspective (decoration 13)
+static void module_scan(const uint32_t *w, size_t nw, hvk_shader *sh) {
+    struct { uint32_t id, member, buf, stride; } x[64]; int nx = 0;
+    for (size_t i = 5; i < nw;) {
+        uint32_t op = w[i] & 0xffff, len = w[i] >> 16;
+        if (!len || i + len > nw) break;
+        if (op == 16 && len >= 3 && w[i + 2] == 11) sh->xfb = 1;
+        if (op == 16 && len >= 4 && w[i + 2] == 26 && sh->stage == 3) sh->tcs_vertices = (uint8_t)(w[i + 3] < 255 ? w[i + 3] : 255);
+        if (op == 71 && len >= 3 && w[i + 2] == 13 && sh->stage == 1) sh->noperspective = 1;   // OpDecorate ... NoPerspective, on a fragment shader's input
+        if ((op == 71 && len >= 4) || (op == 72 && len >= 5)) {
+            uint32_t id = w[i + 1], member = op == 72 ? w[i + 2] : UINT32_MAX, dec = w[i + (op == 72 ? 3 : 2)], val = w[i + (op == 72 ? 4 : 3)];
+            if (dec == 36 || dec == 37) {
+                int k = 0; while (k < nx && !(x[k].id == id && x[k].member == member)) k++;
+                if (k == nx && nx < 64) { x[nx].id = id; x[nx].member = member; x[nx].buf = UINT32_MAX; x[nx].stride = 0; nx++; }
+                if (k < nx) { if (dec == 36) x[k].buf = val; else x[k].stride = val; }
+            }
+        }
+        if (op == 54) break;
+        i += len;
+    }
+    for (int k = 0; k < nx; k++) if (x[k].buf < 4 && x[k].stride && x[k].stride < 65536) sh->xfb_stride[x[k].buf] = (uint16_t)x[k].stride;
+}
+
+// ---------- The reflection: the Vulkan form into the Metal form nvn_refl_from_json_text reads ----------
+static const cJSON *jget(const cJSON *o, const char *k) { return cJSON_GetObjectItemCaseSensitive(o, k); }
+static const char *jstr(const cJSON *o, const char *k) { const cJSON *v = jget(o, k); return cJSON_IsString(v) ? v->valuestring : NULL; }
+static int jint(const cJSON *o, const char *k, int def) { const cJSON *v = jget(o, k); return cJSON_IsNumber(v) ? (int)v->valuedouble : def; }
+static int jbool(const cJSON *o, const char *k) { const cJSON *v = jget(o, k); return cJSON_IsTrue(v) || (cJSON_IsNumber(v) && v->valuedouble != 0); }
+static void msl_image_type(const cJSON *b, char *out, size_t n) {   // texture2d_array<uint, access::read_write>, depth2d<float>, texture_buffer<float>, array<..., N>
+    const char *cls = jstr(b, "class"), *dim = jstr(b, "dim"), *sampled = jstr(b, "sampled");
+    int arrayed = jbool(b, "arrayed"), depth = jbool(b, "depth"), ms = jbool(b, "ms"), count = jint(b, "n", 1);
+    const char *el = !sampled || !strcmp(sampled, "float") ? "float" : !strcmp(sampled, "uint") ? "uint" : "int";
+    char base[64], ty[96];
+    if (cls && (!strcmp(cls, "texel_buffer") || !strcmp(cls, "storage_texel_buffer")) ) snprintf(base, sizeof base, "texture_buffer");
+    else if (dim && !strcmp(dim, "1d")) snprintf(base, sizeof base, arrayed ? "texture1d_array" : "texture1d");
+    else if (dim && !strcmp(dim, "3d")) snprintf(base, sizeof base, "texture3d");
+    else if (dim && !strcmp(dim, "cube")) snprintf(base, sizeof base, depth ? (arrayed ? "depthcube_array" : "depthcube") : (arrayed ? "texturecube_array" : "texturecube"));
+    else if (dim && !strcmp(dim, "buffer")) snprintf(base, sizeof base, "texture_buffer");
+    else snprintf(base, sizeof base, "%s%s%s", depth ? "depth2d" : "texture2d", ms ? "_ms" : "", arrayed ? "_array" : "");
+    int storage = cls && (!strcmp(cls, "storage_image") || !strcmp(cls, "storage_texel_buffer"));
+    snprintf(ty, sizeof ty, "%s<%s%s>", base, el, storage ? (jbool(b, "rw") ? ", access::read_write" : ", access::read") : "");
+    if (cls && !strcmp(cls, "sampler")) snprintf(ty, sizeof ty, "sampler");
+    if (count != 1 || jget(b, "n")) snprintf(out, n, "array<%s, %d>", ty, count); else snprintf(out, n, "%s", ty);
+}
+static VkImageViewType dim_type(const cJSON *b) {
+    const char *dim = jstr(b, "dim"); int arrayed = jbool(b, "arrayed");
+    if (!dim) return VK_IMAGE_VIEW_TYPE_2D;
+    if (!strcmp(dim, "1d")) return arrayed ? VK_IMAGE_VIEW_TYPE_1D_ARRAY : VK_IMAGE_VIEW_TYPE_1D;
+    if (!strcmp(dim, "3d")) return VK_IMAGE_VIEW_TYPE_3D;
+    if (!strcmp(dim, "cube")) return arrayed ? VK_IMAGE_VIEW_TYPE_CUBE_ARRAY : VK_IMAGE_VIEW_TYPE_CUBE;
+    return arrayed ? VK_IMAGE_VIEW_TYPE_2D_ARRAY : VK_IMAGE_VIEW_TYPE_2D;
+}
+// The Vulkan reflection document (json, n bytes) into sh: the neutral reflection through the frontend's parser and the descriptors. 0, or 1 with the reason in err
+static int refl_vk(const char *json, size_t n, hvk_shader *sh, char *err, size_t en) {
+    cJSON *j = cJSON_ParseWithLength(json, n);
+    if (!j) { snprintf(err, en, "the reflection json does not parse"); return 1; }
+    int rc = 1; cJSON *m = NULL; char *text = NULL;
+    const char *chain = jstr(j, "chain"), *target = jstr(j, "target");
+    if (!chain || strcmp(chain, DMSH_CHAIN_VK)) { snprintf(err, en, "translation chain version %s, but this host expects %s", chain ? chain : "(none)", DMSH_CHAIN_VK); goto out; }
+    if (target && strcmp(target, "vk")) { snprintf(err, en, "a reflection for target %s, not vk", target); goto out; }
+    int st = stage_of_refl(jstr(j, "stage"));
+    if (st >= 0 && sh->stage >= 0 && st != sh->stage) { snprintf(err, en, "the library says stage %s, the shader map another", jstr(j, "stage")); goto out; }
+    if (sh->stage < 0) sh->stage = st;
+    snprintf(sh->entry, sizeof sh->entry, "%s", jstr(j, "entry") ? jstr(j, "entry") : "main");
+    if (jstr(j, "entry_u")) snprintf(sh->entry_u, sizeof sh->entry_u, "%s", jstr(j, "entry_u"));
+    if (jstr(j, "entry_m")) { snprintf(sh->entry_m, sizeof sh->entry_m, "%s", jstr(j, "entry_m")); sh->mask_m = (uint8_t)jint(j, "uint_mask_m", 0); }
+    m = cJSON_CreateObject();
+    cJSON_AddStringToObject(m, "route", "B");
+    static const char *const copy[] = {"c1", "drv_reads", "drv_unfillable", "raster", "threadgroup_size", "vin"};
+    for (size_t i = 0; i < sizeof copy / sizeof *copy; i++) { const cJSON *v = jget(j, copy[i]); if (v) cJSON_AddItemToObject(m, copy[i], cJSON_Duplicate(v, 1)); }
+    cJSON *bs = cJSON_AddArrayToObject(m, "bindings");
+    const cJSON *vb = jget(j, "bindings"); int i = 0;
+    for (const cJSON *b = cJSON_IsArray(vb) ? vb->child : NULL; b; b = b->next, i++) {
+        cJSON *o = cJSON_CreateObject(); char ty[160];
+        const char *kind = jstr(b, "kind");
+        cJSON_AddStringToObject(o, "kind", kind ? kind : "?");
+        if (cJSON_IsNumber(jget(b, "reg"))) cJSON_AddNumberToObject(o, "reg", jint(b, "reg", 0));
+        cJSON_AddNumberToObject(o, "arg_id", i);
+        cJSON_AddStringToObject(o, "msl_name", jstr(b, "name") ? jstr(b, "name") : "");
+        const char *cls = jstr(b, "class");
+        if (cls && strcmp(cls, "ubo") && strcmp(cls, "ssbo")) { msl_image_type(b, ty, sizeof ty); cJSON_AddStringToObject(o, "msl_type", ty); }
+        static const char *const pass[] = {"off", "bank", "rw", "atomic", "fetch1d"};
+        for (size_t k = 0; k < sizeof pass / sizeof *pass; k++) { const cJSON *v = jget(b, pass[k]); if (v) cJSON_AddItemToObject(o, pass[k], cJSON_Duplicate(v, 1)); }
+        cJSON_AddItemToArray(bs, o);
+    }
+    cJSON *vi = cJSON_AddArrayToObject(m, "vertex_inputs");
+    const cJSON *vin = jget(j, "vertex_inputs");
+    for (const cJSON *v = cJSON_IsArray(vin) ? vin->child : NULL; v; v = v->next) {
+        cJSON *o = cJSON_CreateObject(); const char *t = jstr(v, "type");
+        int loc = jint(v, "location", -1);
+        cJSON_AddNumberToObject(o, "location", loc);
+        cJSON_AddStringToObject(o, "msl_type", !t || !strcmp(t, "float") ? "float4" : !strcmp(t, "uint") ? "uint4" : "int4");
+        cJSON_AddItemToArray(vi, o);
+        if (loc >= 0 && loc < 32) sh->vin_types[loc] = (uint32_t)(1 + (!t || !strcmp(t, "float") ? NVN_CT_FLOAT : !strcmp(t, "uint") ? NVN_CT_UINT : NVN_CT_INT));
+    }
+    text = cJSON_PrintUnformatted(m);
+    if (!text) { snprintf(err, en, "the reflection could not be rewritten"); goto out; }
+    char perr[200];
+    if (nvn_refl_from_json_text(text, strlen(text), &sh->rf, perr, sizeof perr)) { snprintf(err, en, "%s", perr); goto out; }
+    // The descriptors: one per (set, binding); a combined image's texture and sampler entries share it
+    sh->nb = 0; i = 0;
+    for (const cJSON *b = cJSON_IsArray(vb) ? vb->child : NULL; b; b = b->next, i++) {
+        uint32_t set = (uint32_t)jint(b, "set", 0), bind = (uint32_t)jint(b, "binding", 0);
+        const char *cls = jstr(b, "class"); if (!cls) cls = "";
+        int k = 0; while (k < sh->nb && !(sh->b[k].set == set && sh->b[k].binding == bind)) k++;
+        if (k == sh->nb) {
+            if (sh->nb == HVK_MAXB) { snprintf(err, en, "more than %d descriptors", HVK_MAXB); goto out; }
+            hvk_binding *d = &sh->b[sh->nb++]; memset(d, 0, sizeof *d);
+            d->set = set; d->binding = bind; d->count = (uint32_t)(jget(b, "n") ? jint(b, "n", 1) : 1); d->rb_tex = d->rb_samp = -1;
+            d->type = !strcmp(cls, "ubo") ? VK_DESCRIPTOR_TYPE_UNIFORM_BUFFER : !strcmp(cls, "ssbo") ? VK_DESCRIPTOR_TYPE_STORAGE_BUFFER :
+                      !strcmp(cls, "combined") ? VK_DESCRIPTOR_TYPE_COMBINED_IMAGE_SAMPLER : !strcmp(cls, "texture") ? VK_DESCRIPTOR_TYPE_SAMPLED_IMAGE :
+                      !strcmp(cls, "sampler") ? VK_DESCRIPTOR_TYPE_SAMPLER : !strcmp(cls, "texel_buffer") ? VK_DESCRIPTOR_TYPE_UNIFORM_TEXEL_BUFFER :
+                      !strcmp(cls, "storage_texel_buffer") ? VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER : !strcmp(cls, "storage_image") ? VK_DESCRIPTOR_TYPE_STORAGE_IMAGE : VK_DESCRIPTOR_TYPE_MAX_ENUM;
+            if (d->type == VK_DESCRIPTOR_TYPE_MAX_ENUM) { snprintf(err, en, "binding %s of class %s: no descriptor type", jstr(b, "name") ? jstr(b, "name") : "?", cls); goto out; }
+            d->dim = (uint8_t)dim_type(b);
+            const char *sm = jstr(b, "sampled"); d->cls = !sm || !strcmp(sm, "float") ? NVN_VK_FLOAT : !strcmp(sm, "uint") ? NVN_VK_UINT : NVN_VK_SINT;
+        }
+        hvk_binding *d = &sh->b[k];
+        uint8_t rk = sh->rf.b[i].kind;
+        int is_samp = !strcmp(cls, "sampler") || rk == NVN_RB_SAMP || rk == NVN_RB_SAMPT || rk == NVN_RB_SAMPU || rk == NVN_RB_SAMPI || rk == NVN_RB_SAMPD || rk == NVN_RB_SAMPA;
+        if (is_samp) d->rb_samp = (int16_t)i; else d->rb_tex = (int16_t)i;
+        if (jbool(b, "rw") && (d->type == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER || d->type == VK_DESCRIPTOR_TYPE_STORAGE_IMAGE || d->type == VK_DESCRIPTOR_TYPE_STORAGE_TEXEL_BUFFER)) { d->rw = 1; sh->writes_storage = 1; }
+    }
+    rc = 0;
+out:
+    free(text); cJSON_Delete(m); cJSON_Delete(j);
+    return rc;
+}
+
+// ---------- Loading ----------
+static nvn_hmap g_sh;     // 24-byte key → hvk_shader (NULL entries are never stored: a failed key is in g_fail)
+static nvn_hmap g_fail;   // 24-byte key → (void *)1
+// ---------- The shaders' constants (c1): shared banks, as the Metal backend packs them (nvn_mtl.m c1_store) ----------
+// A shader's c1 is its reflection's bytes (rf.c1_len: 256 to 768 bytes in the libraries so far, 6 KiB at most), bound as a uniform buffer of C1_WINDOW bytes (min with
+// maxUniformBufferRange: the 64 KiB the shader declares, float4[4096]) from its offset (vk_pipeline.c build_set); reads past the bytes must give 0, as on the Switch.
+// - A shader whose c1 indices are proven bounded is packed into a bank shared with others: C1_BANK bytes, a range of a host-visible block of the allocator (step D2), zeroed when
+//   made; its data at an offset aligned to 256 bytes (or minUniformBufferOffsetAlignment if larger), then zeros to the end of its span, the data rounded up to 256 bytes plus 256,
+//   before the next shader's data; a bank takes no shader whose span would leave less than C1_WINDOW bytes after it, so every shader's window lies inside the bank and the bank ends
+//   in at least 64 KiB of zeros. The span is what c1_guard.py proves a shader's reads stay inside.
+// - Proven bounded: the shader's key is not in the profile's c1_full_vk.tsv, which a full dmsh_build_vk.py run writes beside the shader map with dm/gfx/tools/c1_guard.py (the Metal
+//   chain's c1_full.tsv rule: interval arithmetic over every c1 index, 0 <= index and 16 * (index + 1) <= the span) run on the analysis MSL rendering of this library's own SPIR-V,
+//   geometry and tessellation shaders (no rendering) listed as unproven; read as nvn_mtl.m reads c1_full.tsv, and taken only when its first line names this library's chain and
+//   stamp ("# chain vk-<DMSH_CHAIN_VK> inputs <the inputs row of vk-<V>/inputs.tsv>", alone or with more after a blank: shader_lib.py table_head).
+// - Any other shader (listed, or every one when the table is missing or stale) gets C1_WINDOW bytes of its own, a range of a block too. A missing or stale table is said in one
+//   [RED] line, at the first shader with a c1 that takes a window of its own for that reason, not at the map's load as nvn_mtl.m says it: a library whose shaders have no c1 (the
+//   GPU tests', a game's built-in kernels) needs no table, and the line then marks only what the table would have changed.
+// Banks and ranges go back at shutdown (hvk_shader_shutdown); a loaded shader is never unloaded before. The line "[hostvk] c1 banks: ..." gives the counts.
+enum { C1_WINDOW = 65536, C1_BANK = 4u << 20 };   // nvn_mtl.m C1_DECL_SIZE and C1_BANK_SIZE
+typedef struct { VkBuffer buf; hvk_mem *mem; uint8_t *map; } c1_bank;
+static pthread_mutex_t g_c1_mu = PTHREAD_MUTEX_INITIALIZER;   // a leaf: the banks, the table, the counts (the built-in kernels are made outside g_sh_mu)
+static c1_bank *g_banks; static uint32_t g_nbank, g_capbank;
+static VkDeviceSize g_bank_off;   // the next free offset of the last bank
+static nvn_hmap g_c1_full;        // 16-hex-digit key → (void *)1: the shaders c1_full_vk.tsv lists
+static int g_c1_full_valid;       // the table was taken
+static char g_c1_why[1400];       // why not: the [RED] line, said once at the first c1 that falls back to a window of its own (c1_make)
+static int g_c1_said;
+static uint32_t g_c1_packed, g_c1_own;
+static uint64_t g_c1_data;        // the constants' own bytes (packed and own)
+static void c1_table_load(const char *map_path, const char *inputs) {   // under g_sh_mu (map_load_)
+    char p[1100]; size_t dl = 0;
+    for (size_t i = 0; map_path[i]; i++) if (map_path[i] == '/' || map_path[i] == '\\') dl = i + 1;
+    snprintf(p, sizeof p, "%.*sc1_full_vk.tsv", (int)dl, map_path);
+    // The header line is the stamp alone (shader_lib.py table_head, which c1_guard.py writes since the upstream merge) or the stamp and more after a blank, as nvn_mtl.m
+    // table_head_ok takes it; a library without a stamp ("-") matches no table
+    char want[256]; int wl = snprintf(want, sizeof want, "# chain vk-%s inputs %s", DMSH_CHAIN_VK, inputs[0] ? inputs : "-");
+    size_t n = 0; char *txt = read_file(p, &n);
+    pthread_mutex_lock(&g_c1_mu);
+    if (!g_c1_full.klen) nvn_hm_init(&g_c1_full, 16);
+    nvn_hm_clear(&g_c1_full, NULL); g_c1_full_valid = 0; g_c1_said = 0; g_c1_why[0] = 0;
+    if (!txt || strncmp(txt, want, (size_t)wl) || (txt[wl] && txt[wl] != '\n' && txt[wl] != '\r' && txt[wl] != ' ')) {
+        snprintf(g_c1_why, sizeof g_c1_why, "[RED] [hostvk] c1_full_vk.tsv is stale or missing (%s: its header must name this library's chain vk-%s and inputs %s; a full "
+                 "dmsh_build_vk.py run makes it): every c1 gets its own 64 KiB", p, DMSH_CHAIN_VK, inputs[0] ? inputs : "(no stamp)");
+        pthread_mutex_unlock(&g_c1_mu);
+        free(txt); return;
+    }
+    int listed = 0;
+    for (char *ln = strchr(txt, '\n'), *next; ln && *++ln; ln = next) {   // past the header
+        next = strchr(ln, '\n'); if (next) *next = 0;
+        while (*ln == ' ' || *ln == '\t') ln++;
+        size_t l = strlen(ln); while (l && (ln[l - 1] == '\r' || ln[l - 1] == ' ' || ln[l - 1] == '\t')) ln[--l] = 0;
+        if (l == 16 && *ln != '#' && !nvn_hm_put(&g_c1_full, ln, (void *)1)) listed++;
+        if (!next) break;
+    }
+    g_c1_full_valid = 1;
+    pthread_mutex_unlock(&g_c1_mu);
+    free(txt);
+    hostvk_log("[hostvk] c1_full_vk.tsv: %d shaders whose c1 indices are not proven bounded get 64 KiB of their own; every other c1 is packed into shared banks of %u MiB", listed, (unsigned)(C1_BANK >> 20));
+}
+static int c1_make(hvk_shader *sh) {
+    if (!sh->rf.has_c1) return 1;
+    size_t len = sh->rf.c1_len;
+    void *map;
+    pthread_mutex_lock(&g_c1_mu);
+    int own = !g_c1_full_valid || strlen(sh->key) != 16 || nvn_hm_get(&g_c1_full, sh->key);   // a built-in kernel (no 16-digit key) has no c1
+    if (own) {
+        char say[sizeof g_c1_why]; say[0] = 0;
+        if (!g_c1_full_valid && !g_c1_said) {   // the first c1 the missing or stale table leaves without a bank: the red line, once
+            g_c1_said = 1;
+            snprintf(say, sizeof say, "%s", g_c1_why[0] ? g_c1_why : "[RED] [hostvk] c1_full_vk.tsv was not read (no shader map): every c1 gets its own 64 KiB");
+        }
+        int fail = hvk_mem_buffer(C1_WINDOW, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, HVK_MEM_HOST, &sh->c1buf, &sh->c1mem, &map) != VK_SUCCESS;
+        if (!fail) { memset(map, 0, C1_WINDOW); memcpy(map, sh->rf.c1, len); sh->c1off = 0; g_c1_own++; g_c1_data += len; }
+        pthread_mutex_unlock(&g_c1_mu);
+        if (say[0]) hostvk_log("%s", say);
+        return !fail;
+    }
+    VkDeviceSize align = hvk.lim.minUniformBufferOffsetAlignment > 256 ? hvk.lim.minUniformBufferOffsetAlignment : 256;
+    VkDeviceSize span = ((len + 255) & ~(VkDeviceSize)255) + 256;
+    if (!g_nbank || g_bank_off + span + C1_WINDOW > C1_BANK) {
+        if (g_nbank == g_capbank) {
+            c1_bank *b = realloc(g_banks, sizeof *b * (g_capbank ? 2 * g_capbank : 8));
+            if (!b) { pthread_mutex_unlock(&g_c1_mu); return 0; }
+            g_banks = b; g_capbank = g_capbank ? 2 * g_capbank : 8;
+        }
+        c1_bank *b = &g_banks[g_nbank];
+        if (hvk_mem_buffer(C1_BANK, VK_BUFFER_USAGE_UNIFORM_BUFFER_BIT, HVK_MEM_HOST, &b->buf, &b->mem, &map)) { pthread_mutex_unlock(&g_c1_mu); return 0; }
+        b->map = map; memset(b->map, 0, C1_BANK);
+        g_nbank++; g_bank_off = 0;
+    }
+    c1_bank *b = &g_banks[g_nbank - 1];
+    VkDeviceSize off = g_bank_off;
+    memcpy(b->map + off, sh->rf.c1, len);
+    g_bank_off = (off + span + align - 1) / align * align;
+    sh->c1buf = b->buf; sh->c1mem = NULL; sh->c1off = off;
+    g_c1_packed++; g_c1_data += len;
+    pthread_mutex_unlock(&g_c1_mu);
+    return 1;
+}
+void hvk_c1_get_stats(hvk_c1_stats *s) {
+    pthread_mutex_lock(&g_c1_mu);
+    s->packed = g_c1_packed; s->own = g_c1_own; s->banks = g_nbank; s->table = g_c1_full_valid;
+    s->bank_bytes = (uint64_t)g_nbank * C1_BANK; s->own_bytes = (uint64_t)g_c1_own * C1_WINDOW; s->data_bytes = g_c1_data;
+    s->bank_size = C1_BANK; s->window = C1_WINDOW;
+    s->align = hvk.lim.minUniformBufferOffsetAlignment > 256 ? hvk.lim.minUniformBufferOffsetAlignment : 256;
+    pthread_mutex_unlock(&g_c1_mu);
+}
+const uint8_t *hvk_c1_bank(uint32_t i, VkBuffer *buf, VkDeviceSize *size) {
+    pthread_mutex_lock(&g_c1_mu);
+    const uint8_t *m = i < g_nbank ? g_banks[i].map : NULL;
+    if (buf) *buf = i < g_nbank ? g_banks[i].buf : VK_NULL_HANDLE;
+    if (size) *size = i < g_nbank ? C1_BANK : 0;
+    pthread_mutex_unlock(&g_c1_mu);
+    return m;
+}
+static void c1_shutdown(int map_loaded) {   // after every shader's own range went back: the line, the banks, the table
+    pthread_mutex_lock(&g_c1_mu);
+    if (map_loaded || g_c1_packed || g_c1_own)
+        hostvk_log("[hostvk] c1 banks: %u shaders packed in %u banks (%llu bytes), %u with 64 KiB of their own (%llu bytes); %llu bytes of constants; c1_full_vk.tsv %s",
+                   g_c1_packed, g_nbank, (unsigned long long)g_nbank * C1_BANK, g_c1_own, (unsigned long long)g_c1_own * C1_WINDOW, (unsigned long long)g_c1_data,
+                   g_c1_full_valid ? "taken" : "not taken");
+    for (uint32_t i = 0; i < g_nbank; i++) hvk_mem_buffer_free(g_banks[i].buf, g_banks[i].mem);
+    free(g_banks); g_banks = NULL; g_nbank = g_capbank = 0; g_bank_off = 0;
+    nvn_hm_clear(&g_c1_full, NULL); g_c1_full_valid = 0; g_c1_said = 0; g_c1_why[0] = 0; g_c1_packed = g_c1_own = 0; g_c1_data = 0;
+    pthread_mutex_unlock(&g_c1_mu);
+}
+static hvk_shader *shader_from(const char *key, int stage, const uint32_t *code, size_t bytes, const char *json, size_t jn, char *err, size_t en) {
+    hvk_shader *sh = calloc(1, sizeof *sh);
+    if (!sh) { snprintf(err, en, "out of memory"); return NULL; }
+    snprintf(sh->key, sizeof sh->key, "%s", key); sh->stage = stage;
+    char why[200];
+    if (caps_missing(code, bytes / 4, why, sizeof why)) { snprintf(err, en, "the module needs %s, which this device lacks", why); free(sh); return NULL; }
+    if (refl_vk(json, jn, sh, err, en)) { free(sh->rf.c1); free(sh); return NULL; }
+    module_scan(code, bytes / 4, sh);
+    if (!(sh->module = hvk_module(code, bytes))) { snprintf(err, en, "vkCreateShaderModule failed"); free(sh->rf.c1); free(sh); return NULL; }
+    if (!c1_make(sh)) { snprintf(err, en, "no memory for its constants"); vkDestroyShaderModule(hvk.d, sh->module, NULL); free(sh->rf.c1); free(sh); return NULL; }
+    atomic_fetch_add(&hvk.st_shaders, 1);
+    return sh;
+}
+// The backend's counter kernels for nvn_builtin.h's keys: the module and a reflection in the Vulkan form (n in uniform slot 0 = c3, src and dst in storage slots 0 and 1)
+static hvk_shader *builtin_get(const char *ctl) {
+    static const struct { const char *fn; const uint32_t *code; size_t bytes; } K[] = {
+        {"q_val0", q_val0_spv, sizeof q_val0_spv}, {"q_val8", q_val8_spv, sizeof q_val8_spv}, {"q_dlt0", q_dlt0_spv, sizeof q_dlt0_spv}, {"q_dlt8", q_dlt8_spv, sizeof q_dlt8_spv}};
+    for (unsigned i = 0; i < sizeof k_nvn_builtin_map / sizeof *k_nvn_builtin_map; i++) {
+        if (strcmp(ctl, k_nvn_builtin_map[i].ctl)) continue;
+        for (unsigned k = 0; k < sizeof K / sizeof *K; k++) if (!strcmp(K[k].fn, k_nvn_builtin_map[i].fn)) {
+            char json[640], err[200];
+            snprintf(json, sizeof json, "{\"key\":\"%s\",\"target\":\"vk\",\"chain\":\"%s\",\"stage\":\"cs\",\"entry\":\"main\",\"threadgroup_size\":[32,1,1],\"bindings\":["
+                     "{\"name\":\"cs_c3\",\"set\":0,\"binding\":4,\"class\":\"ubo\",\"kind\":\"cbuf\",\"reg\":0},"
+                     "{\"name\":\"cs_s0\",\"set\":1,\"binding\":0,\"class\":\"ssbo\",\"kind\":\"sbuf\",\"reg\":0,\"rw\":false},"
+                     "{\"name\":\"cs_s1\",\"set\":1,\"binding\":1,\"class\":\"ssbo\",\"kind\":\"sbuf\",\"reg\":1,\"rw\":true}]}", K[k].fn, DMSH_CHAIN_VK);
+            hvk_shader *sh = shader_from(K[k].fn, 5, K[k].code, K[k].bytes, json, strlen(json), err, sizeof err);
+            if (!sh) hostvk_log("[RED] [hostvk] built-in counter kernel %s: %s", K[k].fn, err);
+            else sh->builtin = 1;
+            return sh;
+        }
+    }
+    return NULL;
+}
+static hvk_shader *shader_get_(const char *key, int stage);
+static hvk_shader *shader_get(const char *key, int stage) {
+    pthread_mutex_lock(&g_sh_mu);
+    hvk_shader *sh = shader_get_(key, stage);
+    pthread_mutex_unlock(&g_sh_mu);
+    return sh;
+}
+// A prewarm row's shader (vk_backend.h)
+hvk_shader *hvk_shader_by_key(const char *key, int *stale) {
+    if (stale) *stale = 0;
+    map_load();
+    // the lists name a shader by its map key, or the Metal library's name for it, <map key>_b (R and S rows recorded by the Metal backend)
+    size_t n = strlen(key);
+    char k[17] = {0}; snprintf(k, sizeof k, "%s", key);
+    map_ent *e = n == 16 || (n == 18 && !strcmp(key + 16, "_b")) ? nvn_hm_get(&g_map, k) : NULL;
+    if (!e) { if (stale) *stale = 1; return NULL; }
+    return shader_get(k, e->stage);
+}
+int hvk_shader_map_each(void (*fn)(const char *key, int stage, void *u), void *u) {
+    map_load();
+    int n = 0;
+    for (uint32_t i = 0; i < g_map.cap; i++) if (g_map.vals && g_map.vals[i]) { const map_ent *e = g_map.vals[i]; fn(e->key, e->stage, u); n++; }
+    return n;
+}
+static hvk_shader *shader_get_(const char *key, int stage) {   // under g_sh_mu
+    char k24[24] = {0}; snprintf(k24, sizeof k24, "%s", key);
+    if (!g_sh.klen) { nvn_hm_init(&g_sh, 24); nvn_hm_init(&g_fail, 24); }
+    hvk_shader *sh = nvn_hm_get(&g_sh, k24);
+    if (sh || nvn_hm_get(&g_fail, k24)) return sh;
+    char p[1200], err[300]; size_t sn = 0, jn = 0;
+    snprintf(p, sizeof p, "%s/%s.spv", hvk_shader_dir(), key); char *spv = read_file(p, &sn);
+    snprintf(p, sizeof p, "%s/%s.json", hvk_shader_dir(), key); char *json = read_file(p, &jn);
+    if (!spv || !json || (sn & 3) || sn < 20) {
+        hostvk_log("[RED] [hostvk] shader %s: %s is missing from %s (build the library with dm/gfx/tools/dmsh_build_vk.py)", key, !spv ? "the module" : "the reflection", hvk_shader_dir());
+        sh = NULL;
+    } else if (!(sh = shader_from(key, stage, (const uint32_t *)(void *)spv, sn, json, jn, err, sizeof err))) hostvk_log("[RED] [hostvk] shader %s failed to load: %s", key, err);
+    free(spv); free(json);
+    if (sh) nvn_hm_put(&g_sh, k24, sh); else nvn_hm_put(&g_fail, k24, (void *)1);
+    return sh;
+}
+
+// ---------- Programs ----------
+static nvn_hmap g_prog;   // serial → hvk_prog
+// bst: copies of the programs bound per stage when the combination was made, not pointers: since upstream 90edd532 those are a queued job's snapshots (nvn_queue.inc), freed with it
+typedef struct { uint64_t serial; prog_t bst[5]; uint8_t has[5]; } comp_t;
+static nvn_hmap g_comp;   // serial → comp_t: a combined program (nvn_state_hook_compose)
+uint64_t hvk_prog_compose(uint64_t old_serial, const prog_t *const bst[5]) {
+    if (!g_comp.klen) nvn_hm_init(&g_comp, 8);
+    if (old_serial) { free(nvn_hm_del(&g_comp, &old_serial)); if (g_prog.klen) free(nvn_hm_del(&g_prog, &old_serial)); }
+    comp_t *c = calloc(1, sizeof *c); if (!c) return nvn_new_serial();
+    c->serial = nvn_new_serial();
+    for (int i = 0; i < 5; i++) if (bst[i]) { c->bst[i] = *bst[i]; c->has[i] = 1; }
+    nvn_hm_put(&g_comp, &c->serial, c);
+    return c->serial;
+}
+void hvk_prog_drop(uint64_t serial) { if (serial && g_prog.klen) free(nvn_hm_del(&g_prog, &serial)); }
+static hvk_prog *prog_load(const prog_t *p);
+hvk_prog *hvk_prog_get(const prog_t *p) {
+    if (!p) return NULL;
+    // A program bound before its SetShaders has no serial and no stages (hle_nvn.c gives it both there), so it has no shader: the one empty record, read only by the callers.
+    // It got a record of its own here before, which was not cached (no serial to key it) and which no caller frees: one allocation leaked per draw or dispatch with such a
+    // program (found at the look-ahead step)
+    static hvk_prog none;
+    if (!p->serial) return &none;
+    if (!g_prog.klen) nvn_hm_init(&g_prog, 8);
+    hvk_prog *o = nvn_hm_get(&g_prog, &p->serial);
+    if (o) return o;
+    comp_t *c = g_comp.klen ? nvn_hm_get(&g_comp, &p->serial) : NULL;
+    if (!(o = calloc(1, sizeof *o))) return NULL;
+    o->serial = p->serial;
+    if (c) {   // a combined program: each stage from the program bound there
+        // prog_load hands back a copy of its own (malloc), freed once its stage is taken: it leaked one hvk_prog per stage of every combined program made (found at step P5)
+        for (int st = 0; st < 5; st++) if (c->has[st]) { hvk_prog *s = prog_load(&c->bst[st]); if (s) { o->sh[st] = s->sh[st]; free(s); } }
+    } else {
+        hvk_prog *s = prog_load(p);
+        if (s) { memcpy(o->sh, s->sh, sizeof o->sh); free(s); }
+    }
+    nvn_hm_put(&g_prog, &p->serial, o);
+    return o;
+}
+static hvk_prog *prog_load(const prog_t *p) {   // a program's own stages (by the shader map), not cached here
+    if (p->serial && g_prog.klen) { hvk_prog *have = nvn_hm_get(&g_prog, &p->serial); if (have) { hvk_prog *cp = malloc(sizeof *cp); if (cp) *cp = *have; return cp; } }
+    hvk_prog *o = calloc(1, sizeof *o); if (!o) return NULL;
+    map_load();
+    for (unsigned i = 0; i < p->nstage && i < 6; i++) {
+        uint8_t md[8]; if (!prog_key(p, i, md)) continue;
+        char k[17]; for (int b = 0; b < 8; b++) snprintf(k + 2 * b, 3, "%02x", md[b]);
+        map_ent *e = nvn_hm_get(&g_map, k);
+        if (!e) {
+            hvk_shader *b = builtin_get(k);
+            if (b) { o->sh[5] = b; continue; }
+            hostvk_log("[RED] [hostvk] shader %s is not in the shader map", k);
+            continue;
+        }
+        hvk_shader *sh = shader_get(k, e->stage);
+        if (sh) o->sh[e->stage] = sh;
+    }
+    return o;
+}
+void hvk_shader_shutdown(void) {
+    for (uint32_t i = 0; i < g_sh.cap; i++) if (g_sh.vals && g_sh.vals[i]) {
+        hvk_shader *sh = g_sh.vals[i];
+        if (sh->module) vkDestroyShaderModule(hvk.d, sh->module, NULL);
+        if (sh->c1mem) hvk_mem_buffer_free(sh->c1buf, sh->c1mem);   // its own 64 KiB; a packed shader's bank goes in c1_shutdown
+        free(sh->rf.c1); free(sh);
+    }
+    nvn_hm_clear(&g_sh, NULL); nvn_hm_clear(&g_fail, NULL);
+    c1_shutdown(atomic_load(&g_map_loaded));
+    for (uint32_t i = 0; i < g_prog.cap; i++) if (g_prog.vals && g_prog.vals[i]) free(g_prog.vals[i]);
+    nvn_hm_clear(&g_prog, NULL);
+    for (uint32_t i = 0; i < g_comp.cap; i++) if (g_comp.vals && g_comp.vals[i]) free(g_comp.vals[i]);
+    nvn_hm_clear(&g_comp, NULL);
+    for (uint32_t i = 0; i < g_map.cap; i++) if (g_map.vals && g_map.vals[i]) free(g_map.vals[i]);
+    nvn_hm_clear(&g_map, NULL); atomic_store(&g_map_loaded, 0); g_dir[0] = 0;
+}

@@ -33,8 +33,10 @@ def program_id(npdm):   # the ACI0 program ID of main.npdm
     return struct.unpack_from('<Q', d, off + 0x10)[0]
 
 
-def clone(src, dst):   # an APFS clone on the same volume, else a copy
-    if subprocess.run(['cp', '-c', src, dst], capture_output=True).returncode != 0: shutil.copy2(src, dst)
+def clone(src, dst):   # an APFS clone on the same volume, else a copy (also where there is no cp: Windows)
+    try: cloned = subprocess.run(['cp', '-c', src, dst], capture_output=True).returncode == 0
+    except OSError: cloned = False
+    if not cloned: shutil.copy2(src, dst)
 
 
 def exefs(src, dst):

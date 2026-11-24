@@ -169,7 +169,8 @@ static int boot_env(void) {
             if (dm_player_diagnostic_key(k.UTF8String) || [launcher_keys containsObject:k] ||
                 ([launcher_keys containsObject:@"DM_METAL_HUD"] && [k isEqualToString:@"MTL_HUD_ENABLED"])) continue;
 #endif
-            if (!getenv(k.UTF8String)) { setenv(k.UTF8String, v.UTF8String, 0); [from_file addObject:k]; fprintf(stderr, "boot: env %s=%s (%s)\n", k.UTF8String, v.UTF8String, ef.lastPathComponent.UTF8String); }
+            const char *cur = getenv(k.UTF8String);   // an empty value is unset on every platform (dm/host/plat/plat.h): a line with one is as if absent
+            if (v.length && (!cur || !*cur)) { setenv(k.UTF8String, v.UTF8String, 1); [from_file addObject:k]; fprintf(stderr, "boot: env %s=%s (%s)\n", k.UTF8String, v.UTF8String, ef.lastPathComponent.UTF8String); }
         }
     }
     setenv("DM_ENV_FILE_KEYS", [from_file componentsJoinedByString:@" "].UTF8String, 1);   // the launcher keeps what an env file set (LauncherSettings.swift)

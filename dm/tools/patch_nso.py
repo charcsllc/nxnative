@@ -16,9 +16,14 @@
 #   Registered observation gates (OBS of the patch files, restricted by build ID): one instruction at the entry is replaced with "enter the host observation callback → execute the original instruction → jump back", so diagnostics modify zero code at runtime; listed in <name>.obs.tsv
 # The key page only stores "actual key number × 8" at the end of the data segment, and patch code fetches thread slots indirectly through the key page: the loader may use any key number.
 # Output: <name>.patched.bin (key page and patch area appended after the image at PATCH_OFF; when that would start beyond 112 MB the patch area sits before the base, see FAR; a text longer than a B reaches adds a second one after the image, see TWO), <name>.fixups.tsv (layout and key page index header), <name>.gates.tsv, <name>.sites.tsv, <name>.cuts.tsv, <name>.obs.tsv, <name>.changed.tsv (the text words whose instructions no longer run as the file has them)
+# patch_nso.py <NSO file> <output dir> <module name> --aot <aot dir>: the same rewrite and outputs, and besides them the input of the x86-64 recompiler nxaot (docs/design/aot-recompiler.md 1.1, 1.2;
+# "The recompiler's input" below): <aot dir>/<name>.image.bin, the behaviour image (the module with its cuts and frame step, none of Apple's rewrites), and <aot dir>/<name>.aot.tsv, its manifest
 import struct, re, sys, os, glob, shlex, types, importlib.util, multiprocessing, signal
 from itertools import combinations
 import capstone
+# First a capstone the rewrite is known to come out the same with, else a [RED] line naming the one found and the one needed (capstone_version.py: 4.0.2 rewrites less, and has
+# no cs_version for the check below to call)
+import capstone_version; capstone_version.require()
 if capstone.cs_version()[0] != 5:   # the rewriter uses Capstone 5's names (CS_ARCH_ARM64, ARM64_OP_*), which Capstone 6 renamed: see "Capstone API version" in docs/reference/rewriter.md
     sys.exit(f'[RED] Capstone {capstone.__version__} is unsupported; the rewriter requires Capstone 5.x. Run: {shlex.join([sys.executable, "-m", "pip", "install", "capstone>=5,<6"])}')
 from capstone import *
@@ -31,8 +36,11 @@ signal.signal(signal.SIGTERM, lambda *_: sys.exit(143))
 try: WORKERS = int(os.environ.get('DM_REWRITE_J') or os.cpu_count() or 1)
 except ValueError: sys.exit('[RED] DM_REWRITE_J must be a positive integer')
 if WORKERS < 1: sys.exit('[RED] DM_REWRITE_J must be a positive integer')
+FORK = 'fork' in multiprocessing.get_all_start_methods()   # in_parallel's workers: macOS and Linux; not Windows
 
 src, outdir, NAME = sys.argv[1], sys.argv[2], sys.argv[3]
+AOT_DIR = sys.argv[5] if len(sys.argv) > 5 and sys.argv[4] == '--aot' else None   # --aot <dir>: also the recompiler's input (the header above)
+if '--aot' in sys.argv[4:] and not AOT_DIR: sys.exit('usage: patch_nso.py <NSO file> <output dir> <module name> [--aot <aot dir>]')
 # An NSO, or an NRO (a module the game loads at run time with nn::ro, Super Smash Bros. Ultimate's fighter code), rewritten as an NSO of the same layout would be. nso.py checks the file
 # against its header before anything is allocated (a damaged module stops here with a [RED] line)
 MOD = nso.cli_read(src)
@@ -198,6 +206,10 @@ for off, ob, nb, why in cuts:
     assert len(ob) == len(nb) and IMG[off:off + len(ob)] == ob, f'cut original bytes mismatch {off:#x}: {bytes(IMG[off:off + len(ob)]).hex()}'
     if off in ALIAS_OFFS: assert len(ob) <= 16 and off + len(ob) <= TEXT_END, f'ALIAS_CUT at {off:#x} exceeds loader bounds'
     IMG[off:off + len(nb)] = nb
+# --aot: the behaviour image (docs/design/aot-recompiler.md 1.1) is the module's own text, read-only data and data with the cuts applied, before anything below rewrites them;
+# the frame step's branches are added to it and its cut rows ("Frame step" below)
+AOT_IMG = bytearray(IMG[:MOD.segments[2][0] + MOD.segments[2][1]]) if AOT_DIR else bytearray()   # up to the data's end (MOD: nso.py's module)
+AOT_CUTS = list(cuts)
 # Key page indices are fixed; the key page content is written by the loader as "actual key number × 8".
 KEYS = {'K18': 508, 'KTLS': 509, 'KTLR': 510, 'KGATE': 511}
 KEY_INDEX = {k: i for i, k in enumerate(('K18', 'KTLS', 'KTLR', 'KGATE'))}
@@ -982,8 +994,10 @@ def in_parallel(fn, jobs):
     only sets a flag, which Python clears in a new child, so a worker just forked could lose the signal, wait for that lock forever and hang the rewrite (jobs too small for every worker to
     start first). So SIGTERM stays blocked across the fork, which keeps it pending in the kernel, until a worker has the default action back and that action can end it.
     In this process it acts only while waiting for the results: the handler's sys.exit raised during the pool's teardown could stop a terminate halfway and leave workers behind, or be discarded
-    in a destructor."""
-    if WORKERS < 2 or len(jobs) < 2:
+    in a destructor.
+    Windows has no fork, and a spawned worker would run this script's top level again (the whole rewrite) to rebuild the state the jobs read, so there the jobs run here one after
+    another; Windows has no pthread_sigmask either, and the NSP script stops a Windows tool with its Job Object, which delivers no signal to handle."""
+    if WORKERS < 2 or len(jobs) < 2 or not FORK:
         return [fn(*job) for job in jobs]
     def worker_signals():
         signal.signal(signal.SIGTERM, signal.SIG_DFL)
@@ -1048,6 +1062,7 @@ def func_of(a):
     if i >= 0: return (starts[i], starts[i + 1] if i + 1 < len(starts) else TEXT_END)
     return (max((e for s, e in DATA_BLOCKS if e <= a), default=0), starts[0]) if starts else (a, a + 4)
 done = set(); windows = []; jumps = {}; tabjumps = {}; tailcalls = set(); retries = []
+JUMP_WIDTH = {}   # br x18 of a byte or halfword table (jumps) → its entries' bytes, 1 or 2: the manifest's oracle-J rows (--aot); jumps keeps the pads' count
 def tail_call_at_end(insl, j):
     """The br x18 is an indirect tail call, not a jump table: the last write of x18 before it is a plain pointer load and the br ends the function. Ace Attorney Investigations Collection
     (Unity 2022.3 IL2CPP) main+0x1d271bc: ldr x18,[x0,#0x18]; ...; ldr x16,[sp]; ...; br x18, a thunk that moves stack arguments and jumps to the method pointer at +0x18"""
@@ -1168,6 +1183,7 @@ def jump_bytes_far(insl, j, half):
     base = next((q.operands[1].imm for q in reversed(ctx[:k]) if q.mnemonic == 'adr' and q.op_str.startswith('x18,')), None)
     ld = next((q for q in reversed(ctx[:k]) if q.mnemonic in ('ldrb', 'ldrsb', 'ldrh', 'ldrsh') and num(q.reg_name(q.operands[0].reg)) == idx), None)
     if base is None or ld is None: return None
+    JUMP_WIDTH[insl[j].address] = 1 if ld.mnemonic in ('ldrb', 'ldrsb') else 2
     return base, 256 if ld.mnemonic in ('ldrb', 'ldrsb') else half(base) or 65536
 def disasm_fn(fa, fb):
     """A function's instructions. Capstone stops at the first word it cannot decode, so go on after it: Monster Hunter Rise main+0x6b34540 is a trap word (0xe7ffdefe)
@@ -1313,8 +1329,8 @@ for fa, fb in funcs:
                     # capstone names x30 'lr' (and x29 'fp'): Age of Calamity main+0x1382160 indexes with add x18,x18,x30,lsl #2 after ldrb w30,[x14,x12]
                     rn = p.reg_name(p.operands[2].reg); idx = {'lr': 30, 'fp': 29}.get(rn, num(rn))
                     for q in reversed(ctx):
-                        if q.mnemonic in ('ldrb', 'ldrsb') and num(q.reg_name(q.operands[0].reg)) == idx: width = 256
-                        if q.mnemonic in ('ldrh', 'ldrsh') and num(q.reg_name(q.operands[0].reg)) == idx: width = (half_pads(fa, fb, insl, ins.address, base) if q.mnemonic == 'ldrh' else None) or 65536 if base else 65536
+                        if q.mnemonic in ('ldrb', 'ldrsb') and num(q.reg_name(q.operands[0].reg)) == idx: width = 256; JUMP_WIDTH[ins.address] = 1
+                        if q.mnemonic in ('ldrh', 'ldrsh') and num(q.reg_name(q.operands[0].reg)) == idx: width = (half_pads(fa, fb, insl, ins.address, base) if q.mnemonic == 'ldrh' else None) or 65536 if base else 65536; JUMP_WIDTH[ins.address] = 2
                         if width: break
                     break
             if not (base and width):
@@ -1559,6 +1575,24 @@ if FS_STATE_OFF:   # the build's stubs (FRAME_STEP of its patches.py), or those 
                                             state=FS_STATE_OFF, render_scale=0, step_max=0, base=FS_MATCH[1] if FS_MATCH else 0, others=FS_MATCH[2] if FS_MATCH else {},
                                             found=FS_MATCH[3] if FS_MATCH else None, capabilities=set(), address=lambda off, lo_off=None: stub_address(off, 'frame step', lo_off))
     (FS_MATCH[0]['stub'] if FS_MATCH else FRAME_STEP[BUILD_ID])(fs); RENDER_SCALE = fs.render_scale; STEP_MAX = fs.step_max; FS_CAPABILITIES = fs.capabilities
+# --aot: the same stubs, assembled again by the build's own function into the auxiliary region of the behaviour image (design 1.1), which has no patch area: the page after the
+# state page, with the state page at FS_STATE_OFF as here. Its branches go into the behaviour image and its cut rows. The image then holds everything up to the region's end
+# (bss, the key page's place and the state page as zeros), so its manifest has no bss; a B from the text must reach the region (the B() assertion stops a module whose bss is too large).
+# The context is the one above (a function-matched frame step, MATCH_FRAME_STEP, gets its start the same way); STUBS (below) have no --aot form yet: a build with STUBS is refused
+AOT_AUX = bytearray()
+AOT_AUX_OFF = FS_STATE_OFF + 0x4000 if AOT_DIR and FS_STATE_OFF else 0
+if AOT_AUX_OFF:
+    def aot_fs_site(off, orig):
+        ob = bytes.fromhex(orig)
+        assert AOT_IMG[off:off + len(ob)] == ob, f'frame step original bytes mismatch in the behaviour image {off:#x}: {bytes(AOT_IMG[off:off + len(ob)]).hex()}'
+    def aot_fs_put(off, words, why):
+        old = bytes(AOT_IMG[off:off + 4 * len(words)])
+        for i, w in enumerate(words): struct.pack_into('<I', AOT_IMG, off + 4 * i, w)
+        AOT_CUTS.append((off, old.hex(), bytes(AOT_IMG[off:off + 4 * len(words)]).hex(), why + (' [function match]' if FS_MATCH else '')))
+    (FS_MATCH[0]['stub'] if FS_MATCH else FRAME_STEP[BUILD_ID])(types.SimpleNamespace(
+        here=lambda: AOT_AUX_OFF + len(AOT_AUX), emit=lambda w, kind=None: AOT_AUX.extend(struct.pack('<I', w & 0xFFFFFFFF)), site=aot_fs_site, put=aot_fs_put,
+        state=FS_STATE_OFF, render_scale=0, step_max=0, base=FS_MATCH[1] if FS_MATCH else 0, others=FS_MATCH[2] if FS_MATCH else {},
+        found=FS_MATCH[3] if FS_MATCH else None, capabilities=set(), address=lambda off, lo_off=None: stub_address(off, 'frame step', lo_off)))
 
 # ---- Stubs (the modules whose patch file has STUBS of their build) ----
 # A fix of the game's own code that needs more instructions than its sites hold: STUBS[build ID](ctx) in its patches.py assembles them into the patch area and branches there from
@@ -1566,6 +1600,8 @@ if FS_STATE_OFF:   # the build's stubs (FRAME_STEP of its patches.py), or those 
 # the main for one with a frame step). A stub's code must hold nothing the rewriter would rewrite (x18, svc, tpidr, exclusive pairs), since it is not scanned.
 # Ori and the Will of the Wisps 1.2.1 serializes the users of Unity's shared constant-buffer table this way (its patches.py)
 STUBS = PATCHES['STUBS']
+if AOT_DIR and (BUILD_ID in STUBS or STUB_MATCH):   # its code would be in the patch area only, which the behaviour image does not have: the x86-64 engine would run the build unfixed
+    sys.exit(f'[RED] {NAME}: build {BUILD_ID} has STUBS, which --aot cannot put into the behaviour image yet (the frame step\'s aux region holds only FRAME_STEP)')
 if BUILD_ID in STUBS or STUB_MATCH:
     use_area(0)
     st = types.SimpleNamespace(here=here, emit=emit, site=lambda off, orig: stub_site(off, orig, 'stub'),
@@ -2023,3 +2059,69 @@ with open(P('obs.tsv'), 'w') as f:
     for off, oid, ow, why in obs: f.write(f'{off:#x}\t{oid}\t{ow}\t{why}\n')
 print(NAME, stats, 'cuts', len(cuts), 'obs', len(obs), 'patch', len(patch_front) + len(patch_back), 'PATCH_OFF', hex(PATCH_OFF), *(('BACK_OFF', hex(BACK_OFF), 'back', len(patch_back)) if TWO else ()), 'slot_refs', len(fix), 'gates', len(gates))
 if DATA_BLOCKS: print(NAME, 'data blocks left alone:', ', '.join(f'{s:#x}..{e:#x}' for s, e in DATA_BLOCKS))
+
+# ---- The recompiler's input (--aot; docs/design/aot-recompiler.md 1.1, 1.2) ----
+# <name>.image.bin is the behaviour image: the module's text, read-only data and data with the cuts and the frame step's branches, none of Apple's rewrites (x18, TLS, SVC and
+# counter gates, sp alignment, window copies, jump-table pads, spin copies: the patch area is not in it), mapped one to one by dm/host's x86-64 loader (loader.c) and compiled by
+# `nxaot build`. With FRAME_STEP the image goes on to the end of the aux region. <name>.aot.tsv is its manifest, in the form nxaot reads (dm/tools/aot/src/module/manifest.cpp,
+# the truth where it and the design differ; dm/tools/aot/README.md, "Module loader and discovery"):
+#   # nxaot-manifest 1 <module> <build ID> <SHA-256 of image.bin>
+#   layout text_end <hex> ro_off <hex> data_off <hex> bss <hex> image_size <hex>   image_size: the file's bytes; bss: zero bytes after them (0 when the aux region took them in)
+#   aux <offset> <length> fps_state <offset>     the frame step's stubs and its state page (FRAME_STEP)
+#   data <start> <end>                           data in text, never decoded: nso_code's blocks, the MOD0 offset word at +4, MOD0 itself when the text holds it
+#   obs <offset> <number> <parameter> <word>     an observation gate before the instruction at offset: the OBS number's low 8 bits, its bits 8 up, the original word
+#   spin <head> <back-edge>,...                  a spin wait and the back-edges that get the spin gate (sites.tsv S)
+#   cut <offset> <old hex> <new hex> <reason>    already in the image, for the log
+#   oracle-T <br> <target>,...                   the rewriter's offset tables (sites.tsv T): every target, by index
+#   oracle-J <br> <base> <width>                 its byte (1) and halfword (2) tables (sites.tsv J): target = base + 4 × entry
+#   oracle-W <lo> <hi>                           its x18 exclusive windows (sites.tsv W): hi is past the cbz / cbnz that follows the store, when one does
+def aot_data_rows(img, text_end, blocks):
+    """The manifest's data rows: blocks (nso_code.data_blocks), the MOD0 offset word at +4 (data in an NSO's text and an NRO's), and MOD0 with libnx's LNY records after it
+    when the text holds it, as nxaot reads an NRO (image.cpp NroDataBlocks); sorted, overlapping and adjacent rows joined"""
+    rows = list(blocks) + [(4, 8)]
+    m0 = struct.unpack_from('<I', img, 4)[0]
+    if m0 < text_end and img[m0:m0 + 4] == b'MOD0':
+        e = m0 + 28
+        while e + 12 <= text_end and img[e:e + 3] == b'LNY': e += 12
+        rows.append((m0, min(e, text_end)))
+    out = []
+    for s, e in sorted(rows):
+        if out and s <= out[-1][1]: out[-1] = (out[-1][0], max(out[-1][1], e))
+        else: out.append((s, e))
+    return out
+def aot_manifest(name, build_id, sha256, image_size, layout, data, obs, spins, cuts, windows, jumps, tabjumps, aux=None):
+    """The manifest's text, in the canonical form of nxaot's WriteManifest (`nxaot manifest` prints it back unchanged). layout: (text_end, ro_off, data_off, bss);
+    obs: [(offset, OBS number with its parameter in bits 8 up, original word)]; spins: [(head, [back-edges])]; cuts: [(offset, old hex, new hex, reason)]; windows: [(lo, hi)];
+    jumps: {br: (base, entry bytes)}; tabjumps: {br: [targets]}; aux: (offset, length, state page) or None"""
+    x = lambda v: f'{v:#x}'
+    text_end, ro_off, data_off, bss = layout
+    assert text_end <= ro_off <= data_off <= image_size and len(sha256) == 64 and not any('\n' in c[3] for c in cuts)
+    rows = [f'# nxaot-manifest 1\t{name}\t{build_id}\t{sha256}',
+            f'layout\ttext_end\t{x(text_end)}\tro_off\t{x(ro_off)}\tdata_off\t{x(data_off)}\tbss\t{x(bss)}\timage_size\t{x(image_size)}']
+    if aux: rows.append(f'aux\t{x(aux[0])}\t{x(aux[1])}\tfps_state\t{x(aux[2])}')
+    rows += [f'data\t{x(s)}\t{x(e)}' for s, e in data]
+    rows += [f'obs\t{x(off)}\t{oid & 0xFF}\t{x(oid >> 8)}\t{x(word)}' for off, oid, word in obs]
+    rows += ['spin\t' + x(head) + '\t' + ','.join(x(b) for b in bes) for head, bes in spins]
+    rows += [f'cut\t{x(off)}\t{ob}\t{nb}\t{why}' for off, ob, nb, why in cuts]
+    rows += ['oracle-T\t' + x(br) + '\t' + ','.join(x(t) for t in tabjumps[br]) for br in sorted(tabjumps)]
+    rows += [f'oracle-J\t{x(br)}\t{x(jumps[br][0])}\t{jumps[br][1]}' for br in sorted(jumps)]
+    rows += [f'oracle-W\t{x(lo)}\t{x(hi)}' for lo, hi in sorted(windows)]
+    return '\n'.join(rows) + '\n'
+if AOT_DIR:
+    os.makedirs(AOT_DIR, exist_ok=True)
+    aot_gap = AOT_AUX_OFF - len(AOT_IMG) if AOT_AUX_OFF else 0   # zeros between the data and the aux region: bss, the key page's place, the state page
+    aot_size = len(AOT_IMG) + aot_gap + len(AOT_AUX)
+    h = hashlib.sha256(AOT_IMG); zeros = bytes(1 << 20)
+    for k in range(0, aot_gap, len(zeros)): h.update(zeros[:min(len(zeros), aot_gap - k)])
+    h.update(AOT_AUX)
+    with open(os.path.join(AOT_DIR, NAME + '.image.bin'), 'wb') as f:
+        f.write(AOT_IMG)
+        if AOT_AUX_OFF: f.seek(AOT_AUX_OFF); f.write(AOT_AUX)   # the gap a hole, zeros when read
+        f.truncate(aot_size)
+    aot_rows = aot_manifest(NAME, BUILD_ID, h.hexdigest(), aot_size, (TEXT_END, RO_OFF, DATA_OFF, 0 if AOT_AUX_OFF else bss),
+                            aot_data_rows(AOT_IMG, TEXT_END, DATA_BLOCKS), [(off, oid, int(ow, 16)) for off, oid, ow, _ in obs], [(t, bes) for t, bes, _ in spin_sites],
+                            AOT_CUTS, [(w[0].address, w[-1].address + 4) for w in windows], {a: (b, JUMP_WIDTH[a]) for a, (b, _) in jumps.items()}, tabjumps,
+                            (AOT_AUX_OFF, len(AOT_AUX), FS_STATE_OFF) if AOT_AUX_OFF else None)
+    with open(os.path.join(AOT_DIR, NAME + '.aot.tsv'), 'w') as f: f.write(aot_rows)
+    print(NAME, 'aot:', os.path.join(AOT_DIR, NAME + '.image.bin'), f'{aot_size:#x} bytes,', 'obs', len(obs), 'spin', len(spin_sites), 'cuts', len(AOT_CUTS),
+          'oracle T/J/W', len(tabjumps), len(jumps), len(windows), 'aux', f'{AOT_AUX_OFF:#x}+{len(AOT_AUX):#x}' if AOT_AUX_OFF else '-')

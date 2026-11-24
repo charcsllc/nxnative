@@ -1,14 +1,36 @@
 // nn::audio AudioOut: the game (FMOD nx output layer) appends PCM buffers block by block; once played the system puts them back on the "released" queue and signals the event.
-// Host: real audio output = CoreAudio AudioUnit (Mac DefaultOutput / iOS RemoteIO); silent sink = consumes buffers in real time (no sound, pacing matches the real device).
-//       iOS defaults to real audio output (the product must have sound), tests that want silence set DM_AUDIO=0 explicitly; Mac defaults to the silent sink (replay / gate checks are silent), DM_AUDIO=1 for real audio output.
+// Host: real audio output = CoreAudio AudioUnit (Mac DefaultOutput / iOS RemoteIO), an SDL3 audio stream on Linux and Windows; silent sink = consumes buffers in real time (no sound, pacing matches the real device).
+//       iOS, Linux and Windows default to real audio output (the product must have sound), tests that want silence set DM_AUDIO=0 explicitly; Mac defaults to the silent sink (replay / gate checks are silent), DM_AUDIO=1 for real audio output.
 // The contents of AudioOut / AudioOutParameter are read and written only through the interfaces below; the host defines its own internal layout and only writes the front part of the structs (AudioOut: the SDK's own fields, au_info). AudioOutBuffer is the exception: it is the SDK's own struct (aout_buf, hle.h), filled and read by the SDK's own descriptor functions
 #include "hle.h"
 #include "audio_input.h"
+#if defined(__APPLE__)
 #include <AudioToolbox/AudioToolbox.h>
 #include <TargetConditionals.h>
-#include <dispatch/dispatch.h>
+#else
+// Linux and Windows: real audio output = an SDL3 audio stream on the default playback device (SDL_OpenAudioDeviceStream), which SDL's device thread pulls through sdl_render below,
+// the counterpart of au_render. The AudioUnit calls the shared code makes map onto it: start = resume the device, stop = pause it, dispose = destroy the stream (which closes the
+// device). Pausing takes the lock SDL's device thread holds while it calls the stream back, so once it returns no pull() is running and none starts: the same single-consumer
+// guarantee AudioOutputUnitStop gives backend_stop, au_release_pending and the silent sink taking over. SDL_OpenAudioDeviceStream follows the system's default device when it changes
+#include <SDL3/SDL.h>
+typedef SDL_AudioStream *AudioUnit; typedef int32_t OSStatus;
+static OSStatus AudioOutputUnitStart(AudioUnit au) { return SDL_ResumeAudioStreamDevice(au) ? 0 : -1; }
+// What SDL converted but the device has not played yet is dropped, as a stopped AudioUnit drops its buffer: a later Start must not replay buffers the game already took back
+static OSStatus AudioOutputUnitStop(AudioUnit au) { if (!SDL_PauseAudioStreamDevice(au)) return -1; SDL_ClearAudioStream(au); return 0; }
+static OSStatus AudioUnitUninitialize(AudioUnit au) { (void)au; return 0; }   // an SDL stream has no initialized state apart from being open
+static OSStatus AudioComponentInstanceDispose(AudioUnit au) { SDL_DestroyAudioStream(au); return 0; }
+#endif
 #include <stdatomic.h>
 #include <unistd.h>
+// A string the guest is handed is guest memory (docs/design/aot-recompiler.md 5.2; aot.h, "Host memory the guest sees"): the literal itself on Apple, an arena copy made once here
+#if DM_NATIVE_EXEC || defined(DM_TEST_GUEST_C)
+#define GUEST_STR(s) s
+#define GUEST_RA() dm_bigstack_caller(__builtin_return_address(0))   // the game's call site (hle.h; on Apple past the big-stack entry)
+#else
+#include "aot.h"
+#define GUEST_STR(s) dm_garena_literal(s)
+#define GUEST_RA() ((void *)(uintptr_t)dm_aot_guest_lr())   // the game's call site: the host's own return address is the host-call thunk's on the x86-64 engine (aot.h)
+#endif
 #if TARGET_OS_IPHONE
 int dm_ios_output_channels(void);   // front_ios.m: the audio session's output channel count
 #endif
@@ -43,9 +65,9 @@ typedef struct {
     _Atomic int hold_device;               // callbacks output silence until the silent sink has joined
     int backend;                       // BK_*: the running consumer. Start, Stop and the background suspend change it only under g_aos_lock and act on it rather than re-deriving it from state and g_suspended
     pthread_t null_th; _Atomic int null_run;
-    dispatch_semaphore_t notify_sem;
+    plat_sema *notify_sem;
     pthread_t notify_th; _Atomic int notify_run, notify_pending, notify_armed;
-    dispatch_semaphore_t rel_sem;      // Host outputs only (dm_pcmout_open): signaled for each release, so the in-process audio renderer blocks instead of polling (dm_pcmout_wait)
+    plat_sema *rel_sem;                // Host outputs only (dm_pcmout_open): signaled for each release, so the in-process audio renderer blocks instead of polling (dm_pcmout_wait)
     int id;                            // open sequence number (#N in the log; tells simultaneous outputs apart, e.g. Engage's Wwise and Unity's built-in FMOD)
     int nlog;                          // Start / Stop / Close lines logged so far (at most 32 per output)
     _Atomic uint64_t under_n, under_b; // underruns: times the pending queue was empty when the callback needed data / zero-filled bytes
@@ -80,14 +102,14 @@ static void au_note(aout *a, const char *what, void *lr) {
 static void notify_release(aout *a) {
     atomic_store_explicit(&a->notify_pending, 1, memory_order_release);
     if (atomic_exchange_explicit(&a->notify_armed, 1, memory_order_acq_rel) == 0)
-        dispatch_semaphore_signal(a->notify_sem);
+        plat_sema_signal(a->notify_sem);
 }
 
-void dm_host_helper_qos(qos_class_t q);   // hle_thread.c: under DM_QOS_MAP a helper thread sets its own class instead of inheriting its creator's
+void dm_host_helper_qos(plat_qos_t q);   // hle_thread.c: under DM_QOS_MAP a helper thread sets its own class instead of inheriting its creator's
 static void *event_notify(void *p) {
-    aout *a = p; dm_host_helper_qos(QOS_CLASS_USER_INTERACTIVE);   // the game's audio thread waits on the release event it signals
+    aout *a = p; dm_host_helper_qos(PLAT_QOS_USER_INTERACTIVE);   // the game's audio thread waits on the release event it signals
     for (;;) {
-        dispatch_semaphore_wait(a->notify_sem, DISPATCH_TIME_FOREVER);
+        plat_sema_wait(a->notify_sem, -1);
         if (atomic_exchange_explicit(&a->notify_pending, 0, memory_order_acq_rel) && a->event)
             hle_signal_system_event(a->event);
         // Acquire a producer that saw the old armed=1, so the pending recheck
@@ -97,7 +119,7 @@ static void *event_notify(void *p) {
         if (!atomic_load_explicit(&a->notify_run, memory_order_acquire)) break;
         if (atomic_load_explicit(&a->notify_pending, memory_order_acquire) &&
             atomic_exchange_explicit(&a->notify_armed, 1, memory_order_acq_rel) == 0)
-            dispatch_semaphore_signal(a->notify_sem);
+            plat_sema_signal(a->notify_sem);
     }
     return NULL;
 }
@@ -154,7 +176,7 @@ static void pull_pcm(aout *a, uint8_t *dst, uint64_t n, int stage_tail) {
     }
     if (released) {
         if (a->event) notify_release(a);   // the notify thread only signals the guest's event: outputs without one (the host's renderer output, games that poll) need no wake-up
-        if (a->rel_sem) dispatch_semaphore_signal(a->rel_sem);
+        if (a->rel_sem) plat_sema_signal(a->rel_sem);
     }
 }
 
@@ -214,6 +236,7 @@ static unsigned queued_pcm_blocks(const aout *a) {
     uint32_t played = atomic_load_explicit(&a->q_played, memory_order_acquire);
     return atomic_load_explicit(&a->q_tail, memory_order_acquire) - played;
 }
+#if defined(__APPLE__)
 static OSStatus au_render(void *ctx, AudioUnitRenderActionFlags *f, const AudioTimeStamp *ts, UInt32 bus, UInt32 frames, AudioBufferList *bl) {
     (void)f; (void)ts; (void)bus; (void)frames;
     aout *a = ctx;
@@ -431,6 +454,83 @@ static OSStatus au_create(aout *a, int route) {   // route: dm_audio_output_chan
     if (st) { au_dispose(a->au); a->au = NULL; }
     return st;
 }
+#else
+// SDL's device thread asks for additional bytes in the stream's own format (S16 at 48 kHz in the unit's channels, dev_ch); exactly that much is pulled, as au_render pulls what the
+// AudioUnit asks, with the same per-output statistics mailbox (the watchdog logs them), callback counts (its evidence), the silent sink's hold and the DM_AUDIO_MUTE diagnostic.
+// Through a stack buffer: no allocation here
+static void SDLCALL sdl_render(void *ctx, SDL_AudioStream *s, int additional, int total) {
+    (void)total;
+    aout *a = ctx;
+    atomic_fetch_add_explicit(&g_render_calls, 1, memory_order_relaxed); atomic_fetch_add_explicit(&a->cb_n, 1, memory_order_relaxed);
+    int frame = 2 * a->dev_ch; uint32_t frames = additional > 0 ? (uint32_t)(additional / frame) : 0;
+    if (frames) {   // SDL also calls back when the stream still holds what the device asks (a resampler's leftover): nothing to pull, no statistics
+        uint32_t qd = queued_pcm_blocks(a);   // as au_render: a snapshot for the watchdog at each 2000-callback checkpoint, never a log line here
+        if (!a->st_calls || frames < a->st_fmin) a->st_fmin = frames; if (frames > a->st_fmax) a->st_fmax = frames; a->st_qsum += qd;
+        a->st_count++;
+        if (++a->st_calls % 2000 == 0 && !atomic_load_explicit(&a->st_pending, memory_order_acquire)) {
+            uint64_t un = atomic_load(&a->under_n), ubb = atomic_load(&a->under_b);
+            a->st_report = (audio_stats){a->st_calls, a->st_count, a->st_qsum, un - a->st_u0, ubb - a->st_ub0, a->st_fmin, a->st_fmax};
+            atomic_store_explicit(&a->st_pending, 1, memory_order_release);
+            a->st_fmin = ~0u; a->st_fmax = 0; a->st_qsum = a->st_count = 0; a->st_u0 = un; a->st_ub0 = ubb;
+        } }
+    uint8_t buf[4096];
+    while (additional >= frame) {
+        int n = additional < (int)sizeof buf ? additional : (int)sizeof buf; n -= n % frame;
+        if (atomic_load_explicit(&a->hold_device, memory_order_acquire)) memset(buf, 0, (size_t)n);   // the silent sink has not joined yet (au_render)
+        else { pull_device(a, buf, (uint64_t)n); if (a->mute) memset(buf, 0, (size_t)n); }
+        SDL_PutAudioStreamData(s, buf, n);
+        additional -= n;
+    }
+}
+static void au_dispose(AudioUnit au) { SDL_DestroyAudioStream(au); }
+// The device buffer: about 5 ms of frames, as the Mac's au_buffer and iOS's audio session ask. SDL's own default at 48 kHz is 1024 frames (21 ms), more than games keep queued (4 blocks
+// of 5 ms): every callback would come up short and be zero-padded, the crackling of docs/reference/audio.md "RemoteIO's default I/O buffer duration". SDL_AUDIO_DEVICE_SAMPLE_FRAMES in the
+// environment still wins (SDL's hint priority); DM_DBG_AU_FRAMES=N asks N frames, as on the Mac. The backend rounds the request to what it supports (WASAPI to its engine period, PipeWire
+// to its quantum), and the open logs the frames it got. Set before SDL's audio starts, so the first device opened takes it
+static char g_sdl_frames[16];
+static int g_sdl_audio;   // SDL's audio subsystem started (sdl_audio_start)
+static void sdl_audio_start(void) {
+    const char *e = getenv("DM_DBG_AU_FRAMES");
+    snprintf(g_sdl_frames, sizeof g_sdl_frames, "%d", e ? atoi(e) : RATE / 200);
+    SDL_SetHintWithPriority(SDL_HINT_AUDIO_DEVICE_SAMPLE_FRAMES, g_sdl_frames, e ? SDL_HINT_OVERRIDE : SDL_HINT_NORMAL);
+    SDL_SetAppMetadata(DM_GAME_NAME, NULL, NULL);   // the name the system's mixer shows for the game's sound (front_sdl.c sets the same)
+    g_sdl_audio = SDL_InitSubSystem(SDL_INIT_AUDIO);   // reference counted beside the front end's SDL_Init, never quit: outputs open and close all through a game
+    if (g_sdl_audio) LOG("audio: SDL %d.%d.%d, audio driver %s", SDL_VERSIONNUM_MAJOR(SDL_GetVersion()), SDL_VERSIONNUM_MINOR(SDL_GetVersion()), SDL_VERSIONNUM_MICRO(SDL_GetVersion()), SDL_GetCurrentAudioDriver());
+    else LOG("[RED] audio: SDL has no audio driver (%s): every output plays through the silent sink", SDL_GetError());
+}
+// The output route (Apple: the device's channels, followed by its listeners): SDL opens the default device in the stream's own format and converts to whatever the device has, so the
+// host plays stereo there and SDL folds or spreads it; a six-channel guest output keeps its DeviceSink stereo fold (unit_channels, pull_device). No route moves are reported, so the
+// route never changes after the first read. A route check off the calling thread is then nothing to queue
+static _Atomic int g_route;
+static void audio_route_check(int from_front);
+static void route_queue(void) {}
+static int audio_output_channels(int *moved) {
+    if (moved) *moved = 0;
+    int old = atomic_exchange(&g_route, 2);
+    if (!old) LOG("audio output route: stereo (SDL converts to the device's own channels)");
+    return 2;
+}
+int dm_audio_output_channels(void) { return audio_output_channels(NULL); }
+int dm_audio_route(void) {
+    int r = atomic_load(&g_route);
+    return r ? r : dm_audio_output_channels();
+}
+// No device (no audio driver, or the default device would not open: a PC without sound hardware, a container) is not fatal, unlike a failed AudioUnit: the output keeps a->au NULL and
+// plays through the silent sink, which keeps the game's audio at its real-time pace, and the line says so. So this returns 0 either way (au_open stops the host on any other status)
+static OSStatus au_create(aout *a, int route) {   // route: dm_audio_output_channels, read by the caller
+    static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, sdl_audio_start);
+    a->au = NULL;
+    a->dev_ch = unit_channels(a, route);
+    if (!g_sdl_audio) return 0;
+    SDL_AudioSpec spec = {SDL_AUDIO_S16, a->dev_ch, RATE};
+    SDL_AudioStream *st = SDL_OpenAudioDeviceStream(SDL_AUDIO_DEVICE_DEFAULT_PLAYBACK, &spec, sdl_render, a);   // opens paused: nothing is pulled before Start
+    if (!st) { LOG("[RED] audio #%d: the default output device did not open (%s): this output plays through the silent sink", a->id, SDL_GetError()); return 0; }
+    SDL_AudioSpec dev; int fr = 0; SDL_AudioDeviceID id = SDL_GetAudioStreamDevice(st);
+    if (SDL_GetAudioDeviceFormat(id, &dev, &fr)) LOG("audio device buffer: %d frames at %d Hz (requested %s; %s, %d channels)", fr, dev.freq, g_sdl_frames, SDL_GetAudioDeviceName(id) ?: "default device", dev.channels);
+    a->au = st;
+    return 0;
+}
+#endif
 // OpenAudioOut runs on the game's thread, and creating the AudioUnit takes about 24 KB of stack (measured on the Mac: component lookup, instance, Initialize), more than some game threads have
 // left (Super Mario 3D World's save thread has 8 KB in all; Pokémon: Let's Go overflowed here at startup, PR #36). So it runs on a host thread, once per AudioOut (it predates the big-stack entry, which Start / Stop / Close use)
 static void *au_create_th(void *a) { return (void *)(intptr_t)au_create(a, dm_audio_output_channels()); }
@@ -442,11 +542,11 @@ static void au_open(aout *a) {
 // Silent sink: consumes in real time at 48 kHz every 5 ms. When more than 100 ms behind (iOS suspended the whole process in the background, SIGSTOP on the Mac), restart the count from now and do not make up the missed time --
 // making it up would pull hundreds of times in one go (seconds' worth), releasing all of the game's buffers and logging hundreds of underruns; a suspended console does not play that stretch either
 static void *null_sink(void *p) {
-    aout *a = p; uint8_t scratch[RATE / 200 * 2 * 8]; dm_host_helper_qos(QOS_CLASS_USER_INTERACTIVE);   // paces the game's audio in real time
+    aout *a = p; uint8_t scratch[RATE / 200 * 2 * 8]; dm_host_helper_qos(PLAT_QOS_USER_INTERACTIVE);   // paces the game's audio in real time
     uint64_t bytes = (uint64_t)RATE / 200 * 2 * a->ch, t = now_ns();
     while (atomic_load_explicit(&a->null_run, memory_order_acquire)) {
         t += 5000000; uint64_t now = now_ns();
-        if (t > now) usleep((useconds_t)((t - now) / 1000)); else if (now - t > 100000000) t = now;
+        if (t > now) plat_sleep_ns((t - now) / 1000 * 1000); else if (now - t > 100000000) t = now;   // whole microseconds, as usleep took them (Windows' usleep sleeps whole scheduler ticks)
         pull(a, scratch, bytes);
     }
     return NULL;
@@ -463,7 +563,12 @@ static void au_halt(aout *a) {
     }
     a->stalled = 0; a->retry_ms = 0; a->retry_at = 0; a->route_until = 0;
 }
+#if defined(__APPLE__)
 static int real_audio(void) { const char *e = getenv("DM_AUDIO"); return e ? atoi(e) != 0 : TARGET_OS_IPHONE; }
+#else
+// Linux and Windows: a player's PC must have sound, as an iPhone; DM_AUDIO=0 chooses the silent sink (the Mac's default, which exists for the replay checks only Macs run)
+static int real_audio(void) { const char *e = getenv("DM_AUDIO"); return e ? atoi(e) != 0 : 1; }
+#endif
 static void au_retry(aout *a, uint64_t now) {
     a->stalled = 1;
     a->retry_ms = a->retry_ms ? (a->retry_ms < 8000 ? a->retry_ms * 2 : 8000) : 1000;
@@ -478,8 +583,8 @@ static void au_replace(aout *a, int route) {
 }
 static void aout_free(aout *a) {
     if (a->au) au_dispose(a->au);
-    dispatch_release(a->notify_sem);
-    if (a->rel_sem) dispatch_release(a->rel_sem);
+    plat_sema_destroy(a->notify_sem);
+    if (a->rel_sem) plat_sema_destroy(a->rel_sem);
     pthread_mutex_destroy(&a->m); free(a);
 }
 // A HAL start can block for seconds. Each output keeps consuming on the silent sink while its
@@ -507,10 +612,18 @@ static void au_start_device(void *p) {
     }
     pthread_mutex_unlock(&g_aos_lock);
 }
+#if !defined(__APPLE__)
+static void *au_start_device_th(void *p) { au_start_device(p); return NULL; }
+#endif
 static void au_request_start(aout *a) {
     if (!a->au || g_suspended || a->start_phase != AU_IDLE) return;
     a->start_phase = AU_STARTING;
+#if defined(__APPLE__)
     dispatch_async_f(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), a, au_start_device);
+#else   // no libdispatch: a detached host thread makes the start (an SDL device resume does not block as a HAL start can, so the thread ends at once)
+    pthread_t th;
+    if (pthread_create(&th, NULL, au_start_device_th, a)) au_start_device(a); else pthread_detach(th);
+#endif
 }
 // Watchdog (real output only): an AudioUnit that is started while the app is in focus must keep calling back. iOS stops calling back without telling the AudioUnit when another audio session takes over
 // (Siri, an alarm, a call) or the media services reset; the output's buffers were then never released, and a game whose audio thread waits for them (Wwise's poll-only output, FMOD) stayed silent for good.
@@ -590,7 +703,7 @@ static void au_watchdog_output(aout *a, uint64_t t, uint64_t gap) {
 static void *au_watchdog(void *p) {
     (void)p; uint64_t last = now_ns();
     for (;;) {
-        usleep(WD_TICK_MS * 1000);
+        plat_sleep_ns(WD_TICK_MS * 1000000ull);
         pthread_mutex_lock(&g_aos_lock);
         uint64_t t = now_ns(), gap = t - last; last = t;
         for (int i = 0; i < AOMAX; i++) {
@@ -635,7 +748,7 @@ static Result au_open_at(void *g, void *ev, const char *name, const uint8_t *par
     atomic_init(&a->null_run, 0); atomic_init(&a->notify_run, 1);
     atomic_init(&a->notify_pending, 0); atomic_init(&a->notify_armed, 0);
     atomic_init(&a->st_pending, 0);
-    a->notify_sem = dispatch_semaphore_create(0); a->id = atomic_fetch_add(&nopen, 1);
+    a->notify_sem = plat_sema_create(0); a->id = atomic_fetch_add(&nopen, 1);
     pthread_create(&a->notify_th, NULL, event_notify, a);
     if (ev) hle_bind_system_event(ev, 1);   // Buffer release event: bind a kernel event on the guest thread (auto-clear), afterwards signaled by the audio thread
     char sb[64]; int use_au = real_audio();
@@ -655,15 +768,15 @@ static Result au_open_at(void *g, void *ev, const char *name, const uint8_t *par
     return RES_OK;
 }
 HLE_FORCE("_ZN2nn5audio12OpenAudioOutEPNS0_8AudioOutEPNS_2os11SystemEventEPKcRKNS0_17AudioOutParameterE", "connect to the audout service; host AudioUnit / silent sink",
-          Result, h_au_Open, void *g, void *ev, const char *name, const uint8_t *param) { return au_open_at(g, ev, name, param, dm_bigstack_caller(__builtin_return_address(0)), AU_GUEST_AUDIO_OUT); }
+          Result, h_au_Open, void *g, void *ev, const char *name, const uint8_t *param) { return au_open_at(g, ev, name, param, GUEST_RA(), AU_GUEST_AUDIO_OUT); }
 // The two default-device overloads (Engage, SDK 12): as OpenAudioOut with the default device name; the overload without an event binds no release event (the game polls GetReleasedAudioOutBuffer)
 // SDK 22 dropped the release event from the parameter-carrying overload (Well Dweller calls this one; unbound it reached the SDK's audout session, which fails with 0xe15 and the game aborts)
 HLE_FORCE("_ZN2nn5audio12OpenAudioOutEPNS0_8AudioOutEPKcRKNS0_17AudioOutParameterE", "connect to the audout service, no release event (SDK 22 overload)",
           Result, h_au_Open4, void *g, const char *name, const uint8_t *param) { return au_open_at(g, NULL, name, param, dm_bigstack_caller(__builtin_return_address(0)), AU_GUEST_AUDIO_OUT); }
 HLE_FORCE("_ZN2nn5audio19OpenDefaultAudioOutEPNS0_8AudioOutEPNS_2os11SystemEventERKNS0_17AudioOutParameterE", "connect to the audout service (default device); same as OpenAudioOut",
-          Result, h_au_OpenDef, void *g, void *ev, const uint8_t *param) { return au_open_at(g, ev, NULL, param, dm_bigstack_caller(__builtin_return_address(0)), AU_GUEST_AUDIO_OUT); }
+          Result, h_au_OpenDef, void *g, void *ev, const uint8_t *param) { return au_open_at(g, ev, NULL, param, GUEST_RA(), AU_GUEST_AUDIO_OUT); }
 HLE_FORCE("_ZN2nn5audio19OpenDefaultAudioOutEPNS0_8AudioOutERKNS0_17AudioOutParameterE", "connect to the audout service (default device, no event); same as OpenAudioOut",
-          Result, h_au_OpenDef0, void *g, const uint8_t *param) { return au_open_at(g, NULL, NULL, param, dm_bigstack_caller(__builtin_return_address(0)), AU_GUEST_AUDIO_OUT); }
+          Result, h_au_OpenDef0, void *g, const uint8_t *param) { return au_open_at(g, NULL, NULL, param, GUEST_RA(), AU_GUEST_AUDIO_OUT); }
 static Result au_start_at(void *g, void *lr) {
     aout *a = ao(g);
     pthread_mutex_lock(&g_aos_lock);
@@ -681,7 +794,7 @@ static Result au_start_at(void *g, void *lr) {
 // demangler under CAReporter); Arcade Archives RAINBOW ISLANDS 1.0.2, SDK 19.3.11, M1, macOS 27.2, PR #721. Stop (AudioOutputUnitStop) and Close (disposing the AudioUnit) talk to the same service.
 // AudioOutputUnitStart itself now runs on a host worker (au_start_device, issue #1030).
 // dm_bigstack_caller gives the game's call site back for the log line
-HLE_FORCE("_ZN2nn5audio13StartAudioOutEPNS0_8AudioOutE", "start playback", Result, h_au_Start, void *g) { return au_start_at(g, dm_bigstack_caller(__builtin_return_address(0))); }
+HLE_FORCE("_ZN2nn5audio13StartAudioOutEPNS0_8AudioOutE", "start playback", Result, h_au_Start, void *g) { return au_start_at(g, GUEST_RA()); }
 // After the backend stops, return even its partly played buffer. FMOD can wait for these releases before joining its output thread (Pokemon Brilliant Diamond 1.0.0, PR #190).
 // The stopped backend excludes the consumer; m excludes append/reclaim. Buffers appended while already stopped belong to the next Start, so only a started -> stopped transition calls this.
 static void au_release_pending(aout *a) {
@@ -698,7 +811,7 @@ static void au_release_pending(aout *a) {
     atomic_store_explicit(&a->q_played, qh, memory_order_release);
     atomic_store_explicit(&a->rel_tail, rw, memory_order_release);
     pthread_mutex_unlock(&a->m);
-    if (released) { if (a->event) notify_release(a); if (a->rel_sem) dispatch_semaphore_signal(a->rel_sem); }
+    if (released) { if (a->event) notify_release(a); if (a->rel_sem) plat_sema_signal(a->rel_sem); }
 }
 static void au_stop_at(void *g, void *lr) {   // lr NULL: the stop inside Close, not logged separately
     aout *a = ao(g);
@@ -710,13 +823,13 @@ static void au_stop_at(void *g, void *lr) {   // lr NULL: the stop inside Close,
     if (was == STATE_STARTED) au_release_pending(a);
     pthread_mutex_unlock(&g_aos_lock);
 }
-HLE_FORCE("_ZN2nn5audio12StopAudioOutEPNS0_8AudioOutE", "stop playback", void, h_au_Stop, void *g) { au_stop_at(g, dm_bigstack_caller(__builtin_return_address(0))); }
+HLE_FORCE("_ZN2nn5audio12StopAudioOutEPNS0_8AudioOutE", "stop playback", void, h_au_Stop, void *g) { au_stop_at(g, GUEST_RA()); }
 static void au_close(void *g, void *lr) {
     au_note(ao(g), "Close", lr);
     au_stop_at(g, NULL);
     aout *a = objmap_del(g);
     atomic_store_explicit(&a->notify_run, 0, memory_order_release);
-    dispatch_semaphore_signal(a->notify_sem);
+    plat_sema_signal(a->notify_sem);
     pthread_join(a->notify_th, NULL);
     audio_report report;
     pthread_mutex_lock(&g_aos_lock);
@@ -730,7 +843,7 @@ static void au_close(void *g, void *lr) {
     if (!in_flight) aout_free(a);
     au_info(g, ch, STATE_STOPPED);
 }
-HLE_FORCE("_ZN2nn5audio13CloseAudioOutEPNS0_8AudioOutE", "close the audio output", void, h_au_Close, void *g) { au_close(g, dm_bigstack_caller(__builtin_return_address(0))); }
+HLE_FORCE("_ZN2nn5audio13CloseAudioOutEPNS0_8AudioOutE", "close the audio output", void, h_au_Close, void *g) { au_close(g, GUEST_RA()); }
 HLE_FORCE("_ZN2nn5audio16GetAudioOutStateEPKNS0_8AudioOutE", "playback state", int, h_au_State, const void *g) { return atomic_load_explicit(&ao(g)->state, memory_order_acquire); }
 // Pokémon Legends: Z-A (SDK 19): Wwise's sink wakeup thread (main+0x30faae8) asks after every release event and marks the sink starved at 0; the SDK's own version read the audout session the host never made
 HLE_FORCE("_ZN2nn5audio22GetAudioOutBufferCountEPKNS0_8AudioOutE", "buffers appended and not yet played to the end (the one playing included)", unsigned, h_au_BufCount, const void *g) {
@@ -738,7 +851,7 @@ HLE_FORCE("_ZN2nn5audio22GetAudioOutBufferCountEPKNS0_8AudioOutE", "buffers appe
 }
 HLE_FORCE("_ZN2nn5audio21GetAudioOutSampleRateEPKNS0_8AudioOutE", "sample rate", int, h_au_Rate, const void *g) { (void)ao(g); return RATE; }
 HLE_FORCE("_ZN2nn5audio23GetAudioOutChannelCountEPKNS0_8AudioOutE", "channel count", int, h_au_Ch, const void *g) { return ao(g)->ch; }
-HLE_FORCE("_ZN2nn5audio15GetAudioOutNameEPKNS0_8AudioOutE", "device name; the host has only the default device", const char *, h_au_Name, const void *g) { (void)g; return "DeviceOut"; }
+HLE_FORCE("_ZN2nn5audio15GetAudioOutNameEPKNS0_8AudioOutE", "device name; the host has only the default device", const char *, h_au_Name, const void *g) { (void)g; return GUEST_STR("DeviceOut"); }
 HLE_FORCE("_ZN2nn5audio23GetAudioOutSampleFormatEPKNS0_8AudioOutE", "sample format; PCM16 only", int, h_au_Fmt, const void *g) { (void)ao(g); return FMT_PCM16; }
 // STEINS;GATE RE:BOOT (SDK 20) sets its movie sound's output volume right after opening it; the SDK's versions call the audout session the host never made (a null read at sdk+0x1f2314)
 HLE_FORCE("_ZN2nn5audio17SetAudioOutVolumeEPNS0_8AudioOutEf", "output volume; a gain on the samples the host plays", void, h_au_SetVol, void *g, float v) {
@@ -785,11 +898,11 @@ static Result ai_open(const char *name, void *lr) {
     return RES_FAIL;
 }
 HLE_FORCE("_ZN2nn5audio11OpenAudioInEPNS0_7AudioInEPNS_2os11SystemEventEPKcRKNS0_16AudioInParameterE", "connect to the audin service; no microphone on the host: fails",
-          Result, h_ai_Open, void *g, void *ev, const char *name, const void *param) { (void)g; (void)ev; (void)param; return ai_open(name, dm_bigstack_caller(__builtin_return_address(0))); }
+          Result, h_ai_Open, void *g, void *ev, const char *name, const void *param) { (void)g; (void)ev; (void)param; return ai_open(name, GUEST_RA()); }
 HLE_FORCE("_ZN2nn5audio11OpenAudioInEPNS0_7AudioInEPKcRKNS0_16AudioInParameterE", "connect to the audin service (no buffer event: Patrick's Parabox imports this one); no microphone on the host: fails",
-          Result, h_ai_OpenNoEv, void *g, const char *name, const void *param) { (void)g; (void)param; return ai_open(name, dm_bigstack_caller(__builtin_return_address(0))); }
+          Result, h_ai_OpenNoEv, void *g, const char *name, const void *param) { (void)g; (void)param; return ai_open(name, GUEST_RA()); }
 HLE_FORCE("_ZN2nn5audio18OpenDefaultAudioInEPNS0_7AudioInEPNS_2os11SystemEventERKNS0_16AudioInParameterE", "connect to the audin service (default device); no microphone on the host: fails",
-          Result, h_ai_OpenDef, void *g, void *ev, const void *param) { (void)g; (void)ev; (void)param; return ai_open(NULL, dm_bigstack_caller(__builtin_return_address(0))); }
+          Result, h_ai_OpenDef, void *g, void *ev, const void *param) { (void)g; (void)ev; (void)param; return ai_open(NULL, GUEST_RA()); }
 HLE_FORCE("_ZN2nn5audio12StartAudioInEPNS0_7AudioInE", "start recording; never opened on the host: fails", Result, h_ai_Start, void *g) { (void)g; return RES_FAIL; }
 HLE_FORCE("_ZN2nn5audio11StopAudioInEPNS0_7AudioInE", "stop recording; never opened on the host", void, h_ai_Stop, void *g) { (void)g; }
 HLE_FORCE("_ZN2nn5audio12CloseAudioInEPNS0_7AudioInE", "close the audio input; never opened on the host", void, h_ai_Close, void *g) { (void)g; }
@@ -990,13 +1103,13 @@ HLE_FORCE("_ZN2nn5audio18SetInputStreamGainEPNS0_15InputStreamTypeEfNS_8TimeSpan
 static void *pcmout_open(int ch, int sink_pcm) {
     void *key = calloc(1, 64); uint8_t param[8] = {0}; *(uint16_t *)(param + 4) = (uint16_t)ch;
     if (au_open_at(key, NULL, "AudioRenderer", param, NULL, sink_pcm ? AU_DEVICE_SINK : AU_PCM_OUT)) die("host PCM output cannot be opened");
-    ao(key)->rel_sem = dispatch_semaphore_create(0);
+    ao(key)->rel_sem = plat_sema_create(0);
     return key;
 }
 void *dm_pcmout_open(int ch) { return pcmout_open(ch, 0); }
 void *dm_pcmout_open_sink(void) { return pcmout_open(DM_AUDIO_SINK_CHANNELS, 1); }
 // Wait until the output releases a block, at most ms milliseconds (spurious returns are fine: the caller checks dm_pcmout_released again)
-void dm_pcmout_wait(void *k, int ms) { dispatch_semaphore_wait(ao(k)->rel_sem, dispatch_time(DISPATCH_TIME_NOW, (int64_t)ms * 1000000)); }
+void dm_pcmout_wait(void *k, int ms) { plat_sema_wait(ao(k)->rel_sem, (int64_t)ms * 1000000); }
 void dm_pcmout_start(void *k) { au_start_at(k, NULL); }
 void dm_pcmout_close(void *k) { au_close(k, NULL); free(k); }   // stop, take it out of the registry (frees its AOMAX slot), free it and its key
 int dm_pcmout_append(void *k, void *b) { return (int)h_au_Append(k, b); }

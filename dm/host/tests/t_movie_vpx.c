@@ -112,6 +112,9 @@ static void vorbis_flush(void) {
     puts("Vorbis movie sound: the samples come again after a Flush");
 }
 
+// AudioToolbox is Apple's: its encoder makes the packets and its decoder the PCM, so this runs on Apple only; the port's AAC (Media Foundation, the silence stopgap)
+// is checked below in main
+#if defined(__APPLE__)
 // Generate AAC with the system encoder, then seek back to the first packet.
 // A flushed decoder must produce the same samples as a freshly opened decoder,
 // not overlap them with the tail of the old playback position. No game media.
@@ -163,6 +166,7 @@ static void aac_flush(unsigned ch) {
     pthread_mutex_destroy(&d.dmu); pthread_mutex_destroy(&d.mu);
     printf("AAC %u channels: seek / repeated Flush restarts with the original PCM and frame count\n", ch);
 }
+#endif
 // At a window change each packet leaves with (previous blocksize + its blocksize) / 4 samples. With blocksizes 64 / 256, stb_vorbis gives 176 and 32 for a long window before a short one and the short one,
 // where the specification has 128 and 80. Samples kept across a change do not survive a Flush
 static void vorbis_window_change(void) {
@@ -227,11 +231,19 @@ static void movie_buffer_exports(void) {
     }
     memset(&G, 0, sizeof G);
 }
+// hle_os.c and hle_thread.c, which this fixture does not link (hle_movie.c's deferred events): the host clock, no DM_DETCLOCK
+__attribute__((weak)) uint64_t guest_ns(void) { return plat_now_ns(); }
+__attribute__((weak)) int dm_detclock_enabled(void) { return 0; }
+__attribute__((weak)) int dm_detclock_pace_thread(void *tt, uint64_t period) { (void)tt; (void)period; return 0; }
+__attribute__((weak)) void dm_detclock_paced_wake(void *tt) { (void)tt; }
+__attribute__((weak)) void dm_detclock_paced_sleep(uint64_t at) { (void)at; }
 int main(void) {
     movie_buffer_exports();
     playing();
     vorbis_flush();
+#if defined(__APPLE__)
     aac_flush(2); aac_flush(6);
+#endif
     vorbis_window_change();
     vorbis_split();
     int w = 0, h = 0;
@@ -242,4 +254,28 @@ int main(void) {
         decode(2, format, vp8, sizeof vp8);
     }
     puts("VP8 and VP9 key frames: NV12 and RGBA pixels match");
+#if !defined(__APPLE__) && !defined(_WIN32)
+    // The AAC stopgap (Linux, no decoder; md_aac_silence, which Windows takes too where Media Foundation has no decoder): each packet gives one frame of silence, 1024
+    // samples a channel (2048 with SBR), PCM16 interleaved, the size GetOutputBufferSize reports; an empty packet gives nothing; the channels from the configuration
+    // when the MediaData gave none
+    {
+        static uint8_t lc[] = {0x11, 0x90}, sbr[] = {0x29, 0x90}, six[] = {0x11, 0xb0}, pkt[16] = {0xde, 0xad};   // AudioSpecificConfig: AAC-LC, 48 kHz, 2 channels; SBR; 6 channels
+        mdec_t d = { .type = MD_TYPE_AAC, .ch = 2, .rate = 48000 };
+        d.vhdr[0] = lc; d.vhdr_n[0] = sizeof lc;
+        assert(md_aac(&d, pkt, sizeof pkt, 0) == 1 && d.out[0].bytes == 1024 * 2 * 2);
+        d.out[0].frm[0] = 1; d.out[0].frm[4095] = 1;   // the slot is used again: all of the frame is written each time
+        assert(md_aac(&d, pkt, sizeof pkt, 0) == 1);
+        for (size_t i = 0; i < d.out[0].bytes; i++) assert(d.out[0].frm[i] == 0);
+        assert(md_aac(&d, pkt, 0, 1) == 0 && d.out[1].frm == NULL);
+        d.vhdr[0] = sbr;
+        assert(md_aac(&d, pkt, sizeof pkt, 1) == 1 && d.out[1].bytes == 2048 * 2 * 2);
+        mdec_t e = { .type = MD_TYPE_AAC };
+        e.vhdr[0] = six; e.vhdr_n[0] = sizeof six;
+        assert(md_aac(&e, pkt, sizeof pkt, 0) == 1 && e.ch == 6 && e.out[0].bytes == 1024 * 2 * 6);
+        mdec_t f = { .type = MD_TYPE_AAC };
+        assert(md_aac(&f, pkt, sizeof pkt, 0) == 1 && f.ch == 2 && f.out[0].bytes == 1024 * 2 * 2);
+        free(d.out[0].frm); free(d.out[1].frm); free(e.out[0].frm); free(f.out[0].frm);
+        puts("AAC without a decoder: one frame of silence per packet");
+    }
+#endif
 }

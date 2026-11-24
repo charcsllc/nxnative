@@ -1,4 +1,5 @@
 """NRO metadata must survive the real rewriter even when a build ID decodes as x18 instructions."""
+import importlib.util
 import os
 from pathlib import Path
 import struct
@@ -7,12 +8,18 @@ import sys
 import tempfile
 import unittest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))   # its sibling test module, also when the file runs alone (python -m unittest <file>, as CI does)
-from test_nso_match import image, RET   # noqa: E402
-
 TOOLS = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(TOOLS / 'tests'))   # the CI runs each file by path from the repository root (tests.yml), which does not put this folder on sys.path
+from test_nso_match import image, RET  # noqa: E402
+
+# patch_nso.py, run below with this same Python, imports lz4.block and capstone at its top
+MISSING = [m for m in ('lz4', 'capstone') if importlib.util.find_spec(m) is None]
+sys.path.insert(0, str(TOOLS)); import capstone_version  # noqa: E402,E401
+REFUSED = '' if MISSING else capstone_version.problem()   # a capstone patch_nso.py refuses: it stops at its top
 
 
+@unittest.skipIf(MISSING, f'patch_nso.py needs the {" and ".join(MISSING)} Python module(s) (pip install {" ".join(MISSING)}), which this Python cannot import')
+@unittest.skipIf(REFUSED, REFUSED)
 class NroHeader(unittest.TestCase):
     def test_header_preserved_and_text_rewritten(self):
         self.check_rewrite(0x80, 0x58ff0012)   # literal ldr x18, outside the module

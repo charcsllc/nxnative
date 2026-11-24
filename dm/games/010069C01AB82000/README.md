@@ -55,7 +55,7 @@ The NSP script's build directory is `<NSP folder>/010069C01AB82000_build`; analy
 - **Provisional Unreal profiles leave room for the initial heap** (`profile_guess.py`): [Provisional Unreal layout leaves no heap](../../../docs/reference/memory.md#provisional-unreal-layout-leaves-no-heap).
 - **Returning `IGN` image atomics** (the offline translator, `t_atomic_return.m`): [Bounds of image atomics](../../../docs/reference/shaders.md#bounds-of-image-atomics).
 - **A game's own frame-limit variable written instead of `t.MaxFPS`** (profile key `ue_fps_cvar`, `hle_fpslock.c`): [Unreal's frame limit and present interval, found by name](../../../docs/reference/frame-rate.md#unreals-frame-limit-and-present-interval-found-by-name).
-- **Buffer-image reflection preserves its Metal texture type** (`nvn_refl.m`, `t_refl.m`): [Buffer image reflection keeps its texture type](../../../docs/reference/shaders.md#buffer-image-reflection-keeps-its-texture-type).
+- **Buffer-image reflection preserves its Metal texture type** (`nvn_refl.c`, `t_refl_c.c`): [Buffer image reflection keeps its texture type](../../../docs/reference/shaders.md#buffer-image-reflection-keeps-its-texture-type).
 
 ## Open
 

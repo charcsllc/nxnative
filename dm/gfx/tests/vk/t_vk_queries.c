@@ -1,0 +1,158 @@
+// Counter reports (nvnCommandBufferReportCounter / ResetCounter, docs/design/vulkan-backend.md 4.6) as the GPU writes them into guest memory: SAMPLES_PASSED counts the samples
+// of every draw since the last reset, across passes, a culled draw and a submission boundary, and reads 0 right after a reset; TIMESTAMP and TIMESTAMP_TOP write NVN ticks
+// (614.4 MHz, nvn_timestamp.h) on the host clock, ordered, inside the CPU's window around the submission, with a counter field of 0, as the GPU writes it (rendering.md, "Timestamp
+// reports count 0": a game's conditional clears compare it);
+// every report carries a timestamp; a counter type Vulkan has no counter for (TESS_EVALUATION_SHADER_PRIMITIVES, ZCULL_STATS) is still written, with a zero count, and said once.
+// Step P8, the other counter types (stats): the pipeline statistics (input vertices and primitives, vertex shader and fragment shader invocations, clipper input and output
+// primitives), PRIMITIVES_GENERATED (VK_EXT_primitives_generated_query, under rasterizer discard) and TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN (a transform feedback stream query:
+// the primitives that fit), each counted from its own reset, across passes and a submission, a reset of one type leaving the others counting. No Metal counterpart: the Metal
+// backend's reports are checked by its game smoke routes. Checks: each report's value, the timestamps' order and window, and the validation check
+#include "t_vk_harness.h"
+#include "../../nvn/nvn_timestamp.h"
+#include "shaders/gen/fullscreen_vert.h"
+#include "shaders/gen/red_frag.h"
+#include "shaders/gen/xfb5_vert.h"
+
+typedef struct { uint64_t counter, timestamp; } report;
+static void reset(hv_cmds *c, uint64_t type) { hv_emit(c, OP_RESET_COUNTER, &type, 8); }
+static void rep(hv_cmds *c, uint64_t type, report *at) { uint64_t a[2] = {type, (uint64_t)(uintptr_t)at}; hv_emit(c, OP_REPORT_COUNTER, a, 16); }
+// Step P8: the counters of pipeline statistics, primitives generated and transform feedback
+static void stats(NVNqueue *q, hv_pool *mp, hv_cmds *c, NVNprogram *prog, NVNprogram *xfb) {
+    report *r = (report *)(void *)(mp->mem + 12288); memset(r, 0xEE, 32 * sizeof *r);
+    tex_t target = hv_tex(NVN_TEXTURE_TARGET_2D, NVN_FORMAT_RGBA8, 8, 8, 1, 1, 0);
+    const tex_t *rt[1] = {&target};
+    static const uint64_t types[] = {NVN_COUNTER_TYPE_INPUT_VERTICES, NVN_COUNTER_TYPE_INPUT_PRIMITIVES, NVN_COUNTER_TYPE_VERTEX_SHADER_INVOCATIONS, NVN_COUNTER_TYPE_FRAGMENT_SHADER_INVOCATIONS,
+                                     NVN_COUNTER_TYPE_CLIPPER_INPUT_PRIMITIVES, NVN_COUNTER_TYPE_CLIPPER_OUTPUT_PRIMITIVES, NVN_COUNTER_TYPE_PRIMITIVES_GENERATED, NVN_COUNTER_TYPE_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN};
+    hv_rt(c, 1, rt, NULL); hv_bind(c, prog, 3); hv_depth(c, 0, 0, NVN_DEPTH_FUNC_ALWAYS); hv_cull(c, NVN_FACE_NONE); hv_scissor(c, 0, 0, 8, 8);
+    for (unsigned i = 0; i < sizeof types / sizeof *types; i++) reset(c, types[i]);
+    hv_draw(c, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3, 2);   // 2 instances of a full-target triangle: 6 vertices, 2 primitives
+    hv_t2b(c, &target, NULL, mp->mem + 16384, 0, 0, 0, 8, 8, 1);   // a pass split between the draws
+    hv_draw(c, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3, 1);   // + 3, + 1
+    for (unsigned i = 0; i < 6; i++) rep(c, types[i], &r[i]);
+    hv_submit(q, c);
+    hv_draw(c, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3, 1);   // the next submission: + 3, + 1
+    rep(c, NVN_COUNTER_TYPE_INPUT_VERTICES, &r[8]); rep(c, NVN_COUNTER_TYPE_INPUT_PRIMITIVES, &r[9]);
+    reset(c, NVN_COUNTER_TYPE_INPUT_VERTICES); hv_draw(c, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3, 1);
+    rep(c, NVN_COUNTER_TYPE_INPUT_VERTICES, &r[10]); rep(c, NVN_COUNTER_TYPE_INPUT_PRIMITIVES, &r[11]);   // 3 since its reset; the other type goes on: 5
+    // primitives generated under rasterizer discard: 3 triangles
+    p_rast_discard on = {1}, off = {0}; hv_emit(c, OP_RAST_DISCARD, &on, sizeof on);
+    reset(c, NVN_COUNTER_TYPE_PRIMITIVES_GENERATED); hv_draw(c, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 9, 1); rep(c, NVN_COUNTER_TYPE_PRIMITIVES_GENERATED, &r[12]);
+    // transform feedback: 3 points captured into a buffer that takes 2 (20 bytes a vertex)
+    hv_bind(c, xfb, 0x1f);
+    p_tf_bind tb = {0, 0, (uint64_t)(uintptr_t)(mp->mem + 20480), 40}; hv_emit(c, OP_TF_BIND, &tb, sizeof tb);
+    p_tf_state ts = {0, 0, (uint64_t)(uintptr_t)(mp->mem + 24576)}; hv_emit(c, OP_TF_STATE, &ts, sizeof ts);
+    reset(c, NVN_COUNTER_TYPE_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN);
+    hv_draw(c, NVN_DRAW_PRIMITIVE_POINTS, 0, 3, 1);
+    ts.what = 1; hv_emit(c, OP_TF_STATE, &ts, sizeof ts);
+    rep(c, NVN_COUNTER_TYPE_TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN, &r[13]);
+    hv_emit(c, OP_RAST_DISCARD, &off, sizeof off);
+    hv_submit(q, c);
+    const struct { int i; uint64_t lo, hi; const char *label; } want[] = {
+        {0, 9, 9, "INPUT_VERTICES: 2 instances of 3 and 3 more, across a pass split"}, {1, 3, 3, "INPUT_PRIMITIVES: 3"},
+        {2, 1, 9, "VERTEX_SHADER_INVOCATIONS: between 1 and the 9 vertices (Vulkan lets an implementation reuse vertices)"},
+        {3, 64, 3 * 64 * 4, "FRAGMENT_SHADER_INVOCATIONS: at least the 64 pixels covered (helper invocations may add)"},
+        {4, 3, 3, "CLIPPER_INPUT_PRIMITIVES: the 3 triangles"}, {5, 1, 12, "CLIPPER_OUTPUT_PRIMITIVES: what clipping makes of the 3 (each full-target triangle reaches past the target)"},
+        {8, 12, 12, "INPUT_VERTICES across a submission: 12"}, {9, 4, 4, "INPUT_PRIMITIVES across a submission: 4"},
+        {10, 3, 3, "a reset of INPUT_VERTICES counts from it: 3"}, {11, 5, 5, "... and INPUT_PRIMITIVES, not reset, goes on: 5"},
+        {12, 3, 3, "PRIMITIVES_GENERATED under rasterizer discard: 3 triangles"},
+        {13, 2, 2, "TRANSFORM_FEEDBACK_PRIMITIVES_WRITTEN: the 2 points the buffer takes of 3"},
+    };
+    for (unsigned k = 0; k < sizeof want / sizeof *want; k++) {
+        const report *x = &r[want[k].i];
+        int ok = x->counter >= want[k].lo && x->counter <= want[k].hi && x->timestamp != 0xEEEEEEEEEEEEEEEEull;
+        if (!ok) fprintf(stderr, "report %d: %llu, expected %llu .. %llu\n", want[k].i, (unsigned long long)x->counter, (unsigned long long)want[k].lo, (unsigned long long)want[k].hi);
+        char name[200]; snprintf(name, sizeof name, "%s (%llu)", want[k].label, (unsigned long long)x->counter);
+        t(name, ok);
+    }
+}
+
+// DM_DETCLOCK (threads.md, "GPU timestamps on the wall clock under DM_DETCLOCK"): the guest clock is virtual time, so every report takes the guest clock at its record,
+// whatever the GPU's own clock says and however long the GPU and the completion take: two values far from the host clock, a step apart, each in one submission; a timestamp,
+// a top-of-pipe timestamp, a counted type and a type written on the CPU at completion. Before the fix the GPU's calibrated time came back (the host clock's rate)
+static void detclock(NVNqueue *q, hv_cmds *c, report *r) {
+    const uint64_t t0 = 7000000123ull, step = 16666667ull;
+    hv_detclock = 1; hv_guest_clock_ns = t0;
+    hv_draw(c, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3, 1);
+    rep(c, NVN_COUNTER_TYPE_TIMESTAMP, &r[16]); rep(c, NVN_COUNTER_TYPE_TIMESTAMP_TOP, &r[17]); rep(c, NVN_COUNTER_TYPE_SAMPLES_PASSED, &r[18]);
+    rep(c, NVN_COUNTER_TYPE_TESS_EVALUATION_SHADER_PRIMITIVES, &r[19]);
+    hv_submit(q, c);
+    hv_guest_clock_ns = t0 + step;
+    hv_draw(c, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3, 1);
+    rep(c, NVN_COUNTER_TYPE_TIMESTAMP, &r[20]); rep(c, NVN_COUNTER_TYPE_SAMPLES_PASSED, &r[21]);
+    plat_sleep_ns(20000000);   // wall time the guest clock does not see
+    hv_submit(q, c);
+    hv_detclock = 0;
+    const uint64_t a = nvn_timestamp_from_ns(t0), b = nvn_timestamp_from_ns(t0 + step);
+    const struct { int i; uint64_t want; const char *label; } d[] = {
+        {16, a, "DM_DETCLOCK: TIMESTAMP holds the guest clock at its record"}, {17, a, "DM_DETCLOCK: TIMESTAMP_TOP the same"},
+        {18, a, "DM_DETCLOCK: a counted type's report (SAMPLES_PASSED) the same"}, {19, a, "DM_DETCLOCK: a type written on the CPU at completion the same"},
+        {20, b, "DM_DETCLOCK: a report one step later holds the clock one step later"}, {21, b, "DM_DETCLOCK: ... and so does a counted type's"},
+    };
+    for (unsigned k = 0; k < sizeof d / sizeof *d; k++) {
+        if (r[d[k].i].timestamp != d[k].want) fprintf(stderr, "report %d: time %llu NVN ticks, expected %llu\n", d[k].i, (unsigned long long)r[d[k].i].timestamp, (unsigned long long)d[k].want);
+        t(d[k].label, r[d[k].i].timestamp == d[k].want);
+    }
+    t("DM_DETCLOCK: the counted type still counts (64 samples since its last report)", r[21].counter - r[18].counter == 64);
+}
+
+int main(void) {
+    hv_up("t_vk_queries");
+    hv_device(0);
+    NVNqueue queue; NVNqueueBuilder qb; memset(&qb, 0, sizeof qb); h_nvnQueueBuilderSetDefaults(&qb); h_nvnQueueBuilderSetDevice(&qb, &g_dev); h_nvnQueueInitialize(&queue, &qb);
+    hv_pool mp; if (!hv_pool_make(&mp, 1 << 18)) { t("memory pool allocated", 0); return hv_finish(); }
+    hv_cmds c = {mp.mem + 65536, 0, 65536};
+    report *r = (report *)(void *)(mp.mem + 8192); memset(r, 0xEE, 64 * sizeof *r);
+    static NVNprogram prog;
+    const hv_shader sh[2] = {{"fullscreen", 0, HV_SPV(fullscreen_vert_spv), NULL, NULL}, {"red", 1, HV_SPV(red_frag_spv), NULL, NULL}};
+    hv_program(&prog, &mp, 0, sh, 2);
+    static NVNprogram xfbp; const hv_shader sx[1] = {{"xfb5", 0, HV_SPV(xfb5_vert_spv), NULL, NULL}}; hv_program(&xfbp, &mp, 4096, sx, 1);   // the statistics' capture (stats)
+    tex_t target = hv_tex(NVN_TEXTURE_TARGET_2D, NVN_FORMAT_RGBA8, 8, 8, 1, 1, 0);
+    const tex_t *rt[1] = {&target};
+    uint64_t cpu0 = nvn_timestamp_from_ns(plat_now_ns());
+    hv_rt(&c, 1, rt, NULL); hv_bind(&c, &prog, 3); hv_depth(&c, 0, 0, NVN_DEPTH_FUNC_ALWAYS); hv_cull(&c, NVN_FACE_NONE); hv_scissor(&c, 0, 0, 8, 8);
+    reset(&c, NVN_COUNTER_TYPE_SAMPLES_PASSED);
+    rep(&c, NVN_COUNTER_TYPE_SAMPLES_PASSED, &r[0]);                                      // 0: nothing drawn since the reset
+    hv_draw(&c, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3, 1); rep(&c, NVN_COUNTER_TYPE_SAMPLES_PASSED, &r[1]);   // 64
+    hv_scissor(&c, 0, 0, 4, 4); hv_draw(&c, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3, 1); rep(&c, NVN_COUNTER_TYPE_SAMPLES_PASSED, &r[2]);   // + 16
+    hv_cull(&c, NVN_FACE_FRONT_AND_BACK); hv_draw(&c, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3, 1); rep(&c, NVN_COUNTER_TYPE_SAMPLES_PASSED, &r[3]);   // culled: + 0
+    hv_cull(&c, NVN_FACE_NONE);
+    hv_clear_color(&c, 0, 15, 0, 0, 0, 0);   // a clear inside the pass draws no sample that counts
+    hv_t2b(&c, &target, NULL, mp.mem + 16384, 0, 0, 0, 8, 8, 1);   // a copy between: the pass ends, the counting goes on in the next
+    hv_draw(&c, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3, 1); rep(&c, NVN_COUNTER_TYPE_SAMPLES_PASSED, &r[4]);   // + 16 (the scissor is 4×4)
+    rep(&c, NVN_COUNTER_TYPE_TIMESTAMP, &r[5]); rep(&c, NVN_COUNTER_TYPE_TIMESTAMP_TOP, &r[6]);
+    rep(&c, NVN_COUNTER_TYPE_TESS_EVALUATION_SHADER_PRIMITIVES, &r[7]);   // no Vulkan statistic counts it
+    hv_submit(&queue, &c);
+    hv_scissor(&c, 0, 0, 8, 8); hv_draw(&c, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3, 1); rep(&c, NVN_COUNTER_TYPE_SAMPLES_PASSED, &r[8]);   // the next submission: + 64
+    reset(&c, NVN_COUNTER_TYPE_SAMPLES_PASSED); rep(&c, NVN_COUNTER_TYPE_SAMPLES_PASSED, &r[9]);                                        // reset: 0
+    hv_draw(&c, NVN_DRAW_PRIMITIVE_TRIANGLES, 0, 3, 1); rep(&c, NVN_COUNTER_TYPE_SAMPLES_PASSED, &r[10]);                             // 64
+    rep(&c, NVN_COUNTER_TYPE_TIMESTAMP, &r[11]);
+    hv_submit(&queue, &c);
+    uint64_t cpu1 = nvn_timestamp_from_ns(plat_now_ns());
+    const struct { int i; uint64_t want; const char *label; } occ[] = {
+        {0, 0, "a report right after a reset counts 0"}, {1, 64, "a full-target draw passes 64 samples"}, {2, 80, "a 4x4-scissored draw adds 16"},
+        {3, 80, "a draw with both faces culled adds nothing"}, {4, 96, "the count goes on across a pass split (a copy between draws)"},
+        {8, 160, "the count goes on across a submission"}, {9, 0, "a reset in the next submission starts again at 0"}, {10, 64, "and counts the draw after it"},
+    };
+    for (unsigned k = 0; k < sizeof occ / sizeof *occ; k++) {
+        if (r[occ[k].i].counter != occ[k].want) fprintf(stderr, "report %d: %llu samples, expected %llu\n", occ[k].i, (unsigned long long)r[occ[k].i].counter, (unsigned long long)occ[k].want);
+        t(occ[k].label, r[occ[k].i].counter == occ[k].want);
+    }
+    int ordered = 1, inside = 1;
+    const int seq[] = {0, 1, 2, 3, 4, 5, 8, 9, 10, 11};
+    for (unsigned k = 0; k < sizeof seq / sizeof *seq; k++) {
+        uint64_t ts = r[seq[k]].timestamp;
+        inside &= ts >= cpu0 && ts <= cpu1;
+        if (k) ordered &= ts >= r[seq[k - 1]].timestamp;
+    }
+    if (!inside) fprintf(stderr, "timestamps %llu .. %llu, the CPU's window %llu .. %llu (NVN ticks)\n", (unsigned long long)r[0].timestamp, (unsigned long long)r[11].timestamp,
+                         (unsigned long long)cpu0, (unsigned long long)cpu1);
+    t("every report's timestamp lies in the CPU's window around the submissions (host clock, NVN ticks)", inside);
+    t("the timestamps follow the reports' order", ordered);
+    t("TIMESTAMP: the counter field is 0, the timestamp field the time, in order", r[5].counter == 0 && r[5].timestamp >= r[4].timestamp);
+    t("TIMESTAMP_TOP: the counter field is 0, the time in the CPU's window", r[6].counter == 0 && r[6].timestamp >= cpu0 && r[6].timestamp <= cpu1);
+    t("a counter type Vulkan has no counter for (TESS_EVALUATION_SHADER_PRIMITIVES) is written with a zero count (declared)", r[7].counter == 0 && r[7].timestamp != 0xEEEEEEEEEEEEEEEEull);
+    detclock(&queue, &c, r);
+    stats(&queue, &mp, &c, &prog, &xfbp);
+    hv_pool_free(&mp);
+    return hv_finish();
+}

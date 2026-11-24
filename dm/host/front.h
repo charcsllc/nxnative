@@ -1,4 +1,4 @@
-// Host front end (Mac: front_mac.m; iOS: dm/ios separately implements the same-named interface).
+// Host front end (Mac: front_mac.m; iOS: dm/ios separately implements the same-named interface; Linux and Windows: front_sdl.c, SDL3).
 #pragma once
 #include <stdlib.h>
 // Metal reads HUD switches when the first device is made. Called before host preload and again after the launcher applies its settings; explicit environment values win.
@@ -13,6 +13,19 @@ static inline void front_hud_env(void) {
 void front_run(void (*guest)(void));
 // The CAMetalLayer the graphics backend presents frames to (NULL when there is no window)
 void *front_metal_layer(void);
+// The window's Vulkan surface, for the Vulkan presenter (Phase 4 of the port): implemented by front_sdl.c only. The Apple front ends do not implement them and nothing on Apple calls them
+// (Metal presents through front_metal_layer, which front_sdl.c answers with NULL). void * keeps Vulkan's headers out of this file: vk_instance is a VkInstance, *vk_surface_out a VkSurfaceKHR
+// (both pointer-sized on 64-bit). Any thread; the front end does the work on its main thread.
+// The instance extensions vkCreateInstance needs for the window's surface: writes up to *n names (strings that stay valid) and sets *n to how many it wrote; returns how many there are,
+// 0 without a Vulkan window (no window, or the system refused the Vulkan window: front_sdl.c logs it)
+int front_vk_instance_extensions(const char **names, unsigned *n);
+// Make the window's surface with an instance made with those extensions. The progress screen's own drawing stops first (a renderer cannot share the window with the swapchain), so
+// front_progress shows in the window title from then on. 0 on success, -1 without a Vulkan window or when Vulkan refuses (logged)
+int front_vk_create_surface(void *vk_instance, void **vk_surface_out);
+#if defined(DM_NATIVE_EXEC) && !DM_NATIVE_EXEC   // the Vulkan presenter's only (front_sdl.c): declared for the portable host alone (plat.h included first), so every Apple file sees this one as before
+// The window's size in pixels now, the swapchain's size where the surface leaves it to the program (Wayland): 0, or -1 without a window. 0x0 while minimized. Any thread
+int front_vk_pixel_size(int *w, int *h);
+#endif
 // The highest refresh rate of the screen the game is shown on in Hz, 0 = not known (front_mac.m: the window's screen; front_ios.m: the game view's screen, 60 in Low Power Mode). Any thread
 int front_screen_max_fps(void);
 // The screen's native refresh rate before front_screen_match temporarily switched it to a lower fixed rate in fullscreen (front_mac.m; on iOS, same as front_screen_max_fps). Any thread

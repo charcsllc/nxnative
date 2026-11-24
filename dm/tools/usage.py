@@ -139,14 +139,16 @@ def read_manifest(path):
 
 # ---------------------------------------------------------------- the host's call graph (a scanner, not a compiler)
 
-DEF = re.compile(r'^(?:static\s+|inline\s+|__attribute__\(\([^)]*\)\)\s+)*[A-Za-z_][\w\s\*]*?\b([A-Za-z_]\w*)\s*\(([^;{}]|\n)*?\)\s*\{', re.M)
+# The parameter list is one class ([^;{}] already takes a newline): with the newline as a second alternative every line break doubled the ways to match, and a file with a long
+# parenthesised run that is no definition (stb's headers, zycore's Comparison.h) never finished: `regress.py impact` on a range that touched one ran for hours
+DEF = re.compile(r'^(?:static\s+|inline\s+|__attribute__\(\([^)]*\)\)\s+)*[A-Za-z_][\w\s\*]*?\b([A-Za-z_]\w*)\s*\([^;{}]*?\)\s*\{', re.M)
 NVN_DEF = re.compile(r'^NVN(?:_NOPROTO)?\((nvn\w+)\s*,', re.M)
 HLE_DEF = re.compile(r'^HLE\(\s*"([^"]+)"\s*,\s*[^,]+,\s*(\w+)', re.M)   # HLE("symbol", ret, cname, ...) and HLE_FORCE("symbol", "why", ret, cname, ...) in dm/host/hle.h
 HLE_FORCE_DEF = re.compile(r'^HLE_FORCE(?:_DIRECT)?\(\s*"([^"]+)"\s*,\s*"(?:[^"\\]|\\.)*"\s*,\s*[^,]+,\s*(\w+)', re.M)
 CALL = re.compile(r'\b([A-Za-z_]\w*)\s*\(')
 TABLE = re.compile(r'\{\s*"([^"]+)"\s*,\s*(?:\(void\s*\*\)\s*)?&?([A-Za-z_]\w*)\s*\}')
 KEYWORDS = {'if', 'for', 'while', 'switch', 'return', 'sizeof', 'do', 'else', 'case', 'defined', 'typeof', '__typeof__', 'alignof'}
-HOST_SRC = ('dm/host', 'dm/gfx', 'dm/gfx/nvn', 'dm/gfx/tex', 'dm/gfx/vk', 'dm/gfx/gl')
+HOST_SRC = ('dm/host', 'dm/host/plat', 'dm/gfx', 'dm/gfx/nvn', 'dm/gfx/tex', 'dm/gfx/vk', 'dm/gfx/gl')
 HOST_EXT = ('.c', '.m', '.inc', '.h')   # headers too: the frame step, the texture layouts and other static inline code live in them
 
 

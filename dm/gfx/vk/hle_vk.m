@@ -13,11 +13,12 @@
 //     row says which Metal slot each (set, binding) went to (an array of n descriptors: n slots from there; push constants: their own buffer slot);
 //     vertex buffers sit at slot 30 - binding;
 //     Compute shaders are kernels dispatched at their table row's local size on the same command buffer's compute encoder;
-//   · swapchain images are registered with the NVN layer's present path (mtl_ext_tex), which shows a frame once g_ev reaches the value of the frame's last submit.
+//   · swapchain images are registered with the NVN layer's present path (be_ext_tex, nvn_be_ext.h), which shows a frame once g_ev reaches the value of the frame's last submit.
 // Environment: DM_VK_LOG=1 logs object creation; DM_VK_CAPTURE=<dir> writes every SPIR-V module the game creates (sh_capture).
 #define VK_NO_PROTOTYPES
 #include "../../host/hle.h"
-#include "../nvn/nvn_mtl.h"
+#include "../nvn/nvn_mtl.h"      // mtl_device_classic
+#include "../nvn/nvn_be_ext.h"   // the backend's present path and its pacing: be_ext_tex, be_present_ext, be_present_wait, be_fps_target (60, or 30 when the frame rate is halved), be_vsync_active and be_vsync_wait (the display link and its ticks)
 #include "../nvn/nvn_dbnd.h"
 #import "../nvn/host_msl.h"
 #include <vulkan/vulkan_core.h>
@@ -31,8 +32,6 @@
 #include <stdatomic.h>
 #include <time.h>
 
-int mtl_fps_target(void);   // nvn_mtl.m: 60, or 30 when the frame rate is halved
-int mtl_link_active(void); int mtl_link_wait_tick(int vsyncs, uint64_t timeout_ns);   // nvn_mtl.m: whether the display link presents, and the wait for its ticks
 void dm_vi_layer_crop(int c[4]);   // hle_vi.c: x, y, w, h the game last cropped its layer to (all 0 = none)
 
 #define VLOG(...) LOG("[vk] " __VA_ARGS__)
@@ -2887,7 +2886,7 @@ VKB(vkCreateSwapchainKHR, VkResult, VkDevice d, const VkSwapchainCreateInfoKHR *
             im->tex = [g_dev newTextureWithDescriptor:td]; im->f = f; im->fmt = ci->imageFormat; im->type = VK_IMAGE_TYPE_2D;
             im->usage = ci->imageUsage;
             im->w = ci->imageExtent.width; im->h = ci->imageExtent.height; im->d = im->mips = im->layers = im->samples = 1;
-            im->serial = mtl_ext_tex((__bridge void *)im->tex);
+            im->serial = be_ext_tex((__bridge void *)im->tex);
             sc->img[i] = im;
         }
     }
@@ -2896,7 +2895,7 @@ VKB(vkCreateSwapchainKHR, VkResult, VkDevice d, const VkSwapchainCreateInfoKHR *
 }
 VKB(vkDestroySwapchainKHR, void, VkDevice d, VkSwapchainKHR sc, const VkAllocationCallbacks *a) {
     (void)d; (void)a; if (!sc) return;
-    for (uint32_t i = 0; i < sc->n; i++) { if (sc->ticket[i]) mtl_present_wait(sc->ticket[i]); }
+    for (uint32_t i = 0; i < sc->n; i++) { if (sc->ticket[i]) be_present_wait(sc->ticket[i]); }
     // The present path keeps each texture until its presents have completed on the GPU, then lets it go (mtl_ext_tex_release); kept for good before, at every recreation
     for (uint32_t i = 0; i < sc->n; i++) { mtl_ext_tex_release(sc->img[i]->serial); sc->img[i]->tex = nil; free(sc->img[i]); }
     free(sc);
@@ -2909,15 +2908,15 @@ static uint64_t g_next_acq;   // pacing without the display link: the earliest t
 VKB(vkAcquireNextImageKHR, VkResult, VkDevice d, VkSwapchainKHR sc, uint64_t timeout, VkSemaphore sem, VkFence f, uint32_t *idx) {
     (void)d; (void)timeout; (void)sem;
     uint32_t i = sc->next++ % sc->n;
-    uint64_t period = 1000000000ull / (uint64_t)mtl_fps_target(), now = now_ns();
+    uint64_t period = 1000000000ull / (uint64_t)be_fps_target(), now = now_ns();
     // Paced by the display link when it runs, as NVN's acquire (hle_nvn.c nvnWindowAcquireTexture): FIFO presents one frame per vsync. A clock of our own drifts against the screen:
     // Super Mario Galaxy 2 on an iPhone put two frames into some display-link ticks and none into others (about one tick in seven), and on a Mac window it ran at 30 fps
-    if (mtl_link_active() && mtl_link_wait_tick((int)(60 / mtl_fps_target()), 2 * period)) g_next_acq = now_ns() + period;
+    if (be_vsync_active() && be_vsync_wait((int)(60 / be_fps_target()), 2 * period)) g_next_acq = now_ns() + period;
     else {
         if (g_next_acq > now) { uint64_t w = g_next_acq - now; struct timespec ts = {(time_t)(w / 1000000000ull), (long)(w % 1000000000ull)}; nanosleep(&ts, NULL); }
         now = now_ns(); g_next_acq = g_next_acq && now < g_next_acq + period ? g_next_acq + period : now + period;
     }
-    if (sc->ticket[i]) mtl_present_wait(sc->ticket[i]);   // its previous present has been shown, so drawing into it again is safe
+    if (sc->ticket[i]) be_present_wait(sc->ticket[i]);   // its previous present has been shown, so drawing into it again is safe
     if (f) atomic_store(&f->val, 0);
     *idx = i; return VK_SUCCESS;
 }
@@ -2939,7 +2938,7 @@ VKB(vkQueuePresentKHR, VkResult, VkQueue q, const VkPresentInfoKHR *pi) {
     for (uint32_t i = 0; i < pi->swapchainCount; i++) {
         VkSwapchainKHR sc = pi->pSwapchains[i]; uint32_t k = pi->pImageIndices[i];
         int fit = crop[2] > 0 && crop[3] > 0 && k < sc->n && (uint32_t)(crop[0] + crop[2]) <= sc->img[k]->w && (uint32_t)(crop[1] + crop[3]) <= sc->img[k]->h;
-        if (k < sc->n) sc->ticket[k] = mtl_present_ext(sc->img[k]->serial, 1.0 / mtl_fps_target(), (__bridge void *)g_ev, v, fit ? crop : NULL);
+        if (k < sc->n) sc->ticket[k] = be_present_ext(sc->img[k]->serial, 1.0 / be_fps_target(), (__bridge void *)g_ev, v, fit ? crop : NULL);
         if (pi->pResults) pi->pResults[i] = VK_SUCCESS;
     }
     dm_gfx_leave();

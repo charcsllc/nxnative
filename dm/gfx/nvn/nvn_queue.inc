@@ -1,8 +1,13 @@
 #include "nvn_capture.h"
 #include "nvn_hmap.h"
 
+#if defined(__APPLE__)
 void *objc_autoreleasePoolPush(void);
 void objc_autoreleasePoolPop(void *);
+#else   // the Metal backend's Objective-C objects go with an autorelease pool around each job; a backend without Objective-C has none to drain
+static inline void *objc_autoreleasePoolPush(void) { return NULL; }
+static inline void objc_autoreleasePoolPop(void *pool) { (void)pool; }
+#endif
 
 // Ready continuations of NVN queues share the renderer's one ordered Metal queue.
 // An unresolved wait parks its queue, never the submitting CPU or another queue.
@@ -21,7 +26,7 @@ typedef struct nq_owned { struct nq_owned *next; unsigned kind; uint64_t data[];
 typedef struct nq_job { struct nq_job *next; nq_node *first, *last; nq_receipt *receipt; nq_owned *owned; nvn_hmap objects; uint64_t frame, submitted;
     nq_node *staged_first, *staged_last; int open, waits; } nq_job;
 static void nq_job_free(nq_job *j) {
-    for(nq_owned *o=j->owned,*next;o;o=next) { next=o->next; if(o->kind==CAP_K_PROG) mtl_prog_unpin((prog_t *)o->data); else if(o->kind==CAP_K_TEX) mtl_tex_unpin(((tex_t *)o->data)->serial); free(o); }
+    for(nq_owned *o=j->owned,*next;o;o=next) { next=o->next; if(o->kind==CAP_K_PROG) be_prog_unpin((prog_t *)o->data); else if(o->kind==CAP_K_TEX) be_tex_unpin(((tex_t *)o->data)->serial); free(o); }
     free(j->objects.keys); free(j->objects.vals); free(j);
 }
 static int nq_snapshot_address(void *ctx,uint64_t *field,uint64_t len,int writable) { (void)ctx;(void)field;(void)len;(void)writable;return 1; }
@@ -34,9 +39,9 @@ static int nq_snapshot_object(void *ctx,int kind,uint64_t *field,uint8_t *payloa
         if(kind==CAP_K_PROG) {
             prog_t *copy=(prog_t *)o->data;
             const prog_t *source=(const prog_t *)(uintptr_t)*field;
-            if(j->open) mtl_prog_snapshot_pin(copy,source);
-            else mtl_prog_snapshot(copy,source);
-        } else { memcpy(o->data,(const void *)(uintptr_t)*field,bytes); mtl_tex_pin(((tex_t *)o->data)->serial); }
+            if(j->open) be_prog_snapshot_pin(copy,source);
+            else be_prog_snapshot(copy,source);
+        } else { memcpy(o->data,(const void *)(uintptr_t)*field,bytes); be_tex_pin(((tex_t *)o->data)->serial); }
         nvn_hm_put(&j->objects,key,o);
     }
     *field=(uintptr_t)o->data;return 1;
@@ -105,7 +110,7 @@ static int nq_sync_encoded(const sync_t *s,uint64_t *fence) {
     if(!s->fenced) return 0; *fence=s->fence; return 1;
 }
 void nvn_queue_gpu_progress(void) {
-    pthread_mutex_lock(&nq_mu); uint64_t done=mtl_completed_fence(); nq_event_write **p=&nq_event_writes;
+    pthread_mutex_lock(&nq_mu); uint64_t done=be_completed_fence(); nq_event_write **p=&nq_event_writes;
     while(*p) { nq_event_write *w=*p; if(w->fence<=done) { *p=w->next; free(w); } else p=&w->next; }
     pthread_cond_broadcast(&nq_cv); pthread_mutex_unlock(&nq_mu);
 }
@@ -117,7 +122,7 @@ static void nq_event_publish(volatile uint32_t *word,unsigned mode,uint32_t valu
     // Latch waits already reached: a subsequent signal must not erase a release.
     for(nq_queue *q=nq_queues;q;q=q->next) if(q->first && q->first->first) {
         nq_node *n=q->first->first;
-        if(n->kind==NQ_EVENT && n->waiting && n->event==word && (gpu_fence ? gpu_fence>=n->event_predecessor : nq_event_pending(word)<=mtl_completed_fence()) && nq_predicate(atomic_load_explicit((_Atomic uint32_t *)word,memory_order_acquire),n->mode,n->value)) { n->event=NULL; n->wait_fence=gpu_fence; }
+        if(n->kind==NQ_EVENT && n->waiting && n->event==word && (gpu_fence ? gpu_fence>=n->event_predecessor : nq_event_pending(word)<=be_completed_fence()) && nq_predicate(atomic_load_explicit((_Atomic uint32_t *)word,memory_order_acquire),n->mode,n->value)) { n->event=NULL; n->wait_fence=gpu_fence; }
     }
     pthread_cond_broadcast(&nq_cv); pthread_mutex_unlock(&nq_mu);
 }
@@ -134,19 +139,19 @@ static void nq_snapshot_sync(nq_node *n,const sync_t *s) {
 }
 typedef struct { uint64_t wall, cpu, instr, cycles, sys; } nq_cost;
 static nq_cost nq_cost_begin(void) {
-    nq_cost c={.wall=now_ns(),.cpu=clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID),.sys=thr_sys_ns()};
+    nq_cost c={.wall=now_ns(),.cpu=thr_cpu_ns(),.sys=thr_sys_ns()};
     thr_counts(&c.instr,&c.cycles); return c;
 }
 static void nq_cost_end(nq_cost c) {
-    uint64_t dw=now_ns()-c.wall, dc=clock_gettime_nsec_np(CLOCK_THREAD_CPUTIME_ID)-c.cpu, ins, cyc; thr_counts(&ins,&cyc);
+    uint64_t dw=now_ns()-c.wall, dc=thr_cpu_ns()-c.cpu, ins, cyc; thr_counts(&ins,&cyc);
     atomic_fetch_add(&g_nvn_ns,dw); atomic_fetch_add(&g_sub_wall_ns,dw); atomic_fetch_add(&g_cum_sub_wall_ns,dw);
     atomic_fetch_add(&g_sub_cpu_ns,dc); atomic_fetch_add(&g_cum_sub_cpu_ns,dc);
     atomic_fetch_add(&g_sub_instr,ins-c.instr); atomic_fetch_add(&g_cum_sub_instr,ins-c.instr);
     atomic_fetch_add(&g_cum_sub_cyc,cyc-c.cycles); atomic_fetch_add(&g_cum_sub_sys_ns,thr_sys_ns()-c.sys);
 }
 static void *nq_worker(void *unused) {
-    (void)unused; pthread_setname_np("NVN queue replay");
-    pthread_set_qos_class_self_np(QOS_CLASS_USER_INTERACTIVE,0);
+    (void)unused; plat_thread_set_name("NVN queue replay");   // plat.h: pthread_setname_np and pthread_set_qos_class_self_np on Apple, as before
+    plat_qos_set_self(PLAT_QOS_USER_INTERACTIVE);
     void *rt=nvn_rt_join("queue replay thread");   // it carries the frame's submissions: it declares the frame's deadline too (hle_nvn.c rt_tick)
     uint64_t frame=UINT64_MAX;
     for(;;) {
@@ -165,14 +170,14 @@ static void *nq_worker(void *unused) {
                     if(!n->waiting) n->event_predecessor=predecessor;
                     // The queued GPU write satisfies the wait: the GPU runs this continuation after it (nq_event_write). Ocarina of Time waits on about 25 events a frame; each wait
                     // for the writer's completion left the GPU idle while the host encoded the next submission, 2 ms of its 14.5 ms frame, which its dynamic resolution read as work
-                    nq_event_write *queued=predecessor>mtl_completed_fence() ? nq_event_write_of(n->event) : NULL;
+                    nq_event_write *queued=predecessor>be_completed_fence() ? nq_event_write_of(n->event) : NULL;
                     if(queued && queued->exact && nq_predicate(queued->value,n->mode,n->value)) break;
-                    if(predecessor>mtl_completed_fence() || !nq_predicate(atomic_load_explicit((_Atomic uint32_t *)n->event,memory_order_acquire),n->mode,n->value)) {
+                    if(predecessor>be_completed_fence() || !nq_predicate(atomic_load_explicit((_Atomic uint32_t *)n->event,memory_order_acquire),n->mode,n->value)) {
                         // A queue held more than 5 s by one event wait: what it waits for, since the game's own GPU watchdog acts on the fences behind it (PRAGMATA aborts after 15 s)
                         uint64_t t=now_ns(); if(!n->wait_since) n->wait_since=t;
                         else if(t-n->wait_since>5000000000ull && !n->wait_said) { static _Atomic int said; n->wait_said=1; if(atomic_fetch_add(&said,1)<8)
                             LOG("[RED] queue %llu: an event wait has held it %.1f s: word %p is %#x, waiting for %s %#x; a GPU write of it is %s",(unsigned long long)q->serial,(t-n->wait_since)/1e9,(void *)n->event,
-                                atomic_load_explicit((_Atomic uint32_t *)n->event,memory_order_acquire),n->mode==0?"equal to":"at least",n->value,predecessor>mtl_completed_fence()?"queued, not completed":"not queued"); }
+                                atomic_load_explicit((_Atomic uint32_t *)n->event,memory_order_acquire),n->mode==0?"equal to":"at least",n->value,predecessor>be_completed_fence()?"queued, not completed":"not queued"); }
                         n->waiting=1; mapped_event_wait=1; continue; }
                 }
                 if(n->kind==NQ_SYNC) {
@@ -190,7 +195,7 @@ static void *nq_worker(void *unused) {
             if(q) break;
             // NVN events can also be changed by plain stores through mapped pool memory.
             // A bounded notification poll only while such a word is awaited complements API/callback wakes.
-            if(mapped_event_wait) { struct timespec tick={0,1000000}; pthread_cond_timedwait_relative_np(&nq_cv,&nq_mu,&tick); }
+            if(mapped_event_wait) { struct timespec tick={0,1000000}; cond_wait_rel(&nq_cv,&nq_mu,&tick); }
             else pthread_cond_wait(&nq_cv,&nq_mu);
         }
         j->first=n->next; if(!j->first) j->last=NULL;
@@ -205,23 +210,23 @@ static void *nq_worker(void *unused) {
         if((n->kind==NQ_SYNC || n->kind==NQ_EVENT) && n->wait_since) q->wait_passed=guest_ns();   // the GPU could not start what follows before this either
         if(n->kind==NQ_FENCE) nq_publish(n->receipt,q->physical);
         pthread_mutex_unlock(&nq_mu);
-        if(wait_phys || wait_copy) mtl_present_wait_texture(wait_phys,wait_copy);
+        if(wait_phys || wait_copy) be_present_wait_texture(wait_phys,wait_copy);
         uint64_t fence=0, present=0, copy=0;
         if(n->kind==NQ_COMMANDS || n->kind==NQ_PRESENT) {
             nvn_rt_tick(rt);
             dm_host_mutex_lock(&g_sub_mu); void *pool=objc_autoreleasePoolPush();
-            dm_host_work++; mtl_prepare(); dm_host_work--;
+            dm_host_work++; be_prepare(); dm_host_work--;
             gfx_enter(); nq_cost cost=nq_cost_begin();
-            if(frame!=j->frame) { frame=j->frame; mtl_set_frame(frame); }
-            mtl_queue_activate(q->serial); mtl_set_queue_origin_lower_left(q->origin);
+            if(frame!=j->frame) { frame=j->frame; be_set_frame(frame); }
+            be_queue_activate(q->serial); be_set_queue_origin_lower_left(q->origin);
             if(n->kind==NQ_COMMANDS) {
                 uint64_t handle=(uintptr_t)n->bytes;
                 nvn_cap_submit(1,&handle);
-                mtl_sub_begin(); mtl_sub_ready(j->submitted>q->wait_passed?j->submitted:q->wait_passed); nvn_ft_poll();
-                mtl_exec_rest(NULL,0); mtl_exec(n->bytes); fence=mtl_sub_commit();
+                be_sub_begin(); be_sub_ready(j->submitted>q->wait_passed?j->submitted:q->wait_passed); nvn_ft_poll();
+                be_exec_rest(NULL,0); be_exec(n->bytes); fence=be_sub_commit();
             } else {
                 nvn_cap_present(&n->texture,n->crop);
-                present=mtl_present(&n->texture,n->period,n->crop,&copy); mtl_tex_unpin(n->texture.serial);
+                present=be_present(&n->texture,n->period,n->crop,&copy); be_tex_unpin(n->texture.serial);
             }
             nq_cost_end(cost); gfx_leave(); objc_autoreleasePoolPop(pool); pthread_mutex_unlock(&g_sub_mu);
         }
@@ -330,8 +335,8 @@ void nvn_queue_submit(queue_t *q,int count,const uint64_t *handles) {
     pthread_once(&nq_once,nq_start); nq_job *j=calloc(1,sizeof *j); if(!j) die("queue job allocation failed"); j->receipt=nq_new();
     j->objects.klen=16; j->frame=dm_nvn_frame_count(); j->submitted=guest_ns();
     // No scheduler lock while copying descriptors or resolving shader libraries.
-    dm_host_mutex_lock(&g_sub_mu); void *pool=objc_autoreleasePoolPush(); dm_host_work++; mtl_prepare(); dm_host_work--; nq_cost cost=nq_cost_begin();
-    int stream=mtl_sub_stream_on();
+    dm_host_mutex_lock(&g_sub_mu); void *pool=objc_autoreleasePoolPush(); dm_host_work++; be_prepare(); dm_host_work--; nq_cost cost=nq_cost_begin();
+    int stream=be_sub_stream_on();
     if(stream) {
         j->open=1;
         pthread_mutex_lock(&nq_mu); nq_enqueue(nq_get(q),j); pthread_mutex_unlock(&nq_mu);
@@ -351,9 +356,9 @@ void nvn_queue_submit(queue_t *q,int count,const uint64_t *handles) {
 uint64_t nvn_queue_present(queue_t *q,const tex_t *t,double period,const int crop[4]) {
     nvn_cap_queue(q->serial,0);
     pthread_once(&nq_once,nq_start); nq_job *j=calloc(1,sizeof *j); if(!j) die("queue present allocation failed");
-    j->receipt=nq_new(); j->frame=dm_nvn_frame_count(); { void mtl_present_recorded(uint64_t); mtl_present_recorded(j->frame); }   // the game's own present count, for the screen wait (nvn_mtl.m)
+    j->receipt=nq_new(); j->frame=dm_nvn_frame_count(); { be_present_recorded(j->frame); }   // the game's own present count, for the screen wait (nvn_mtl.m)
     nq_node *n=nq_append(j,NQ_PRESENT);
-    n->texture=*t; mtl_tex_pin(t->serial); n->period=period; if(crop) memcpy(n->crop,crop,sizeof n->crop);
+    n->texture=*t; be_tex_pin(t->serial); n->period=period; if(crop) memcpy(n->crop,crop,sizeof n->crop);
     pthread_mutex_lock(&nq_mu); nq_publish_staged(j); j->receipt->refs++; uint64_t ticket=(uintptr_t)j->receipt;
     nq_enqueue(nq_get(q),j); pthread_mutex_unlock(&nq_mu); return ticket;
 }
@@ -364,12 +369,12 @@ void nvn_queue_present_release(uint64_t ticket) {
 void nvn_queue_present_wait(uint64_t ticket) {
     if(!ticket) return; nq_receipt *r=(nq_receipt *)(uintptr_t)ticket;
     pthread_mutex_lock(&nq_mu); while(!r->published) pthread_cond_wait(&nq_cv,&nq_mu); uint64_t physical=r->present, copy=r->copy; pthread_mutex_unlock(&nq_mu);
-    if(physical || copy) mtl_present_wait_texture(physical,copy);   // a snapshot can outlive its dropped display ticket
+    if(physical || copy) be_present_wait_texture(physical,copy);   // a snapshot can outlive its dropped display ticket
 }
 int nvn_queue_present_ready(uint64_t ticket) {
     if(!ticket) return 1; nq_receipt *r=(nq_receipt *)(uintptr_t)ticket;
     pthread_mutex_lock(&nq_mu); int pub=r->published; uint64_t physical=r->present, copy=r->copy; pthread_mutex_unlock(&nq_mu);
-    return pub && mtl_present_texture_ready(physical,copy);
+    return pub && be_present_texture_ready(physical,copy);
 }
 int nvn_queue_present_wait_timeout(uint64_t ticket, uint64_t timeout_ns) {
     if(!ticket) return 1;
@@ -380,12 +385,12 @@ int nvn_queue_present_wait_timeout(uint64_t ticket, uint64_t timeout_ns) {
     while(!r->published) {
         uint64_t el=now_ns()-start; if(el>=timeout_ns) { pthread_mutex_unlock(&nq_mu); return 0; }
         uint64_t left=timeout_ns-el; struct timespec ts={(time_t)(left/1000000000ull),(long)(left%1000000000ull)};
-        pthread_cond_timedwait_relative_np(&nq_cv,&nq_mu,&ts);
+        cond_wait_rel(&nq_cv,&nq_mu,&ts);
     }
     uint64_t physical=r->present, copy=r->copy; pthread_mutex_unlock(&nq_mu);
     if(!physical && !copy) return 1;
     for(;;) {
-        if(mtl_present_texture_ready(physical,copy)) return 1;
+        if(be_present_texture_ready(physical,copy)) return 1;
         uint64_t el=now_ns()-start; if(el>=timeout_ns) return 0;
         uint64_t left=timeout_ns-el, sl=left<1000000ull?left:1000000ull;
         sleep_until_ns(now_ns()+sl);
@@ -401,10 +406,10 @@ int nvn_sync_wait(const sync_t *s,uint64_t timeout) {
     while(!nq_sync_encoded(s,&fence)) {
         uint64_t elapsed=now_ns()-start; if(timeout!=UINT64_MAX && elapsed>=timeout) { pthread_mutex_unlock(&nq_mu); return 0; }
         if(timeout==UINT64_MAX) pthread_cond_wait(&nq_cv,&nq_mu);
-        else { uint64_t left=timeout-elapsed; struct timespec ts={(time_t)(left/1000000000ull),(long)(left%1000000000ull)}; pthread_cond_timedwait_relative_np(&nq_cv,&nq_mu,&ts); }
+        else { uint64_t left=timeout-elapsed; struct timespec ts={(time_t)(left/1000000000ull),(long)(left%1000000000ull)}; cond_wait_rel(&nq_cv,&nq_mu,&ts); }
     }
     pthread_mutex_unlock(&nq_mu); uint64_t elapsed=now_ns()-start;
-    return mtl_wait(fence,timeout==UINT64_MAX?timeout:elapsed>=timeout?0:timeout-elapsed);
+    return be_wait(fence,timeout==UINT64_MAX?timeout:elapsed>=timeout?0:timeout-elapsed);
 }
 void nvn_queue_wait_sync(queue_t *q,const sync_t *s) {
     nvn_cap_queue(q->serial,1);
@@ -413,6 +418,6 @@ void nvn_queue_wait_sync(queue_t *q,const sync_t *s) {
 }
 void nvn_queue_finish(queue_t *q) { sync_t s={0}; nvn_queue_fence(q,&s); nvn_sync_wait(&s,UINT64_MAX); nvn_sync_release(&s);
     pthread_mutex_lock(&nq_mu); nq_queue *p=nq_get(q); uint64_t present=p->present, copy=p->copy; pthread_mutex_unlock(&nq_mu);
-    if(present || copy) mtl_present_wait_texture(present,copy);   // a snapshot present: its copy has run, not the screen (the display link would pace a game that finishes every frame)
+    if(present || copy) be_present_wait_texture(present,copy);   // a snapshot present: its copy has run, not the screen (the display link would pace a game that finishes every frame)
 }
 void nvn_queue_forget(queue_t *q) { nvn_queue_finish(q); pthread_mutex_lock(&nq_mu); nq_queue **p=&nq_queues; while(*p && (*p)->serial!=q->serial) p=&(*p)->next; if(*p) { nq_queue *old=*p; *p=old->next; nq_put(old->tail); free(old); } pthread_mutex_unlock(&nq_mu); }

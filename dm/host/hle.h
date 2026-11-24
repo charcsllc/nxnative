@@ -27,10 +27,18 @@ static inline int dm_control_read(off_t off, void *out, size_t len, char *path_o
     return r == (ssize_t)len ? 0 : (fd < 0 ? -1 : -2);
 }
 typedef struct { const char *name; void *fn; } hle_ent;
+// Linkage of the entries' C functions: static on native builds (Apple arm64), as always. Elsewhere external, so that the host-call thunks of the x86-64 execution engine,
+// generated from these entries at build time (dm/host/tools/gen_hle_thunks.py writes gen/hle_thunks.c), can call them; their C names then share one namespace and
+// the generator stops on a duplicate
+#if DM_NATIVE_EXEC
+#define HLE_LINKAGE static
+#else
+#define HLE_LINKAGE
+#endif
 #define HLE(mangled, ret, cname, ...)                                                             \
-    static ret cname(__VA_ARGS__);                                                                \
+    HLE_LINKAGE ret cname(__VA_ARGS__);                                                           \
     DM_REGISTER("swhle", hle_ent, hle_ent_##cname, {mangled, (void *)cname}); \
-    static ret cname(__VA_ARGS__)
+    HLE_LINKAGE ret cname(__VA_ARGS__)
 
 typedef uint32_t Result;   // nn::Result: w0, 0 = success
 #define RES_OK 0u
@@ -72,6 +80,7 @@ typedef struct { const char *name; void *fn; const char *why; const char *to; } 
 #define HLE_STR(x) HLE_STR_(x)
 #define HLE_STR_(x) #x
 // Past 8 parameters the stub enters at dm_bigstack_enter_n with x17 = the bytes of stack arguments the caller passes: 8 per parameter past the eighth, rounded up to 16 (hle_bigstack.c copies them to the host stack)
+#if DM_NATIVE_EXEC
 #define HLE_FORCE(mangled, why, ret, cname, ...)                                                   \
     _Static_assert(HLE_NARG(__VA_ARGS__) <= 16, #cname ": more parameters than the big-stack entry carries over (hle.h)"); \
     static ret cname(__VA_ARGS__) __attribute__((used));                                          \
@@ -82,13 +91,22 @@ typedef struct { const char *name; void *fn; const char *why; const char *to; } 
             "    b _dm_bigstack_enter_n\n.else\n    b _dm_bigstack_enter\n.endif\n");           \
     DM_REGISTER("swforce", hle_force_ent, hle_force_##cname, {mangled, (void *)(uintptr_t)cname##_bs, why}); \
     static ret cname(__VA_ARGS__)
+#else
+// Without native execution the implementation is registered directly: the x86-64 engine calls host code on the host thread's own stack, not on the guest's, so
+// there is no stack to switch. The parameter limit stays, so an entry written here still builds for Apple
+#define HLE_FORCE(mangled, why, ret, cname, ...)                                                   \
+    _Static_assert(HLE_NARG(__VA_ARGS__) <= 16, #cname ": more parameters than the big-stack entry carries over (hle.h)"); \
+    HLE_LINKAGE ret cname(__VA_ARGS__);                                                           \
+    DM_REGISTER("swforce", hle_force_ent, hle_force_##cname, {mangled, (void *)cname, why}); \
+    HLE_LINKAGE ret cname(__VA_ARGS__)
+#endif
 // Same as above, but the implementation runs on the caller's stack. Only for a take-over that runs the game's own code (an NRO's init and fini, a JIT plugin): that code's stack
 // use is the game's, sized for the thread's own stack (which can be larger than the 512 KB host stack), and it may switch stacks itself (a coroutine), which would reuse the
 // host stack the take-over is on. A short call into the SDK (fs::IsMounted, the audio renderer's command generation) is no reason. Say why beside it
 #define HLE_FORCE_DIRECT(mangled, why, ret, cname, ...)                                            \
-    static ret cname(__VA_ARGS__);                                                                \
+    HLE_LINKAGE ret cname(__VA_ARGS__);                                                           \
     DM_REGISTER("swforce", hle_force_ent, hle_force_##cname, {mangled, (void *)cname, why}); \
-    static ret cname(__VA_ARGS__)
+    HLE_LINKAGE ret cname(__VA_ARGS__)
 // A guest alias: every reference to mangled binds to the loaded modules' own definition of target instead, as if the module had imported target. No host code runs and no
 // signature is restated, so the alias holds for every SDK that defines both. For a hardware class whose constructor the host takes over to build the SDK's software class in the
 // same memory: its members, called directly rather than through the vtable, go to the software class's members of the same signature (hle_codec.c). A target no loaded module
@@ -97,6 +115,7 @@ typedef struct { const char *name; void *fn; const char *why; const char *to; } 
 #define HLE_FORCE_ALIAS_(mangled, target, why, n) HLE_FORCE_ALIAS__(mangled, target, why, n)
 #define HLE_FORCE_ALIAS__(mangled, target, why, n) \
     DM_REGISTER("swforce", hle_force_ent, hle_force_alias_##n, {mangled, NULL, why, target})
+#if DM_NATIVE_EXEC
 // Programs that do not link hle_bigstack.c (unit tests, whose stacks are host stacks) get this pass-through: the implementation runs on the caller's stack, as dm.h's weak dm_log
 // writes there. The host's entry (hle_bigstack.c) replaces it at link time
 __attribute__((weak, naked, visibility("hidden"))) void dm_bigstack_enter(void) { __asm__ volatile("br x16"); }
@@ -105,6 +124,10 @@ __attribute__((weak, naked, visibility("hidden"))) void dm_bigstack_enter_n(void
 // same programs as above
 void *dm_bigstack_caller(void *ra);
 __attribute__((weak, visibility("hidden"))) void *dm_bigstack_caller(void *ra) { return ra; }
+#else
+// No stack switch without native execution (HLE_FORCE above): the return address is the game's call site
+static inline void *dm_bigstack_caller(void *ra) { return ra; }
+#endif
 
 // Host service sessions (hle_sf.c): a request on a session the host serves, as its service sees it, and the answer it fills in. The input is the raw CMIF data after the "SFCI"
 // header; the buffers are the client's A (send), B (receive) and X (pointer) descriptors, read and written in place (one address space); the output is the raw data after "SFCO",

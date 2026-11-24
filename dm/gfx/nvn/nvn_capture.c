@@ -2,8 +2,12 @@
 #include "nvn_capture.h"
 #include <stdlib.h>
 #include <string.h>
-#include <compression.h>
+#if defined(__APPLE__)
+#include <compression.h>   // LZFSE (libcompression); elsewhere chunks are written raw and an LZFSE chunk is not read (a capture made on a Mac replays there)
+#endif
+#if defined(__APPLE__)
 __asm__(".linker_option \"-lcompression\"");   // libcompression (LZFSE) links itself: the host, the iOS app and the tests that compile this file need no link flag
+#endif
 
 // The walk below names every pointer field of every payload by its offset. A change to a payload struct in nvn_obj.h must come here too: these asserts stop the build
 // instead of letting a capture carry a host pointer or relocate the wrong bytes. The numbers are the layout the walk was written against.
@@ -188,10 +192,17 @@ void cap_put(cap_writer *w, uint32_t tag, uint32_t submit, const void *data, uin
     if (!w->f) return;
     cap_chunk c = {tag, CAP_RAW, n, n, submit, 0};
     uint8_t *z = NULL;
+#if !defined(__APPLE__)
+    compress = 0;
+#endif
     if (compress && n >= 256) {
         size_t cap = (size_t)n + n / 16 + 4096;
         if ((z = malloc(cap))) {
+#if defined(__APPLE__)
             size_t zn = compression_encode_buffer(z, cap, data, (size_t)n, NULL, COMPRESSION_LZFSE);
+#else
+            size_t zn = 0; (void)cap;
+#endif
             if (zn && zn < n) { c.codec = CAP_LZFSE; c.stored = zn; } else { free(z); z = NULL; }
         }
     }
@@ -222,7 +233,11 @@ int cap_next(cap_reader *r, cap_chunk *c, uint8_t **data) {
     if (c->tag == CAP_END_) return 0;
     uint8_t *d = malloc(c->raw ? (size_t)c->raw : 1); if (!d) return -1;
     if (c->codec == CAP_RAW) { if (c->stored != c->raw) { free(d); return -1; } memcpy(d, r->buf + r->pos, (size_t)c->raw); }
+#if defined(__APPLE__)
     else if (c->codec == CAP_LZFSE) { if (compression_decode_buffer(d, (size_t)c->raw, r->buf + r->pos, (size_t)c->stored, NULL, COMPRESSION_LZFSE) != c->raw) { free(d); return -1; } }
+#else
+    else if (c->codec == CAP_LZFSE) { fprintf(stderr, "[dm] [RED] capture: an LZFSE chunk (libcompression, Apple's) cannot be read on this platform\n"); free(d); return -1; }
+#endif
     else { free(d); return -1; }
     r->pos += c->stored; *data = d; return 1;
 }

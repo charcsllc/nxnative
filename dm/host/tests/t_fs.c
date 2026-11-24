@@ -12,25 +12,38 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/types.h>
+#if !defined(_WIN32)
 #include <sys/wait.h>
+#endif
 #include <signal.h>
-#include <sys/clonefile.h>                // declared before the define, so only hle_fs.c's calls go to the fake
+#include "../plat/plat.h"   // declared before the define, so only hle_fs.c's calls go to the fake
 static ssize_t fake_pwrite(int fd, const void *buf, size_t n, off_t off);
-static int fake_clonefile(const char *src, const char *dst, uint32_t flags);
+static int fake_clone_tree(const char *src, const char *dst);   // hle_fs.c clones through the platform layer (plat_clone_tree: clonefile on Apple)
 #define pwrite fake_pwrite
-#define clonefile fake_clonefile
+#define plat_clone_tree fake_clone_tree
 #include "../hle_fs.c"
 #undef pwrite
-#undef clonefile
+#undef plat_clone_tree
 ssize_t pwrite(int, const void *, size_t, off_t);
 static int g_clone_enotsup;                   // 1: clonefile fails as on HFS+ and exFAT (ENOTSUP), checked on disk images of both
-static int fake_clonefile(const char *src, const char *dst, uint32_t flags) {
+static int fake_clone_tree(const char *src, const char *dst) {
     if (g_clone_enotsup) { errno = ENOTSUP; return -1; }
-    return clonefile(src, dst, flags);
+    return plat_clone_tree(src, dst);
 }
 
 struct dm_flags g_flag; uint64_t g_t0_ns; uint64_t now_ns(void) { return 0; }   // stubs for log timestamps and the read path (not used by the write path)
 void dm_guest_write_prepare(void *a, size_t n) { (void)a; (void)n; }
+// A second name for a file: a hard link on POSIX; a copy on Windows, whose C runtime has no link()
+static int stage_file(const char *from, const char *to) {
+#if defined(_WIN32)
+    FILE *a = fopen(from, "rb"), *b = a ? fopen(to, "wb") : NULL; char buf[4096]; size_t k; int ok = a && b;
+    while (ok && (k = fread(buf, 1, sizeof buf, a)) > 0) ok = fwrite(buf, 1, k, b) == k;
+    if (a) fclose(a); if (b && fclose(b)) ok = 0;
+    return ok ? 0 : -1;
+#else
+    return link(from, to);
+#endif
+}
 extern int g_nfail, g_lasterr;                                        // front-end notification count (the strong implementation in t_fs_stub.c replaces the weak one in hle_fs.c)
 static int g_mode, g_calls;                   // 0 write normally; 1 always return 0; 2 write only 3 bytes the first time
 static ssize_t fake_pwrite(int fd, const void *buf, size_t n, off_t off) {
@@ -217,18 +230,21 @@ int main(void) {
     CHECK(h_fs_OpenFile(&rh, "rom:/data/base", MODE_READ) == RES_OK && rh && !(rh & 15), "a folder file's handle is 16-byte aligned, as a Horizon FileAccessor pointer is (%#llx)", (unsigned long long)rh); h_fs_CloseFile(rh);
     g_nmnt = 0;
     unsetenv("DM_ROMFS_OVERLAY");
+#if !defined(_WIN32)   // a child process and a fifo: POSIX only (Windows has neither fork nor mkfifo; the check runs on Linux and Apple)
     {   // game files that are neither a folder nor a file (a stale path, a fifo) stop the rom mount with a FATAL line, in a child so the abort does not end this test
         char gone[1200], fifo[1200], out[1200]; snprintf(gone, sizeof gone, "%s/RomFS", root); snprintf(fifo, sizeof fifo, "%s/fifo", root); snprintf(out, sizeof out, "%s/fatal.txt", root);
         mkfifo(fifo, 0644);
         const char *paths[2] = {gone, fifo};
         for (int i = 0; i < 2; i++) {
             fflush(NULL); pid_t pid = fork();
-            if (!pid) { freopen(out, "w", stderr); setenv("DM_ROMFS", paths[i], 1); h_fs_MountRom("rom", NULL, 0); _exit(0); }
+            // stderr unbuffered again, as the host's is: glibc's freopen leaves it fully buffered and abort() flushes nothing, so the FATAL line would be lost
+            if (!pid) { freopen(out, "w", stderr); setvbuf(stderr, NULL, _IONBF, 0); setenv("DM_ROMFS", paths[i], 1); h_fs_MountRom("rom", NULL, 0); _exit(0); }
             int st = 0; waitpid(pid, &st, 0);
             char line[512] = {0}; FILE *f = fopen(out, "r"); if (f) { fread(line, 1, sizeof line - 1, f); fclose(f); }
             CHECK(WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT && strstr(line, "FATAL the game files") && strstr(line, paths[i]), "%s game files stop the rom mount", i ? "a fifo as the" : "missing");
         }
     }
+#endif
 
     printf("RomFS image\n");   // written by hand in romfs_image.py's layout: /data/a = "hello", /data/b empty directory, /data/c = "xy"
     {   uint8_t img[32 + 7 + 5 * 24 + 7] = {0}; uint64_t hd[3] = {39, 5 * 24 + 7, 5};
@@ -276,11 +292,11 @@ int main(void) {
             memcpy(img + 32, "HELLO", 5); snprintf(fn, sizeof fn, "%s/0.img", pd); f = fopen(fn, "wb"); fwrite(img, 1, sizeof img, f); fclose(f); memcpy(img + 32, "hello", 5);
             CHECK(h_fs_MountRomIdx("content", 0, NULL, 0) == RES_OK && read_fs("content:/data/a", got, sizeof got) && !strcmp(got, "HELLO"), "MountRom with a program index mounts that program's image (got %s)", got);
             CHECK(h_fs_MountRomIdx("own", 1, NULL, 0) == RES_OK && read_fs("own:/data/a", got, sizeof got) && !strcmp(got, "hello"), "an index with no image mounts this program's own RomFS (got %s)", got);
-            snprintf(fn, sizeof fn, "%s/0.img", pd2); CHECK(!link(ip, fn), "stage a program image elsewhere"); setenv("DM_ROMFS_PROGRAMS", pd2, 1);
+            snprintf(fn, sizeof fn, "%s/0.img", pd2); CHECK(!stage_file(ip, fn), "stage a program image elsewhere"); setenv("DM_ROMFS_PROGRAMS", pd2, 1);
             CHECK(h_fs_MountRomIdx("content2", 0, NULL, 0) == RES_OK && read_fs("content2:/data/a", got, sizeof got) && !strcmp(got, "hello"), "DM_ROMFS_PROGRAMS names the folder (the iOS app's, when its RomFS is in Documents)");
             unsetenv("DM_ROMFS_PROGRAMS"); g_nmnt = 0;
         }
-        snprintf(fn, sizeof fn, "%s/2.img", root); CHECK(!link(ip, fn), "stage a DLC image"); setenv("DM_AOC_DIR", root, 1);
+        snprintf(fn, sizeof fn, "%s/2.img", root); CHECK(!stage_file(ip, fn), "stage a DLC image"); setenv("DM_AOC_DIR", root, 1);
         size_t cache = 0;
         CHECK(h_fs_QueryAocCache(&cache, 2) == RES_OK && cache == 176, "DLC image reports Horizon table size (176, got %zu)", cache);
         CHECK(h_fs_MountAoc("aoc", 2, NULL, 0) == RES_OK && read_fs("aoc:/data/a", got, sizeof got) && !strcmp(got, "hello"), "DLC mounts and reads directly from its image");
@@ -434,6 +450,7 @@ int main(void) {
         snprintf(p, sizeof p, "%s/a", save); CHECK(same(p, "ok3"), "committed a is still ok3");
         g_clone_enotsup = 0; g_nmnt = 0;
         CHECK(h_fs_MountSave("save", NULL) == RES_OK && !g_mnt[0].ro, "with cloning back, the save mounts writable");
+#if !defined(_WIN32)   // symlinks: Windows' C runtime has no symlink(), and making one there takes a privilege; rm_tree over a reparse point is not checked there (open)
         char victim[1100], vf[1200], lnk[1200];
         snprintf(victim, sizeof victim, "%s/victim", root); mkdir(victim, 0755); snprintf(vf, sizeof vf, "%s/keep", victim); put(vf, "keep");
         CHECK(h_fs_CreateDirectory("save:/d") == RES_OK, "create save:/d");
@@ -443,6 +460,7 @@ int main(void) {
         CHECK(h_fs_CleanDirRec("save:/d") == RES_OK && access(lnk, F_OK) && same(vf, "keep"), "CleanDirectoryRecursively removes the symlink, not its target's files");
         snprintf(lnk, sizeof lnk, "%s/lnk2", root); symlink(victim, lnk); errno = 0;
         CHECK(rm_tree(lnk) == -1 && errno == ENOTDIR && same(vf, "keep"), "rm_tree of a symlink to a directory refuses it (ENOTDIR) and leaves the target alone");
+#endif
     }
 
     {   // Unmount follows who holds the mount: the host's table is permanent, the SDK's entry is released in the SDK, so the name can be mounted again

@@ -12,7 +12,6 @@
 // UE_FIXED_RATE_PTR / _FIELD / _FLAG): DRAGON BALL: Sparking! ZERO's battles and Pikmin 4. It is written only while the object's bUseFixedFrameRate is set (_FLAG), so an engine stepping by
 // the time that passed is left as it is
 #include "hle.h"
-#include <mach/mach.h>
 
 // What a field holds: the frame rate as a float, double or int32, vsyncs per frame (60 / frame rate) as an int32, or the frame time in milliseconds as a float. Copies: consecutive copies of the
 // value (Unreal keeps one for the game thread, one for the render thread). A row with no pointer (ptr_off 0) has its field at main + field: a constant in main's read-only data, which the loader
@@ -50,7 +49,7 @@ static const lock_t k_locks[] = {
 #define NLOCKS ((int)(sizeof k_locks / sizeof k_locks[0]))
 #define MAX_LOCKS (NLOCKS + 8)   // target, Monolith, four Unreal rows, Unity targetFrameRate, Frostbite frame regulator
 
-static int rd(uint64_t a, void *out, size_t n) { vm_size_t got = 0; return a >= 0x1000 && vm_read_overwrite(mach_task_self(), (vm_address_t)a, n, (vm_address_t)out, &got) == KERN_SUCCESS && got == n; }
+static int rd(uint64_t a, void *out, size_t n) { size_t got = 0; return a >= 0x1000 && !plat_mem_read(a, out, n, &got) && got == n; }
 
 // NieR 1.0.3 exposes its preset minimum but ships fixed mode-specific fallbacks.
 // Keep the native current-scale and UV controller intact; only select its

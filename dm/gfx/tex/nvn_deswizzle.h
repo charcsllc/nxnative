@@ -26,6 +26,14 @@ int nvn_deswizzle_from(const nvn_texdesc *d, unsigned level, unsigned layer, con
 // descriptor word 2 bit 24 use that flag, independently of IMAGE. TextureInitialize captures the owning device's choice in the descriptor; every texture reader and writer uses it.
 static inline int nvn_gob_order(const nvn_texdesc *d) { return d->gob_order; }
 uint64_t nvn_bl_offset(uint32_t x, uint32_t y, uint32_t z, uint32_t row_bytes, uint32_t rows, unsigned tileH, unsigned tileD, int switch2);
+// The same address for the bytes of one block row of one slice, with the row's terms computed once (nvn_bl_row_of) and each byte's by shifts and a table
+// (nvn_bl_row_at): nvn_bl_row_at(&r, x) == nvn_bl_offset(x, y, z, row_bytes, rows, tileH, tileD, switch2) for r = nvn_bl_row_of(y, z, row_bytes, rows, tileH, tileD, switch2). For a
+// writer that addresses a region row by row (WriteTexels), where nvn_bl_offset's divisions by the block height for every 16-byte run cost more than the copy
+typedef struct { uint64_t row, block; const uint16_t *kox; } nvn_bl_row;   // kox: a 16-byte piece's offset in its GOB by x%64/16, in the texture's GOB order
+nvn_bl_row nvn_bl_row_of(uint32_t y, uint32_t z, uint32_t row_bytes, uint32_t rows, unsigned tileH, unsigned tileD, int switch2);
+static inline uint64_t nvn_bl_row_at(const nvn_bl_row *r, uint32_t x) {
+    return r->row + (uint64_t)(x >> 6) * r->block + r->kox[(x >> 4) & 3] + (x & 15);
+}
 
 int nvn_deswizzle_geom(const nvn_texdesc *d, unsigned level, unsigned layer,
                        uint32_t *row_bytes, uint32_t *rows, uint32_t *slices,

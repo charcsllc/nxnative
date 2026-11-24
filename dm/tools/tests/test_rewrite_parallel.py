@@ -27,13 +27,16 @@ def wait_until(test):
     return False
 
 
-def pool_helper():
-    """patch_nso is a command-line program: its real pool helper and process signal handler, extracted as the spin tests extract its analysis."""
+def pool_helper(windows=False):
+    """patch_nso is a command-line program: its real pool helper, the FORK line it reads and the process signal handler, extracted as the spin tests extract its analysis.
+    windows: the helper sees what Windows' Python has, no fork start method and no signal.pthread_sigmask"""
     tree = ast.parse(SOURCE.read_text())
     body: list[ast.stmt] = [n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == 'in_parallel'
+            or isinstance(n, ast.Assign) and any(isinstance(t, ast.Name) and t.id == 'FORK' for t in n.targets)
             or isinstance(n, ast.Expr) and isinstance(n.value, ast.Call) and isinstance(n.value.func, ast.Attribute)
             and isinstance(n.value.func.value, ast.Name) and n.value.func.value.id == 'signal' and n.value.func.attr == 'signal']
-    return 'import multiprocessing, os, signal, sys, time\nfrom pathlib import Path\nWORKERS = 2\n' + ast.unparse(ast.Module(body=body, type_ignores=[])) + '\n'
+    limits = "multiprocessing.get_all_start_methods = lambda: ['spawn']\ndel signal.pthread_sigmask\n" if windows else ''
+    return 'import multiprocessing, os, signal, sys, time\nfrom pathlib import Path\nWORKERS = 2\n' + limits + ast.unparse(ast.Module(body=body, type_ignores=[])) + '\n'
 
 
 class RewriteWorkers(unittest.TestCase):
@@ -45,6 +48,18 @@ class RewriteWorkers(unittest.TestCase):
                 self.assertNotEqual(r.returncode, 0)
                 self.assertIn('[RED] DM_REWRITE_J must be a positive integer', r.stderr)
                 self.assertNotIn('Traceback', r.stderr)
+
+    def test_without_fork_the_jobs_run_in_the_rewriter(self):
+        # Windows: no fork and no pthread_sigmask (a rewrite stopped there with AttributeError on signal.pthread_sigmask); the jobs run in this process, in order
+        script = pool_helper(windows=True) + '''
+import json
+def job(n): return n, os.getpid()
+print(json.dumps({'results': in_parallel(job, [(0,), (1,), (2,)]), 'pid': os.getpid()}))
+'''
+        r = subprocess.run([sys.executable, '-c', script], capture_output=True, text=True, timeout=30)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        got = json.loads(r.stdout)
+        self.assertEqual(got['results'], [[n, got['pid']] for n in range(3)])
 
     def test_sigterm_reaps_the_active_pool(self):
         with tempfile.TemporaryDirectory() as tmp:

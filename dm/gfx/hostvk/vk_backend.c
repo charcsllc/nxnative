@@ -1,0 +1,826 @@
+// The Vulkan backend's entry points (docs/design/vulkan-backend.md 1.5, phase P3): every function of dm/gfx/nvn/nvn_be.h and nvn_be_ext.h for the hosts without Metal, the hooks
+// the frontend's state, handle and pool code calls in its backend (nvn_state.h, nvn_resolve.h, nvn_pools.h), and be_get_caps / be_guest_map / be_guest_unmap of design 1.5.
+// The device comes up on the first call that needs it (as the Metal backend's mtl_init), through hostvk_init: DM_VK_DEVICE=<index> picks the physical device (design 10 item 4),
+// DM_VK_VALIDATION=1 turns the Khronos validation layer on with synchronization validation (design 10 item 7), DM_VK_LEVEL=A|B|C|D makes the device as one of that level of design
+// 3.6 would be (for tests and measurements of levels C and D on one machine; phase P5), DM_VK_MAX_ALLOCATIONS=<n> keeps the backend under n live device memory allocations
+// instead of the device's maxMemoryAllocationCount (a test switch, so lavapipe stands for a driver with a low limit; step D2, vk_alloc.h). With a Vulkan window registered by
+// the host program (vk_present.h), the device is made with VK_KHR_swapchain and frames go to the window presenter (vk_present.c, step P4a); otherwise, or with
+// DM_VK_HEADLESS=1, to the headless presenter below.
+// Fallback: when no Vulkan device meets the baseline (no loader, no driver, a device below design 9.1), every function takes the null backend's form instead (dm/gfx/nvn/nvn_null.c:
+// one [RED] line per function on its first call, a GPU that has finished everything, events and syncs written at once, the pool table kept), so a host without Vulkan still runs
+// its CPU side. The two forms live in this one library: a host binary links exactly one backend (dm/host/CMakeLists.txt: nxhost links hostvk; nvn_null.c stays the backend of the
+// CMake targets that do not link hostvk, t_frontend).
+// Declared here, with a red line and the phase that brings them: be_report's statistics lines (the per-frame statistics answer zero or what the backend counts). The DM_CTL
+// diagnostics: "shot" here (dm_gfx_shot_at, the headless presenter's next frame), the texture and pass dumps in vk_dump.c. Presentation and the vsync source: vk_present.c in a
+// window (step P4a), the headless presenter below without one.
+#include "plat/plat.h"
+#include "vk_backend.h"
+#include "vk_pso.h"
+#include "guest_vk.h"
+#include "vk_present.h"
+#include "../nvn/nvn_be.h"
+#include "../nvn/nvn_pools.h"
+#include "../nvn/nvn_replay.h"
+#include "../nvn/nvn_resolve.h"
+#include "../nvn/nvn_state.h"
+#include "../nvn/nvn_tex.h"
+#include <pthread.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+hvk_t hvk = {.mu = PTHREAD_MUTEX_INITIALIZER, .tex_mu = PTHREAD_MUTEX_INITIALIZER, .queue_mu = PTHREAD_MUTEX_INITIALIZER};
+
+// The other files' entry points (their headers stay internal to their concern)
+void hvk_pool_add(const void *mem, uint64_t size, uint32_t nvn_flags);
+void hvk_pool_del(const void *mem);
+void hvk_pool_hook_use(nvn_pool *p);
+void hvk_pool_hook_del(nvn_pool *p);
+int hvk_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off);
+void hvk_guest_unmap(void *mem, uint64_t size);
+void hvk_tex_init(const tex_t *t);
+void hvk_tex_release(tex_t *t);
+void hvk_tex_cpu_written(const tex_t *t);
+int hvk_tex_gpu_owned(uint64_t serial);
+void hvk_reg_tex(int tid, const tex_t *t, const view_t *v, int image);
+void hvk_reg_samp(int sid, const samp_par *p);
+void hvk_sub_begin(void);
+uint64_t hvk_sub_commit(void);
+uint64_t hvk_last(void);
+int hvk_wait(uint64_t fence, uint64_t timeout_ns);
+void hvk_finish(void);
+void hvk_draw(const p_draw *dw, const p_draw_idx *di, const uint8_t *rec, uint32_t size);
+void hvk_dispatch(const p_dispatch *dp);
+void hvk_clear_color(const p_clear_color *c);
+void hvk_clear_ds(const p_clear_ds *c);
+void hvk_clear_tex(const p_clear_tex *c);
+void hvk_copy_b2b(uint64_t src, uint64_t dst, uint64_t n);
+void hvk_update_ub(const void *data, uint64_t dst, uint64_t n);
+void hvk_fill(uint64_t dst, uint64_t n, uint32_t value);
+void hvk_copy_b2t(const p_copy_b2t *c, uint32_t size, int to_buffer);
+void hvk_copy_t2t(const p_copy_t2t *c);
+void hvk_barrier(int32_t bits);
+void hvk_signal_event(volatile uint32_t *val, uint32_t mode, uint32_t v);
+void hvk_set_rt(const p_set_rt *r);
+void hvk_report_counter(uint64_t type, uint64_t addr);
+void hvk_reset_counter(uint64_t type);
+void hvk_render_cond(const p_render_cond *rc);
+void hvk_tf_state(const p_tf_state *b);
+void hvk_tf_bind_note(void);
+
+// ---------- Bring-up and shutdown ----------
+static pthread_once_t g_once = PTHREAD_ONCE_INIT;
+static char g_why[1024];   // why the device is not up (for the null forms' red line)
+static int g_require_status;   // hvk_require_device: the exit status when no device comes up, 0 for the null forms
+void hvk_require_device(int status) { g_require_status = status; }
+static _Atomic int g_tried;   // the bring-up ran (a function that needs the device was called)
+static void up_once(void) {
+    atomic_store(&g_tried, 1);
+    hostvk_opts o = {-1, 0, 0};
+    const char *e = getenv("DM_VK_DEVICE");
+    if (e && *e) { char *end; long v = strtol(e, &end, 10); if (*end || v < 0) hostvk_log("[RED] [hostvk] DM_VK_DEVICE=%s is not a device index: the first device that meets the baseline is used", e); else o.device_index = (int)v; }
+    e = getenv("DM_VK_VALIDATION");
+    o.validation = e && *e && strcmp(e, "0") != 0;
+    e = getenv("DM_VK_LEVEL");
+    if (e && *e) { if ((e[0] >= 'A' && e[0] <= 'D') && !e[1]) o.force_level = e[0]; else hostvk_log("[RED] [hostvk] DM_VK_LEVEL=%s is not A, B, C or D: the device's level is used", e); }
+    e = getenv("DM_VK_MAX_ALLOCATIONS");
+    if (e && *e) {
+        char *end; unsigned long v = strtoul(e, &end, 10);
+        if (*end || !v || v > UINT32_MAX) hostvk_log("[RED] [hostvk] DM_VK_MAX_ALLOCATIONS=%s is not a count from 1: the device's maxMemoryAllocationCount is used", e);
+        else o.max_allocations = (uint32_t)v;
+    }
+    o.want_surface = hvk_win_wanted();   // a Vulkan window: VK_KHR_swapchain and the surface's instance extensions (vk_present.c makes the surface at the first present)
+    int rc = hostvk_init(&o, &hvk.dev, g_why, sizeof g_why);
+    if (rc && o.want_surface) {   // a device without what a window needs (VK_KHR_swapchain, the surface's instance extensions): headless rather than none
+        hostvk_log("[RED] [hostvk] no Vulkan device with a window's needs (%s): the device is made again without them, and frames go to the headless presenter", g_why);
+        o.want_surface = 0;
+        rc = hostvk_init(&o, &hvk.dev, g_why, sizeof g_why);
+    }
+    if (rc && g_require_status) {   // the game program's path (hvk_require_device): nothing would be drawn, so the game stops here, with the reason and what to install
+        hostvk_log("[RED] [hostvk] no Vulkan device for the game (%s): it needs a GPU driver with Vulkan 1.3 and the Vulkan loader (libvulkan.so.1, the package libvulkan1 on Ubuntu "
+                   "and Debian; vulkan-1.dll on Windows, which the GPU driver installs); nxhost-run exits with status %d", g_why, g_require_status);
+        fflush(NULL);
+        _Exit(g_require_status);   // as aot.h's other start refusals: no exit handlers under the start's other threads
+    }
+    if (rc) { hostvk_log("[RED] [hostvk] no Vulkan device for the NVN backend (%s): the null backend's forms answer, nothing is drawn", g_why); return; }
+    hvk_win_device_up(o.want_surface);
+    hvk.d = hvk.dev.device; hvk.lim = hvk.dev.props.limits;
+    hvk_alloc_init();   // the device memory allocator of decision D2 (vk_alloc.c): its block sizes, logged
+    if (!hvk.dev.caps.buffer_device_address) hostvk_log("[RED] [hostvk] the device has no buffer device address: counter reports and conditional rendering are not written by the GPU");
+    if (!hvk_commands_init()) { hostvk_log("[RED] [hostvk] the command layer could not be made: the null backend's forms answer"); hvk_alloc_shutdown(); hostvk_destroy(&hvk.dev); hvk.d = VK_NULL_HANDLE; return; }
+    hvk.on = 1;
+    hvk_cache_init(); hvk_pso_init();   // the pipeline cache on disk is read now; the prewarm starts at the first submission (vk_prewarm.c)
+    hostvk_log("[hostvk] NVN backend on Vulkan: library %s%s", hvk_shader_dir(), o.validation ? ", validation on (DM_VK_VALIDATION)" : "");
+}
+int hvk_up(void) { pthread_once(&g_once, up_once); return hvk.on; }
+// For tests and tools (dm/gfx/tests/vk): the device the backend runs on (its validation counters), NULL when it is not up; and a full shutdown, after which nothing may be called
+const hostvk_dev *hvk_device(void);
+const hostvk_dev *hvk_device(void) { return hvk_up() ? &hvk.dev : NULL; }
+void hvk_shutdown(void);
+static void pres_shutdown(void);
+void hvk_shutdown(void) {
+    if (!hvk.on) return;
+    hvk_win_shutdown();   // the window presenter's threads stopped, its swapchain, snapshots and surface released (step P4a)
+    pres_shutdown();   // the headless presenter's copies finished, its objects released (external producers, step P9a)
+    hvk_commands_shutdown();
+    hvk_pso_shutdown(); hvk_prewarm_shutdown(); hvk_cache_shutdown();   // the workers stopped, every pipeline released, the cache written a last time
+    hvk_pipeline_shutdown(); hvk_shader_shutdown(); hvk_tex_shutdown(); hvk_mem_shutdown();
+    hostvk_destroy(&hvk.dev); hvk.d = VK_NULL_HANDLE; hvk.on = 0;
+}
+
+// ---------- The null forms (nvn_null.c's, for a host without a device) ----------
+static void null_reached(_Atomic int *once, const char *fn) {
+    if (atomic_exchange(once, 1)) return;
+    fprintf(stderr, "[dm] [RED] null graphics backend (no Vulkan device: %s): %s called, and no GPU work is done for it\n", g_why[0] ? g_why : "not brought up", fn);
+}
+#define NULLRED() do { static _Atomic int once_; null_reached(&once_, __func__); } while (0)
+static _Atomic uint64_t g_null_fence;
+
+// ---------- Device ----------
+void be_init(void) { if (!hvk_up()) NULLRED(); }
+const be_caps *be_get_caps(void) {
+    static be_caps c; static int made;
+    if (!made && hvk_up()) {
+        const hostvk_caps *h = &hvk.dev.caps;
+        c.unified_memory = h->unified_memory; c.gpl = h->gpl; c.eds3_blend = h->eds3_blend; c.eds3_raster = h->eds3_raster; c.vertex_input_dynamic = h->vertex_input_dynamic;
+        c.cond_render = h->cond_render; c.xfb = h->xfb; c.geometry = h->geometry; c.tessellation = h->tessellation; c.astc_ldr = h->astc_ldr; c.logic_op = h->logic_op;
+        c.max_samples = h->max_samples; c.max_point_size = h->max_point_size; c.max_vertex_attribs = h->max_vertex_attribs;
+        made = 1;
+    }
+    if (!hvk.on) NULLRED();   // no device: every capability 0
+    return &c;
+}
+
+// ---------- Memory pools ----------
+static pthread_mutex_t g_null_mu = PTHREAD_MUTEX_INITIALIZER;   // the pool table's lock in the null form
+void be_pool_add(const void *mem, uint64_t size, uint32_t nvn_flags) {
+    if (hvk_up()) { hvk_pool_add(mem, size, nvn_flags); return; }
+    NULLRED(); pthread_mutex_lock(&g_null_mu); nvn_pool_add(mem, size, nvn_flags, (uintptr_t)mem, NULL, (uint64_t)(uintptr_t)mem); pthread_mutex_unlock(&g_null_mu);
+}
+void be_pool_del(const void *mem) {
+    if (hvk.on) { hvk_pool_del(mem); return; }
+    NULLRED(); pthread_mutex_lock(&g_null_mu); nvn_pool_del(mem); pthread_mutex_unlock(&g_null_mu);
+}
+// The runs of a sparse pool a request changed (hle_nvn.c vrun_set): removed and added as be_pool_del and be_pool_add do, one by one (the Metal backend changes its table in one
+// step; here a lookup between two of them misses the run, as with the separate calls the frontend made before)
+void be_pool_replace(const void *const *del, int ndel, const void *const *add, const uint64_t *size, int nadd, uint32_t nvn_flags) {
+    for (int i = 0; i < ndel; i++) be_pool_del(del[i]);
+    for (int i = 0; i < nadd; i++) be_pool_add(add[i], size[i], nvn_flags);
+}
+void be_pool_addressed(const void *mem, uint64_t size) { (void)mem; (void)size; }   // the Metal backend's raw global memory table (the pools a shader may reach by address): no such binding here
+void be_sparse_alias_delta(int delta) { (void)delta; }   // the Metal backend's residency of aliased sparse pools: the imports are resident
+void be_sp_phys_gone(const void *mem, uint64_t size) { (void)mem; (void)size; }   // the Metal backend's shared placement sparse tiles: none here
+void be_alias_drop_pool(const void *pool) { (void)pool; }   // the Metal backend's alias table (sparse views of a pool): the Vulkan imports have none to drop
+int be_addr(uint64_t addr, uint64_t len, void **buf, uint64_t *off) {
+    if (hvk.on) return hvk_addr(addr, len, buf, off);
+    NULLRED();
+    const nvn_pool_ref *c = nvn_pool_cached(addr, len);
+    if (c) { *buf = c->backend; *off = addr - c->base; return 1; }
+    int ok = 0; nvn_pool_ref r;
+    pthread_mutex_lock(&g_null_mu);
+    if (nvn_pool_lookup(addr, len, &r)) { *buf = r.backend; *off = addr - r.base; ok = 1; }
+    pthread_mutex_unlock(&g_null_mu);
+    return ok;
+}
+int be_addr_known(uint64_t addr, uint64_t len) { void *b; uint64_t o; return be_addr(addr, len, &b, &o); }   // the imports need no residency: be_addr's answer
+// Guest memory committed / about to be decommitted (design 1.5, 1.6; hle_svc.c's memory SVCs and the x86-64 engine's arena call them): the committed ranges are recorded from the
+// first call, device or not (a game sizes its heap before it makes an NVN device), for the imports pools share where the allocation count nears the device's limit (vk_memory.c,
+// step D2); a decommit under an import releases or moves it first. Before the device's bring-up was asked for (the host program's first guest memory SVCs) nothing is missing: the
+// null forms' red line is for a device that could not be made
+void be_guest_map(void *mem, uint64_t size) { hvk_region_map(mem, size, 1); if (!hvk.on && atomic_load(&g_tried)) NULLRED(); }
+void be_guest_unmap(void *mem, uint64_t size) {
+    if (hvk.on) { hvk_guest_unmap(mem, size); return; }
+    hvk_region_map(mem, size, 0);
+    if (atomic_load(&g_tried)) NULLRED();
+}
+void nvn_pool_hook_use(nvn_pool *p) { if (hvk.on) hvk_pool_hook_use(p); }   // nothing to make resident
+void nvn_pool_hook_del(nvn_pool *p) { if (hvk.on) hvk_pool_hook_del(p); }   // the import goes when the GPU is done with it
+
+// ---------- Object hooks ----------
+void be_tex_init(const tex_t *t) { if (hvk_up()) hvk_tex_init(t); else NULLRED(); }
+void be_tex_release(tex_t *t) { if (hvk.on) hvk_tex_release(t); else NULLRED(); }
+void be_tex_cpu_written(const tex_t *t) { if (hvk_up()) hvk_tex_cpu_written(t); else NULLRED(); }
+// The CPU wrote a registered texture's pages after its first use (hle_nvn.c nvn_ft_poll): as the Metal backend's texture without a storage view, one a submission wrote stays the
+// GPU's, any other is uploaded again (MTL_REWRITE_*)
+int be_tex_cpu_rewritten(const tex_t *t) {
+    if (!hvk.on) { NULLRED(); return MTL_REWRITE_UPLOADED; }
+    if (hvk_tex_gpu_owned(t->serial)) return MTL_REWRITE_GPU;
+    hvk_tex_cpu_written(t); return MTL_REWRITE_UPLOADED;
+}
+void be_tex_linear_cpu_written(const tex_t *t) { be_tex_cpu_written(t); }   // WriteTexels into a linear texture: uploaded again from its storage
+void be_tex_gpu_written(const tex_t *t) { (void)t; }   // recorded GPU writes: the backend sees them at replay (vk_texture.c ownership)
+// A texture or program a queued job still names after the game finalized it (nvn_queue.inc keeps its copy until the job replays): the Metal backend keeps its objects alive
+// for it; this backend keeps no pins, so a texture released before a parked job replays is made again from its storage at that replay, or missing (declared once)
+void be_tex_pin(uint64_t serial) { if (!serial) return; HVK_RED_ONCE("texture pins for queued jobs (nvn_queue.inc) are not kept by the Vulkan backend: a texture finalized before a parked job replays is not kept for it"); }
+void be_tex_unpin(uint64_t serial) { (void)serial; }
+int be_tex_gpu_owned(uint64_t serial) { if (hvk.on) return hvk_tex_gpu_owned(serial); NULLRED(); return 0; }
+void be_reg_tex(int tid, const tex_t *t, const view_t *v) { if (hvk_up()) hvk_reg_tex(tid, t, v, 0); else NULLRED(); }
+void be_reg_image(int tid, const tex_t *t, const view_t *v) {   // RegisterImage declares image use (the Metal backend's mtl_reg_image): the texture gets storage use when it is made
+    if (!hvk_up()) { NULLRED(); return; }
+    if (!t) { hvk_reg_tex(tid, NULL, v, 1); return; }
+    tex_t image = *t; image.d.flags |= NVN_TEXTURE_FLAGS_IMAGE;
+    hvk_reg_tex(tid, &image, v, 1);
+}
+void be_reg_samp(int sid, const samp_par *sp) { if (hvk_up()) hvk_reg_samp(sid, sp); else NULLRED(); }
+void be_set_tex_pool_n(int n) { atomic_store(&hvk.tex_pool_n, n); }
+void be_prog_release(prog_t *p) { if (hvk.on) { if (p && p->serial) hvk_prog_drop(p->serial); } else NULLRED(); }
+void be_set_samp_pool_n(int n) { (void)n; }   // the sampler table is sized by its registrations (vk_texture.c)
+void be_prog_forget(const prog_t *p) { (void)p; }   // the Metal backend's cached program state per draw: programs are found by serial here
+void be_prog_prefetch(const prog_t *p) { (void)p; }   // modules load at the first draw (vk_shader.c) and through the prewarm lists
+void be_prog_snapshot(prog_t *copy, const prog_t *source) { *copy = *source; }   // a queued job's copy of the program (nvn_queue.inc): the serial names the same modules
+void be_prog_snapshot_pin(prog_t *copy, const prog_t *source) { *copy = *source; }
+void be_prog_unpin(prog_t *p) { (void)p; }
+// NVN2 ray tracing (nvn_raytrace.h, nvn_accel.h): the Metal backend's own; declared here, nothing traced
+int be_rt_program_set(prog_t *program, int count, const NVNshaderData *modules, uint32_t trace_depth, uint32_t callable_depth, uint32_t flags) {
+    (void)program; (void)count; (void)modules; (void)trace_depth; (void)callable_depth; (void)flags;
+    HVK_RED_ONCE("NVN2 ray tracing programs are not implemented by the Vulkan backend: the program has no ray tracing pipeline"); return 0;
+}
+void be_rt_group_handle(const prog_t *program, const int32_t indices[3], void *out16) { (void)program; (void)indices; memset(out16, 0, 16); HVK_RED_ONCE("NVN2 ray tracing shader group handles: zero (no ray tracing pipeline on the Vulkan backend)"); }
+void be_as_sizes(const nvn_as_build *b, uint64_t *storage, uint64_t *scratch, uint64_t *update) { (void)b; *storage = *scratch = *update = 0; HVK_RED_ONCE("NVN2 acceleration structure sizes: zero (no acceleration structures on the Vulkan backend)"); }
+void be_read_texels(const tex_t *t, unsigned level, unsigned layer0, const NVNcopyRegion *r, uint8_t *dst, size_t row, size_t img) {
+    if (hvk_up()) { hvk_tex_read(t, level, layer0, r, dst, row, img); return; }
+    NULLRED();   // no texture holds GPU content: the texels read are zero (only the region's rows are written, each image's at its stride)
+    int bw, bh, bpb = nvn_fmt_bpb(t->d.format, &bw, &bh);
+    if (!bpb || !dst || r->width <= 0 || r->height <= 0) return;
+    size_t wb = (size_t)((r->width + bw - 1) / bw) * (size_t)bpb, hb = (size_t)((r->height + bh - 1) / bh), nz = r->depth > 0 ? (size_t)r->depth : 1;
+    for (size_t z = 0; z < nz; z++) for (size_t y = 0; y < hb; y++) memset(dst + z * img + y * row, 0, wb);
+}
+// The window's textures (nvnWindowInitialize hands each texture of the window builder's SetTextures here; the Metal backend keeps them out of its cross-submit ledger): their
+// count is the one the window presenter's swapchain follows (decision D12, vk_present.c hvk_win_texture)
+void be_xv_window_tex(uint64_t serial) { hvk_win_texture(serial); }
+void be_set_depth_zero(int on) { atomic_store(&hvk.depth_zero, on != 0); }
+void be_set_queue_origin_lower_left(int on) { hvk.queue_origin_ll = on != 0; }
+void be_set_origin_lower_left(int on) { atomic_store(&hvk.origin_ll, on != 0); }
+
+// ---------- Submission and sync (hle_nvn.c holds its submission lock) ----------
+void be_queue_activate(uint64_t serial) { (void)nvn_state_queue_activate(serial); if (!hvk_up()) NULLRED(); }   // the frontend's per-queue state, as the Metal backend switches it
+void be_queue_forget(uint64_t serial) { (void)nvn_state_queue_forget(serial); if (!hvk.on) NULLRED(); }
+void be_prepare(void) { }   // the Metal backend's prewarm at the first submission: this backend's starts with the device (vk_prewarm.c hvk_prewarm_start)
+void be_sub_begin(void) { if (hvk_up()) hvk_sub_begin(); else NULLRED(); }
+void be_sub_ready(uint64_t guest_ns) { (void)guest_ns; }   // counter timestamps are placed at the replay here
+int be_sub_stream_on(void) { return 0; }   // the Metal backend's streamed submission (encoding while recording): one command buffer per submission here
+void be_exec_rest(const uint64_t *h, int n) { hvk_predict_rest_handles(h, n); }   // the handles still to come in the submission: the look-ahead goes on into them (vk_predict.c)
+void be_exec(const uint8_t *handle) { if (!hvk.on) NULLRED(); nvn_replay_exec(handle); }   // the frontend's decoder hands every record to the functions below
+// The bindings that outlive the submission's job move into the queue's own copies once its replay is done (nvn_state_preserve; the Metal backend does it in mtl_sub_commit)
+uint64_t be_sub_commit(void) {
+    uint64_t f; if (hvk.on) f = hvk_sub_commit(); else { NULLRED(); f = atomic_fetch_add(&g_null_fence, 1) + 1; }
+    be_state_dirty(nvn_state_preserve());
+    return f;
+}
+uint64_t be_last_fence(void) { if (hvk.on) return hvk_last(); NULLRED(); return atomic_load(&g_null_fence); }
+int be_wait(uint64_t fence, uint64_t timeout_ns) { if (hvk.on) return hvk_wait(fence, timeout_ns); NULLRED(); (void)fence; (void)timeout_ns; return 1; }
+// An acquire sync (fenced 2, by WindowAcquireTexture): the window's texture is free once the commits before the acquire completed; headless, that is the fence itself
+int be_wait_acq(uint64_t fence, uint64_t timeout_ns) { if (hvk.on) return hvk_wait(fence, timeout_ns); NULLRED(); (void)fence; (void)timeout_ns; return 1; }
+void be_finish(void) { if (hvk.on) hvk_finish(); else NULLRED(); }
+void be_drain(void) { if (hvk.on) hvk_finish(); else NULLRED(); }
+uint64_t be_completed_fence(void) { if (hvk.on) return hvk_done_fence(); return atomic_load(&g_null_fence); }   // the last submission complete (its CPU-visible effects done)
+void be_set_present_suspended(int on) { (void)on; }   // the window presenter keeps its thread; the frames a suspended game does not make are not shown
+void be_drop_queued_presents(void) { }
+void be_suspend_drain(void) { if (hvk.on) hvk_finish(); }
+void be_arch_save(int wait_ms, int ending) { (void)wait_ms; (void)ending; if (hvk.on) hvk_cache_flush(ending ? "quit" : "background"); }   // the pipeline cache's file, now (vk_cache.c)
+void be_warm_stop(void) { }   // the prewarm workers stop with the backend (hvk_prewarm_shutdown)
+
+// ---------- Presentation and pacing (design 7; the window presenter and the vsync source are vk_present.c's, step P4a) ----------
+// A present goes to the window presenter while it is on or about to start (hvk_win_ready), else to the headless presenter below. Their tickets are kept apart by WIN_TICKET, so a
+// ticket waits on the presenter that gave it. Without a window the vsync functions answer "no source", and hle_nvn.c paces on its own clock, as it did before the presenter
+#define WIN_TICKET (1ull << 62)
+static uint64_t pres_headless(uint64_t serial, VkImage image, VkFormat format, VkImageLayout layout, uint32_t iw, uint32_t ih, void *ev, uint64_t ev_val, const int crop[4]);
+static void pres_wait(uint64_t v);
+static VkSemaphore g_pres_tl;   // the headless presenter's timeline (below)
+static void pres_flush(void);
+static _Atomic uint64_t g_presents;   // NVN presents handed to a presenter: hle_vi.c's frame history counts them queued and done at once (be_present_progress)
+uint64_t be_present(const tex_t *t, double period_s, const int crop[4], uint64_t *copy) {
+    (void)period_s;
+    if (copy) *copy = 0;   // the Metal backend's snapshot copy: the window presenter's snapshot is part of the ticket here
+    atomic_fetch_add(&g_presents, 1);   // the window presenter's FIFO and the acquire's vsync wait pace the frames (hle_nvn.c); the headless one paces nothing
+    if (!hvk.on) { NULLRED(); return 0; }
+    // The window's texture as the GPU left it: a texture no submission wrote (its content the CPU's) would need an upload, which only a submission records (vk_texture.c)
+    if (!t || !hvk_tex_gpu_owned(t->serial)) { HVK_RED_ONCE("present of a texture no submission wrote (first ser=%llu): not shown", (unsigned long long)(t ? t->serial : 0)); return 0; }
+    hvk_tex *x = hvk_tex_get(t);
+    VkFormat fmt = VK_FORMAT_UNDEFINED; uint32_t w = 0, h = 0; VkSampleCountFlagBits samples = VK_SAMPLE_COUNT_1_BIT;
+    if (!x || !hvk_tex_info(x, &fmt, NULL, &w, &h, NULL, NULL, NULL, &samples, NULL) || samples != VK_SAMPLE_COUNT_1_BIT) {
+        HVK_RED_ONCE("present of texture ser=%llu, which has no single-sampled image: not shown", (unsigned long long)t->serial); return 0;
+    }
+    int flip = atomic_load(&hvk.origin_ll);   // NVN's lower-left window origin: the image is stored bottom row first
+    if (hvk_win_ready()) { uint64_t v = hvk_win_present(hvk_tex_image(x), fmt, VK_IMAGE_LAYOUT_GENERAL, w, h, crop, flip, VK_NULL_HANDLE, 0); return v ? v | WIN_TICKET : 0; }
+    return pres_headless(0, hvk_tex_image(x), fmt, VK_IMAGE_LAYOUT_GENERAL, w, h, NULL, 0, crop);   // NVN's images stay in GENERAL (vk_texture.c)
+}
+void be_present_flush(void) { if (!hvk.on) { NULLRED(); return; } hvk_win_flush(); pres_flush(); }
+int be_has_window(void) { return hvk_win_on(); }
+int be_display_hz(void) { return hvk_win_display_hz(); }
+int be_vsync_wait_ticks(int ticks, uint64_t timeout_ns) { return hvk_vsync_wait_ticks(ticks, timeout_ns); }
+int be_vsync_rate(void) { return hvk_vsync_rate(); }
+int be_vsync_stalled(void) { return hvk_vsync_stalled(); }
+int be_vsync_tick(uint64_t n, double *target, double *lead_ms, int *ticks, double *gap_ms) { (void)n; (void)target; (void)lead_ms; (void)ticks; (void)gap_ms; return 0; }   // the display link's per-tick record: none here
+double be_presented_time(uint64_t n) { return hvk_win_presented_time(n); }
+void be_present_progress(uint64_t *queued, uint64_t *done) { *queued = *done = atomic_load(&g_presents); }   // a present is handed on as it is made
+void be_present_layer(uint32_t w, uint32_t h) { (void)w; (void)h; HVK_RED_ONCE("a sized vi layer (%ux%u): the Vulkan presenter keeps the display's 16:9 (the Metal backend shows the layer's shape, mtl_present_layer)", w, h); }
+void be_present_wait_texture(uint64_t ticket, uint64_t copy) { (void)copy; be_present_wait(ticket); }
+int be_present_texture_ready(uint64_t ticket, uint64_t copy) {
+    (void)copy;
+    if (!ticket) return 1;
+    if (ticket & WIN_TICKET) return hvk_win_present_done(ticket & ~WIN_TICKET);
+    uint64_t c = 0; return !g_pres_tl || (vkGetSemaphoreCounterValue(hvk.d, g_pres_tl, &c) == VK_SUCCESS && c >= ticket);
+}
+void be_present_recorded(uint64_t frame) { (void)frame; }   // the Metal backend's screen wait (DM_PRESENT_DEPTH): the window presenter's FIFO paces here
+int be_present_screen_ready(void) { return 1; }
+uint64_t be_present_screen_wait(double period) { (void)period; return 0; }
+int be_vsync_ready_tick(int vsyncs) { return hvk_vsync_ready_ticks(vsyncs < 1 ? 1 : vsyncs); }   // 60 Hz ticks: one per vsync, as hvk_vsync_wait
+int be_vsync_ready_ticks(int ticks) { return hvk_vsync_ready_ticks(ticks); }
+void be_vsync_mode_set(int mode) { (void)mode; }   // the vsync source ticks at 60 Hz (vk_present.c)
+uint64_t be_vsync_drain_take_ns(void) { return 0; }   // the display link's drain of standing frames: none here
+int be_snap_acquire_ready(void) { return 1; }   // no snapshot ring (be_snap_on)
+void be_set_fstep_fine(int on) { (void)on; }   // the Metal display link's 60 Hz showing of a 30 cap's late frames
+int be_probe_ramp_on(void) { const char *e = getenv("DM_FSTEP_PROBE_RAMP"); return !(e && !strcmp(e, "0")); }   // the frame step's probe ramp, on by default (nvn_mtl.m mtl_probe_ramp_on; no A/B here)
+int be_snap_on(void) { return 0; }   // the window presenter's snapshots free the game's texture at once by construction (design 7.2): no ring for hle_nvn.c to manage
+uint64_t be_snap_acquire_wait(void) { return 0; }
+void be_present_wait(uint64_t ticket) { if (ticket & WIN_TICKET) hvk_win_present_wait(ticket & ~WIN_TICKET); else pres_wait(ticket); }
+int be_fps_target(void) {
+    static int env = -2;
+    if (env == -2) { const char *e = getenv("DM_FPS"); env = e ? atoi(e) : -1; if (env != 30 && env != 60) env = -1; }
+    extern int nvn_game_fps(void) __attribute__((weak));
+    return env > 0 ? env : nvn_game_fps && nvn_game_fps() == 30 ? 30 : 60;   // the Metal backend's rule (mtl_fps_target)
+}
+int be_vsync_active(void) { return hvk_vsync_active(); }
+int be_vsync_wait(int vsyncs, uint64_t timeout_ns) { return hvk_vsync_wait(vsyncs, timeout_ns); }
+// The DM_CTL diagnostics (hle_hid.c): "texlist", "texraw", "texdump" and "passdump" are vk_dump.c's; "shot" is the headless presenter's (below)
+void dm_gfx_shot_at(long k, const char *path);
+// ---------- External producers (the guest Vulkan layer, guest_vk.c; step P9a) and the headless presenter ----------
+// The shared device record is the backend's device layer (hostvk_dev). be_ext_tex registers an image (hvk_ext_image, guest_vk.h) under a serial; be_present_ext presents one, through
+// the window presenter when it is on (vk_present.c), else through the headless presenter here, which also takes be_present's NVN frames without a window (DM_VK_HEADLESS=1, no
+// Vulkan window): each present copies the frame's region (the layer crop, else the whole image) into a host-visible buffer, the picture a window would show (hvk_present_last
+// reads it back). A present is one submission on the backend's queue: it waits for the producer's timeline value (ev, ev_val), copies between two full barriers, so the copy is
+// ordered against everything submitted before and after it on the queue whatever semaphores the producer used, and signals the presenter's own timeline; that value is the ticket
+// be_present_wait waits for. Up to PRES_N presents are in flight; the next one waits for the oldest. The period is not used: nothing paces a headless present (there is no vsync
+// source without a window). With the lower-left window origin (be_set_origin_lower_left: the guest GL layer, guest_gl.c, stores its images bottom row first, as GL lays them out;
+// NVN's lower-left window origin) the region's rows are copied bottom up, so the picture is upright, as the Metal backend's present flips it
+void *be_native_device(void) { return hvk_up() ? (void *)&hvk.dev : NULL; }
+typedef struct { VkImage image; VkFormat format; uint32_t w, h; } ext_ent;
+enum { PRES_N = 4 };
+static pthread_mutex_t g_ext_mu = PTHREAD_MUTEX_INITIALIZER;   // the registry and the presenter
+static ext_ent *g_ext; static uint32_t g_n_ext, g_cap_ext;      // serial s names g_ext[s - 1]; a dropped one has no image
+static VkCommandPool g_pres_pool; static VkCommandBuffer g_pres_cb[PRES_N]; static uint64_t g_pres_at[PRES_N];
+static VkSemaphore g_pres_tl; static uint64_t g_pres_n;         // the presenter's timeline and the last value submitted
+static VkBuffer g_screen; static hvk_mem *g_screen_mem; static void *g_screen_map; static VkDeviceSize g_screen_size;
+static hvk_present_info g_last;
+uint64_t be_ext_tex(void *tex) {
+    if (!hvk_up()) { NULLRED(); return 0; }
+    const hvk_ext_image *e = tex;
+    if (!e || !e->image) return 0;
+    pthread_mutex_lock(&g_ext_mu);
+    if (g_n_ext == g_cap_ext) {
+        uint32_t c = g_cap_ext ? 2 * g_cap_ext : 16; ext_ent *n = realloc(g_ext, c * sizeof *n);
+        if (!n) { pthread_mutex_unlock(&g_ext_mu); HVK_RED_ONCE("external texture registry: out of memory"); return 0; }
+        g_ext = n; g_cap_ext = c;
+    }
+    g_ext[g_n_ext++] = (ext_ent){e->image, e->format, e->width, e->height};
+    uint64_t s = g_n_ext;
+    pthread_mutex_unlock(&g_ext_mu);
+    hvk_win_texture(s | 1ull << 63);   // a guest layer's swapchain or window surface image: one of its window's textures (decision D12), keyed apart from NVN's serials
+    return s;
+}
+void hvk_ext_tex_drop(uint64_t serial) {
+    pthread_mutex_lock(&g_ext_mu);
+    if (serial && serial <= g_n_ext) g_ext[serial - 1].image = VK_NULL_HANDLE;
+    pthread_mutex_unlock(&g_ext_mu);
+}
+static void pres_wait(uint64_t v) {   // the present of ticket v has finished reading its image
+    if (!v || !g_pres_tl) return;
+    VkSemaphoreWaitInfo wi = {VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO, NULL, 0, 1, &g_pres_tl, &v};
+    uint64_t t0 = plat_now_ns();
+    while (vkWaitSemaphores(hvk.d, &wi, 1000000000ull) == VK_TIMEOUT)
+        if (plat_now_ns() - t0 > 5000000000ull) HVK_RED_ONCE("a present has waited over 5 s for its frame (the producer's timeline value is never signalled?)");
+}
+static int pres_make(void) {   // under g_ext_mu
+    if (g_pres_tl) return 1;
+    VkCommandPoolCreateInfo pi = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO, NULL, VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT, hvk.dev.queue_family};
+    VkCommandBufferAllocateInfo ai = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO, NULL, VK_NULL_HANDLE, VK_COMMAND_BUFFER_LEVEL_PRIMARY, PRES_N};
+    VkSemaphoreTypeCreateInfo ti = {VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO, NULL, VK_SEMAPHORE_TYPE_TIMELINE, 0};
+    VkSemaphoreCreateInfo si = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO, &ti, 0};
+    if (vkCreateCommandPool(hvk.d, &pi, NULL, &g_pres_pool)) { g_pres_pool = VK_NULL_HANDLE; return 0; }
+    ai.commandPool = g_pres_pool;
+    if (vkAllocateCommandBuffers(hvk.d, &ai, g_pres_cb) || vkCreateSemaphore(hvk.d, &si, NULL, &g_pres_tl)) {
+        vkDestroyCommandPool(hvk.d, g_pres_pool, NULL); g_pres_pool = VK_NULL_HANDLE; g_pres_tl = VK_NULL_HANDLE; return 0;
+    }
+    return 1;
+}
+uint64_t be_present_ext(uint64_t serial, double period, void *ev, uint64_t ev_val, const int crop[4]) {
+    (void)period;
+    if (!hvk.on) { NULLRED(); return 0; }
+    pthread_mutex_lock(&g_ext_mu);
+    if (!serial || serial > g_n_ext || !g_ext[serial - 1].image) {
+        pthread_mutex_unlock(&g_ext_mu);
+        HVK_RED_ONCE("present of external texture %llu, which names no registered image: not shown", (unsigned long long)serial);
+        return 0;
+    }
+    const ext_ent e = g_ext[serial - 1];
+    pthread_mutex_unlock(&g_ext_mu);
+    if (hvk_win_ready()) {
+        uint64_t v = hvk_win_present(e.image, e.format, HVK_EXT_LAYOUT, e.w, e.h, crop, atomic_load(&hvk.origin_ll), (VkSemaphore)ev, ev_val);
+        return v ? v | WIN_TICKET : 0;
+    }
+    return pres_headless(serial, e.image, e.format, HVK_EXT_LAYOUT, e.w, e.h, ev, ev_val, crop);
+}
+static int texel4(VkFormat f) {   // the headless presenter's buffer holds 4-byte texels
+    switch (f) {
+    case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB: case VK_FORMAT_A8B8G8R8_UNORM_PACK32:
+    case VK_FORMAT_A8B8G8R8_SRGB_PACK32: case VK_FORMAT_A2B10G10R10_UNORM_PACK32: case VK_FORMAT_A2R10G10B10_UNORM_PACK32: case VK_FORMAT_B10G11R11_UFLOAT_PACK32:
+    case VK_FORMAT_R8G8B8A8_SNORM: case VK_FORMAT_R8G8B8A8_UINT: case VK_FORMAT_R16G16_UNORM: case VK_FORMAT_R16G16_SFLOAT: case VK_FORMAT_R32_SFLOAT: case VK_FORMAT_R32_UINT:
+        return 1;
+    default: return 0;
+    }
+}
+static void shot_serve(uint64_t frames);
+static uint64_t pres_headless(uint64_t serial, VkImage image, VkFormat format, VkImageLayout layout, uint32_t iw, uint32_t ih, void *ev, uint64_t ev_val, const int crop[4]) {
+    const ext_ent e = {image, format, iw, ih};
+    if (!texel4(format)) { HVK_RED_ONCE("the headless presenter keeps 4-byte texels: a frame in format %d is not copied", format); return 0; }
+    pthread_mutex_lock(&g_ext_mu);
+    uint32_t x = 0, y = 0, w = e.w, h = e.h;
+    if (crop && crop[0] >= 0 && crop[1] >= 0 && crop[2] > 0 && crop[3] > 0 && (uint32_t)crop[0] + (uint32_t)crop[2] <= e.w && (uint32_t)crop[1] + (uint32_t)crop[3] <= e.h) {
+        x = (uint32_t)crop[0]; y = (uint32_t)crop[1]; w = (uint32_t)crop[2]; h = (uint32_t)crop[3];
+    }
+    VkDeviceSize need = (VkDeviceSize)w * h * 4;
+    if (!pres_make()) { pthread_mutex_unlock(&g_ext_mu); HVK_RED_ONCE("the headless presenter's command pool or timeline could not be made: frames are not shown"); return 0; }
+    if (need > g_screen_size) {   // a larger picture: the copies in flight write the old buffer
+        pres_wait(g_pres_n);
+        if (g_screen) hvk_mem_buffer_free(g_screen, g_screen_mem);
+        g_screen = VK_NULL_HANDLE; g_screen_mem = NULL; g_screen_map = NULL; g_screen_size = 0;
+        if (hvk_mem_buffer(need, VK_BUFFER_USAGE_TRANSFER_DST_BIT, HVK_MEM_HOST, &g_screen, &g_screen_mem, &g_screen_map)) {
+            pthread_mutex_unlock(&g_ext_mu); HVK_RED_ONCE("the headless presenter's buffer of %llu bytes could not be made: frames are not shown", (unsigned long long)need); return 0;
+        }
+        g_screen_size = need;
+    }
+    int slot = (int)(g_pres_n % PRES_N);
+    pres_wait(g_pres_at[slot]);   // its command buffer is free again
+    VkCommandBuffer cb = g_pres_cb[slot];
+    vkResetCommandBuffer(cb, 0);
+    VkCommandBufferBeginInfo bi = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO, NULL, VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT, NULL};
+    vkBeginCommandBuffer(cb, &bi);
+    hvk_full_barrier(cb);   // after the producer's frame and after the previous present's copy into the buffer
+    if (atomic_load(&hvk.origin_ll)) {   // the image is stored bottom row first: one region per row, the last row first
+        static VkBufferImageCopy *rows; static uint32_t nrows;
+        if (h > nrows) { VkBufferImageCopy *n = realloc(rows, h * sizeof *n); if (n) { rows = n; nrows = h; } }
+        uint32_t k = h <= nrows ? h : 0;
+        for (uint32_t i = 0; i < k; i++) rows[i] = (VkBufferImageCopy){(VkDeviceSize)(h - 1 - i) * w * 4, w, 1, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {(int32_t)x, (int32_t)(y + i), 0}, {w, 1, 1}};
+        if (k) vkCmdCopyImageToBuffer(cb, e.image, layout, g_screen, k, rows);
+        else HVK_RED_ONCE("the headless presenter's row list could not be made: the frame is not shown");
+    } else {
+        VkBufferImageCopy r = {0, w, h, {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1}, {(int32_t)x, (int32_t)y, 0}, {w, h, 1}};
+        vkCmdCopyImageToBuffer(cb, e.image, layout, g_screen, 1, &r);
+    }
+    VkMemoryBarrier2 mb[2] = {   // before whatever follows on the queue (the producer drawing into the image again) and before the host reads the buffer
+        {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, VK_ACCESS_2_MEMORY_WRITE_BIT, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT,
+         VK_ACCESS_2_MEMORY_READ_BIT | VK_ACCESS_2_MEMORY_WRITE_BIT},
+        {VK_STRUCTURE_TYPE_MEMORY_BARRIER_2, NULL, VK_PIPELINE_STAGE_2_COPY_BIT, VK_ACCESS_2_TRANSFER_WRITE_BIT, VK_PIPELINE_STAGE_2_HOST_BIT, VK_ACCESS_2_HOST_READ_BIT}};
+    VkDependencyInfo di = {VK_STRUCTURE_TYPE_DEPENDENCY_INFO, NULL, 0, 2, mb, 0, NULL, 0, NULL};
+    vkCmdPipelineBarrier2(cb, &di);
+    vkEndCommandBuffer(cb);
+    uint64_t v = g_pres_n + 1;
+    VkSemaphoreSubmitInfo wait = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, NULL, (VkSemaphore)ev, ev_val, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0};
+    VkSemaphoreSubmitInfo sig = {VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO, NULL, g_pres_tl, v, VK_PIPELINE_STAGE_2_ALL_COMMANDS_BIT, 0};
+    VkCommandBufferSubmitInfo ci = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO, NULL, cb, 0};
+    VkSubmitInfo2 si = {VK_STRUCTURE_TYPE_SUBMIT_INFO_2, NULL, 0, ev ? 1u : 0u, &wait, 1, &ci, 1, &sig};
+    pthread_mutex_lock(&hvk.queue_mu); VkResult rs = vkQueueSubmit2(hvk.dev.queue, 1, &si, VK_NULL_HANDLE); pthread_mutex_unlock(&hvk.queue_mu);
+    if (rs) { pthread_mutex_unlock(&g_ext_mu); HVK_RED_ONCE("the headless present's submission failed (VkResult %d): the frame is not shown", rs); return 0; }
+    g_pres_n = v; g_pres_at[slot] = v;
+    g_last = (hvk_present_info){serial, v, g_last.frames + 1, x, y, w, h, e.format};
+    const uint64_t frames = g_last.frames;
+    pthread_mutex_unlock(&g_ext_mu);
+    shot_serve(frames);   // a "shot" asked for this frame is written here, before the present returns
+    return v;
+}
+int hvk_present_last(void *texels, size_t n, hvk_present_info *info) {
+    pthread_mutex_lock(&g_ext_mu);
+    int ok = g_last.ticket != 0;
+    if (ok) {
+        pres_wait(g_last.ticket);
+        size_t bytes = (size_t)g_last.width * g_last.height * 4;
+        if (texels) memcpy(texels, g_screen_map, bytes < n ? bytes : n);
+        if (info) *info = g_last;
+    }
+    pthread_mutex_unlock(&g_ext_mu);
+    return ok;
+}
+// DM_CTL "shot <path>" (hle_hid.c) without a window (DM_VK_HEADLESS=1): the kth frame the headless presenter copies from the call on (k 1: the next), read back from its buffer
+// (hvk_present_last) and written as a PNG of its RGB, converted from the frame's 4-byte format (the picture a window would show: the layer crop, the rows upright). The PNG is
+// uncompressed (stored deflate blocks: no zlib in the host), about 6 MB at 1920x1080. The call only notes the request (up to SHOTS wait at a time); the presenter writes the PNG on
+// the presenting thread, inside the present of that frame (shot_serve), as the Metal backend's does. So the picture is that frame's whatever comes after it, and the caller goes
+// on at once: the frame counter (dm_guest_frame, which follows the present) has not moved, and a block of DM_CTL lines keeps its frame offsets across a shot. It used to wait and
+// write on the calling thread, which the game ran on beside: the control thread came back two frames later, now and then three or four, and every later press of a route
+// moved with it. With the window presenter on, the frame goes to the swapchain instead and nothing is written (a red line)
+static uint32_t png_crc(uint32_t c, const uint8_t *p, size_t n) {
+    static uint32_t t[256];
+    if (!t[1]) for (uint32_t i = 0; i < 256; i++) { uint32_t v = i; for (int b = 0; b < 8; b++) v = v & 1 ? 0xEDB88320u ^ (v >> 1) : v >> 1; t[i] = v; }
+    c = ~c;
+    for (size_t i = 0; i < n; i++) c = t[(c ^ p[i]) & 0xFF] ^ (c >> 8);
+    return ~c;
+}
+static void be32(uint8_t *p, uint32_t v) { p[0] = (uint8_t)(v >> 24); p[1] = (uint8_t)(v >> 16); p[2] = (uint8_t)(v >> 8); p[3] = (uint8_t)v; }
+static int png_chunk(FILE *f, const char *type, const uint8_t *data, size_t n) {
+    uint8_t h[8]; be32(h, (uint32_t)n); memcpy(h + 4, type, 4);
+    uint32_t crc = png_crc(png_crc(0, h + 4, 4), data, n);
+    uint8_t c[4]; be32(c, crc);
+    return fwrite(h, 1, 8, f) == 8 && (!n || fwrite(data, 1, n, f) == n) && fwrite(c, 1, 4, f) == 4;
+}
+// rgb: h rows of w * 3 bytes; 0 when written
+int hvk_png_write(const char *path, const uint8_t *rgb, uint32_t w, uint32_t h) {
+    const size_t row = (size_t)w * 3 + 1, raw = row * h, blocks = (raw + 65534) / 65535;
+    uint8_t *z = malloc(2 + raw + 5 * (blocks ? blocks : 1) + 4);
+    FILE *f = z ? fopen(path, "wb") : NULL;
+    if (!f) { free(z); return -1; }
+    size_t o = 0; uint32_t a = 1, b = 0;   // the zlib header (deflate, no dictionary), stored blocks, Adler-32 of the filtered rows
+    z[o++] = 0x78; z[o++] = 0x01;
+    size_t left = raw, y = 0, x = 0;   // position in the filtered rows: row y, byte x of it (x 0: its filter byte, 0 = none)
+    do {
+        const size_t n = left < 65535 ? left : 65535;
+        z[o++] = left <= 65535; z[o++] = (uint8_t)n; z[o++] = (uint8_t)(n >> 8); z[o++] = (uint8_t)~n; z[o++] = (uint8_t)(~n >> 8);
+        for (size_t i = 0; i < n; i++) {
+            const uint8_t v = x ? rgb[y * (size_t)w * 3 + x - 1] : 0;
+            z[o++] = v; a = (a + v) % 65521; b = (b + a) % 65521;
+            if (++x == row) { x = 0; y++; }
+        }
+        left -= n;
+    } while (left);
+    be32(z + o, b << 16 | a); o += 4;
+    static const uint8_t sig[8] = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n'};
+    uint8_t ihdr[13]; be32(ihdr, w); be32(ihdr + 4, h); ihdr[8] = 8; ihdr[9] = 2; ihdr[10] = ihdr[11] = ihdr[12] = 0;   // 8 bits, RGB
+    const int ok = fwrite(sig, 1, 8, f) == 8 && png_chunk(f, "IHDR", ihdr, 13) && png_chunk(f, "IDAT", z, o) && png_chunk(f, "IEND", NULL, 0);
+    free(z);
+    return fclose(f) || !ok ? -1 : 0;
+}
+// One 4-byte texel of a presented frame's format as R, G, B (the formats texel4 takes); 0 for a format it does not convert
+static int texel_rgb(VkFormat f, const uint8_t *t, uint8_t *o) {
+    uint32_t v; memcpy(&v, t, 4);
+    switch (f) {
+    case VK_FORMAT_R8G8B8A8_UNORM: case VK_FORMAT_R8G8B8A8_SRGB: case VK_FORMAT_A8B8G8R8_UNORM_PACK32: case VK_FORMAT_A8B8G8R8_SRGB_PACK32: case VK_FORMAT_R8G8B8A8_UINT:
+        o[0] = t[0]; o[1] = t[1]; o[2] = t[2]; return 1;
+    case VK_FORMAT_R8G8B8A8_SNORM: for (int i = 0; i < 3; i++) o[i] = (int8_t)t[i] <= 0 ? 0 : (uint8_t)((int8_t)t[i] * 2); return 1;
+    case VK_FORMAT_B8G8R8A8_UNORM: case VK_FORMAT_B8G8R8A8_SRGB: o[0] = t[2]; o[1] = t[1]; o[2] = t[0]; return 1;
+    case VK_FORMAT_A2B10G10R10_UNORM_PACK32: o[0] = (uint8_t)((v & 0x3FF) >> 2); o[1] = (uint8_t)((v >> 12) & 0xFF); o[2] = (uint8_t)((v >> 22) & 0xFF); return 1;
+    case VK_FORMAT_A2R10G10B10_UNORM_PACK32: o[2] = (uint8_t)((v & 0x3FF) >> 2); o[1] = (uint8_t)((v >> 12) & 0xFF); o[0] = (uint8_t)((v >> 22) & 0xFF); return 1;
+    default: return 0;
+    }
+}
+#define SHOTS 8
+static struct { uint64_t want; char path[1024]; } g_shots[SHOTS];   // the shots asked for and not yet written: the presenter's frame count each waits for
+static int g_n_shots;
+static pthread_mutex_t g_shot_mu = PTHREAD_MUTEX_INITIALIZER;        // taken inside g_ext_mu by the request, alone by the presenter
+void dm_gfx_shot_at(long k, const char *path) {
+    if (hvk_win_ready()) { HVK_RED_ONCE("DM_CTL shot: frames go to the window presenter, whose swapchain is not read back: %s not saved (DM_VK_HEADLESS=1 shoots)", path); return; }
+    int noted = 0;
+    pthread_mutex_lock(&g_ext_mu);   // held across the note: the present that makes the frame count `want` comes after it and finds the request
+    pthread_mutex_lock(&g_shot_mu);
+    if (g_n_shots < SHOTS && strlen(path) < sizeof g_shots[0].path) {
+        g_shots[g_n_shots].want = g_last.frames + (uint64_t)(k > 0 ? k : 1); strcpy(g_shots[g_n_shots].path, path); g_n_shots++; noted = 1;
+    }
+    pthread_mutex_unlock(&g_shot_mu);
+    pthread_mutex_unlock(&g_ext_mu);
+    if (!noted) hostvk_log("[RED] [hostvk] DM_CTL shot: %d shots wait for their frames already, or the path is %zu bytes or longer: %s not saved", SHOTS, sizeof g_shots[0].path, path);
+}
+// The frame the headless presenter copied last, as a PNG
+static void shot_write(const char *path) {
+    hvk_present_info info;
+    if (!hvk_present_last(NULL, 0, &info) || !info.width || !info.height) { hostvk_log("[RED] [hostvk] DM_CTL shot: no frame to read back: %s not saved", path); return; }
+    const size_t n = (size_t)info.width * info.height;
+    uint8_t *tex = malloc(n * 4), *rgb = malloc(n * 3);
+    if (!tex || !rgb || !hvk_present_last(tex, n * 4, &info) || (size_t)info.width * info.height != n) {
+        free(tex); free(rgb); hostvk_log("[RED] [hostvk] DM_CTL shot: the frame could not be read back: %s not saved", path); return;
+    }
+    int conv = 1;
+    for (size_t i = 0; i < n && conv; i++) conv = texel_rgb(info.format, tex + 4 * i, rgb + 3 * i);
+    if (!conv) for (size_t i = 0; i < n; i++) memcpy(rgb + 3 * i, tex + 4 * i, 3);   // the bytes as they are, said below
+    const int bad = hvk_png_write(path, rgb, info.width, info.height);
+    free(tex); free(rgb);
+    if (bad) hostvk_log("[RED] [hostvk] DM_CTL shot: cannot write %s", path);
+    else hostvk_log("[hostvk] DM_CTL shot: frame %llu (%ux%u, VkFormat %d%s) -> %s", (unsigned long long)info.frames, info.width, info.height, info.format,
+                    conv ? "" : ": not converted, its first three bytes per texel as R, G, B", path);
+}
+// The headless presenter, on the presenting thread, after it recorded its frame number `frames` and before its present returns: writes the shots that wait for that frame
+static void shot_serve(uint64_t frames) {
+    for (;;) {
+        char path[sizeof g_shots[0].path]; int due = 0;
+        pthread_mutex_lock(&g_shot_mu);
+        for (int i = 0; i < g_n_shots && !due; i++) if (g_shots[i].want <= frames) { strcpy(path, g_shots[i].path); g_shots[i] = g_shots[--g_n_shots]; due = 1; }
+        pthread_mutex_unlock(&g_shot_mu);
+        if (!due) return;
+        shot_write(path);
+    }
+}
+static void pres_flush(void) { pthread_mutex_lock(&g_ext_mu); uint64_t v = g_pres_n; pthread_mutex_unlock(&g_ext_mu); pres_wait(v); }
+static void pres_shutdown(void) {   // hvk_shutdown: every present finished, the presenter's objects released, the registry emptied
+    pthread_mutex_lock(&g_ext_mu);
+    pres_wait(g_pres_n);
+    if (g_pres_tl) vkDestroySemaphore(hvk.d, g_pres_tl, NULL);
+    if (g_pres_pool) vkDestroyCommandPool(hvk.d, g_pres_pool, NULL);
+    if (g_screen) hvk_mem_buffer_free(g_screen, g_screen_mem);
+    g_pres_tl = VK_NULL_HANDLE; g_pres_pool = VK_NULL_HANDLE; g_screen = VK_NULL_HANDLE; g_screen_mem = NULL; g_screen_map = NULL; g_screen_size = 0;
+    g_pres_n = 0; memset(g_pres_at, 0, sizeof g_pres_at); memset(&g_last, 0, sizeof g_last);
+    pthread_mutex_lock(&g_shot_mu); g_n_shots = 0; pthread_mutex_unlock(&g_shot_mu);   // the frames they waited for never come
+    free(g_ext); g_ext = NULL; g_n_ext = g_cap_ext = 0;
+    pthread_mutex_unlock(&g_ext_mu);
+}
+
+// ---------- Frames and measurements ----------
+void be_set_frame(uint64_t f) { hvk.frame = f; }
+double be_gpu_ms(uint64_t f) { (void)f; return -1; }   // no GPU time per frame yet (timestamps per submission are phase P4's pacing work)
+int be_gpu_span(uint64_t f, uint64_t *t0, uint64_t *t1) { (void)f; (void)t0; (void)t1; return 0; }
+void be_ab_gpu(uint64_t f, double gpu_ms, double frame_ms) { (void)f; (void)gpu_ms; (void)frame_ms; }
+void be_ub_present(double iv_ms) { (void)iv_ms; }
+
+// ---------- Statistics: what the backend counts, zero for the Metal mechanisms it has not ----------
+void be_mem_stat(unsigned long long frame, unsigned long long rss_mb) { (void)frame; (void)rss_mb; }
+void be_stats(uint64_t *passes, uint64_t *draws) { *passes = atomic_load(&hvk.st_passes); *draws = atomic_load(&hvk.st_draws); }
+void be_args_stats(uint64_t *enc, uint64_t *reuse, uint64_t *patch) { uint64_t h = 0, m = 0, w = 0; if (hvk.on) hvk_desc_stats(&h, &m, &w); *enc = m; *reuse = h; *patch = 0; }   // descriptor sets written / taken from the cache
+void be_use_stats(uint64_t *call, uint64_t *skip) { *call = *skip = 0; }
+void be_vbuf_stats(uint64_t *resolve, uint64_t *reuse, uint64_t *set, uint64_t *skip, uint64_t *copies, uint64_t *copy_bytes) { *resolve = *reuse = *set = *skip = *copies = *copy_bytes = 0; }
+uint64_t be_drawable_ns_take(void) { return 0; }
+void be_bw(uint64_t *load, uint64_t *store, uint64_t *full_rw_passes) { *load = *store = *full_rw_passes = 0; }
+uint64_t be_udc_saved_bytes(void) { return 0; }
+void be_pkg_stats(uint64_t *uploads, uint64_t *reuploads) { *uploads = atomic_load(&hvk.st_uploads); *reuploads = atomic_load(&hvk.st_reuploads); }
+unsigned be_cpu_tex_count(void) { return 0; }
+uint64_t be_pkg_edge_skips(void) { return 0; }
+uint64_t be_pkg_miss(void) { return 0; }
+uint64_t be_upload_ns_take(void) { return atomic_exchange(&hvk.st_upload_ns, 0); }
+uint64_t be_upload_gpu_ns_take(void) { return 0; }
+uint64_t be_upload_bytes(void) { return atomic_load(&hvk.st_upload_bytes); }
+void be_create_stats(uint64_t *lib, uint64_t *pso) { *lib = atomic_load(&hvk.st_shaders); *pso = atomic_load(&hvk.st_pipelines); }
+void be_create_ns(uint64_t *lib_ns, uint64_t *pso_ns) { *lib_ns = 0; *pso_ns = atomic_load(&hvk.st_pipeline_ns); }   // pso_ns: the time draws waited for their pipelines
+void be_hybrid_stats(uint64_t *draws, uint64_t *made, uint64_t *none) { *draws = *made = *none = 0; }
+// The device-local heaps' budget and use (VK_EXT_memory_budget), in MiB; 0 when the device has not the extension
+static int mem_budget(double *budget_mib, double *usage_mib) {
+    *budget_mib = *usage_mib = 0;
+    if (!hvk.on || !hvk.dev.x.memory_budget) return 0;
+    VkPhysicalDeviceMemoryBudgetPropertiesEXT b = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT};
+    VkPhysicalDeviceMemoryProperties2 p = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2, &b};
+    vkGetPhysicalDeviceMemoryProperties2(hvk.dev.phys, &p);
+    for (uint32_t i = 0; i < p.memoryProperties.memoryHeapCount; i++)
+        if (p.memoryProperties.memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) { *budget_mib += b.heapBudget[i] / 1048576.0; *usage_mib += b.heapUsage[i] / 1048576.0; }
+    return 1;
+}
+// The backend's resource line (hle_nvn.c gives it 400 bytes, so it stays short): commands (draws whose indices were converted on the GPU and on the CPU, and those of draws whose
+// count the GPU holds, vk_index.c; step P8: passes split before feedback draws, DrawTransformFeedback draws, draw-based copies), and texture memory (step P7, decision D1): every image,
+// ASTC held compressed against ASTC decoded into RGBA8 (with what its blocks take), the uploads by path, and the device-local budget where VK_EXT_memory_budget gives it
+void be_res_stats(char *out, size_t n) {
+    if (!n) return;
+    double mib = 1048576.0, bud, use;
+    int k = snprintf(out, n, "vulkan: passes %llu draws %llu dispatches %llu pipelines %llu shaders %llu barriers %llu pass splits %llu GPU vertex copies %llu index conversions GPU %llu CPU %llu indirect %llu fb splits %llu xfb draws %llu copy draws %llu; "
+                     "textures %.1f MiB (ASTC %.1f native, %.1f decoded from %.1f of blocks), uploads GPU %llu CPU %llu (%llu again in one prologue), ASTC decodes %llu",
+                     (unsigned long long)hvk.st_passes, (unsigned long long)hvk.st_draws, (unsigned long long)hvk.st_dispatches, (unsigned long long)hvk.st_pipelines,
+                     (unsigned long long)hvk.st_shaders, (unsigned long long)hvk.st_barriers, (unsigned long long)hvk.st_pass_splits, (unsigned long long)hvk.st_vcopies_gpu,
+                     (unsigned long long)hvk.st_index_gpu, (unsigned long long)atomic_load(&hvk.st_index_cpu), (unsigned long long)atomic_load(&hvk.st_index_ind), (unsigned long long)atomic_load(&hvk.st_feedback_splits),
+                     (unsigned long long)atomic_load(&hvk.st_xfb_draws), (unsigned long long)atomic_load(&hvk.st_copy_draws), (double)atomic_load(&hvk.st_tex_bytes) / mib, (double)atomic_load(&hvk.st_astc_native_bytes) / mib,
+                     (double)atomic_load(&hvk.st_astc_decoded_bytes) / mib, (double)atomic_load(&hvk.st_astc_block_bytes) / mib, (unsigned long long)atomic_load(&hvk.st_up_gpu),
+                     (unsigned long long)atomic_load(&hvk.st_up_cpu), (unsigned long long)atomic_load(&hvk.st_reupload_same), (unsigned long long)atomic_load(&hvk.st_astc_decodes));
+    if (k > 0 && (size_t)k < n) {   // the descriptor sets: written, allocated from a pool, taken again from a free list (vk_pipeline.c set_take)
+        uint64_t dh = 0, dm = 0, dw = 0, made = 0, again = 0; hvk_desc_stats(&dh, &dm, &dw); hvk_desc_set_stats(&made, &again);
+        int k2 = snprintf(out + k, n - (size_t)k, "; descriptor sets written %llu (%llu found written in the submission), allocated %llu, taken again %llu",
+                          (unsigned long long)dm, (unsigned long long)dh, (unsigned long long)made, (unsigned long long)again);
+        if (k2 > 0) k += k2;
+    }
+    if (k > 0 && (size_t)k < n) {
+        if (mem_budget(&bud, &use)) snprintf(out + k, n - (size_t)k, "; device-local %.0f of %.0f MiB", use, bud);
+        else snprintf(out + k, n - (size_t)k, "; no memory budget");
+    }
+}
+void be_barrier_stats(uint64_t *skip, uint64_t *full) { *skip = 0; *full = atomic_load(&hvk.st_barriers); }
+uint32_t be_present_qos(void) { return hvk_win_qos(); }   // the window presenter's thread (vk_present.c); PLAT_QOS_UNSPECIFIED without one
+uint64_t be_cut_count(void) { return 0; }
+uint64_t be_copy_cut_count(void) { return 0; }
+uint64_t be_blit_splits(void) { return atomic_load(&hvk.st_pass_splits); }
+void be_ubd_stats(uint64_t *deferred, uint64_t *conflicts) { *deferred = *conflicts = 0; }
+void be_ubp_stats(uint64_t *made, uint64_t *reused, uint64_t *refused) { *made = *reused = *refused = 0; }
+void be_ubp_why(uint64_t w[6]) { memset(w, 0, 6 * sizeof *w); }
+void be_lc_stats(uint64_t *taken, uint64_t *landed) { *taken = *landed = 0; }
+void be_sm_stats(uint64_t *np, uint64_t *nc, uint64_t *nw) { *np = *nc = *nw = 0; }
+void be_cshoist_stats(uint64_t *moved, uint64_t *depth, uint64_t *stops) { *moved = *depth = 0; memset(stops, 0, 8 * sizeof *stops); }   // stops: 8 counters, as hle_nvn.c reads them
+// The pipeline line of hle_nvn.c's timing summary, the differences since the last call, in the shape of the Metal backend's (mtl_pso_line): what the submit thread spent (the
+// look-ahead's walks as the Metal line's predictions), what every thread made, the background builds (the look-ahead's: queued, and at their draw ready, still being made or
+// made by the draw; the speculative builds from the prewarm rows), and the draws that waited, per reason, with the longest wait of the window and the waits over the 2 ms budget
+// (phase P5)
+void be_pso_line(char *o, size_t n) {
+    if (!n) return;
+    if (!hvk.on) { snprintf(o, n, "vulkan: no device"); return; }
+    hvk_pso_stats a; hvk_pso_stats_get(&a); hvk_prewarm_stats pw; hvk_prewarm_stats_get(&pw); hvk_cache_stats cs; hvk_cache_stats_get(&cs); hvk_predict_stats pr; hvk_predict_stats_get(&pr);
+    enum { NV = 26, V = NV + 2 * HVK_W_N };
+    uint64_t v[V] = {a.draw_ns, a.wait_ns[HVK_W_LIB], pw.speculative, a.lib[0] + a.lib[1] + a.lib[2] + a.lib[3], a.lib_ns[0] + a.lib_ns[1] + a.lib_ns[2] + a.lib_ns[3],
+                     a.fast, a.fast_ns, a.opt, a.opt_ns, a.swapped, a.mono, a.mono_ns, pw.built, pw.failed, a.draw_made, a.over_budget, cs.created, cs.hits, a.opt_dropped, pw.stale,
+                     pr.walks, pr.ns, a.pred_queued, a.pred_ready, a.pred_inflight, a.pred_made};
+    for (int i = 0; i < HVK_W_N; i++) { v[NV + i] = a.wait_n[i]; v[NV + HVK_W_N + i] = a.wait_ns[i]; }
+    static uint64_t p[V]; uint64_t d[V]; for (int i = 0; i < V; i++) d[i] = v[i] - p[i];
+    size_t k = (size_t)snprintf(o, n, "on the submit thread pipelines %.1f ms, shader libraries %.1f ms, predictions %llu / %.1f ms; all threads (level %c): pipeline libraries %llu / %.1f ms, "
+        "fast links %llu / %.1f ms, optimized links %llu / %.1f ms (swapped in %llu, dropped %llu), monolithic %llu / %.1f ms, driver cache hits %llu of %llu creations; "
+        "background builds done %llu, failed %llu, made by the draw %llu, in flight %llu; look-ahead pipelines queued %llu (at their draw ready %llu, still being made %llu, "
+        "made by the draw %llu), speculative from the rows %llu; draws that waited:",
+        d[0] / 1e6, d[1] / 1e6, (unsigned long long)d[20], d[21] / 1e6, hvk_pso_level(), (unsigned long long)d[3], d[4] / 1e6, (unsigned long long)d[5], d[6] / 1e6, (unsigned long long)d[7], d[8] / 1e6,
+        (unsigned long long)d[9], (unsigned long long)d[18], (unsigned long long)d[10], d[11] / 1e6, (unsigned long long)d[17], (unsigned long long)d[16], (unsigned long long)d[12],
+        (unsigned long long)d[13], (unsigned long long)d[14], (unsigned long long)a.pending, (unsigned long long)d[22], (unsigned long long)d[23], (unsigned long long)d[24],
+        (unsigned long long)d[25], (unsigned long long)d[2]);
+    for (int i = 0; i < HVK_W_N; i++) if (d[NV + i] && k < n) k += (size_t)snprintf(o + k, n - k, " %s %llu / %.1f ms,", hvk_wait_why[i], (unsigned long long)d[NV + i], d[NV + HVK_W_N + i] / 1e6);
+    if (k < n) snprintf(o + k, n - k, " longest %.2f ms, over 2 ms %llu", hvk_pso_take_window_max() / 1e6, (unsigned long long)d[15]);
+    memcpy(p, v, sizeof p);
+}
+void be_alloc_stats(uint64_t *waits, uint64_t *grown, int *n) { *waits = *grown = 0; *n = 0; }
+void be_pkg_edge_stats(uint64_t *allocs, uint64_t *bytes, uint64_t *peak_bytes, uint64_t *fails, uint64_t *fail_bytes) { *allocs = *bytes = *peak_bytes = *fails = *fail_bytes = 0; }
+void be_spare_stats(uint64_t *held, uint64_t *trimmed, uint64_t *trimmed_mb) { *held = *trimmed = *trimmed_mb = 0; }
+void be_pool_stats(uint64_t s[POOL_STATS]) { memset(s, 0, POOL_STATS * sizeof *s); }
+void be_dispatch_barrier_stats(uint64_t *game, uint64_t *copy, uint64_t *unranged, uint64_t *none) { *game = *copy = *unranged = *none = 0; }
+void be_tf_stats(uint64_t v[4]) { memset(v, 0, 4 * sizeof *v); }
+void be_geohoist_stats(uint64_t *hoisted, uint64_t *refused, uint64_t *stops) { *hoisted = *refused = 0; memset(stops, 0, 6 * sizeof *stops); }   // stops: 6, as hle_nvn.c reads them
+void be_geomesh_stats(uint64_t *draws, uint64_t *wide, uint64_t *redraws, uint64_t *refused, uint64_t *reasons) { *draws = *wide = *redraws = *refused = 0; memset(reasons, 0, 5 * sizeof *reasons); }
+uint64_t be_geocomp_stats(char *out, size_t n) { if (n) out[0] = 0; return 0; }
+void be_fb_stats(uint64_t *same, uint64_t *redirected, uint64_t *tile, uint64_t *whole) { *same = *redirected = *tile = *whole = 0; }
+void be_dbnd_stats(uint64_t *o, uint64_t *d, uint64_t *c, uint64_t *e) { *o = *d = *c = *e = 0; }
+void be_gsb_stats(uint64_t *n, uint64_t *bytes) { *n = *bytes = 0; }
+
+// ---------- Per operation (nvn_replay_exec, in record order) ----------
+// DM_NVN_CAPTURE's hooks (nvn_capture.h): the Metal backend writes captures (nvn_capture.inc); this one does not, said once when the switch asks for one
+static void cap_red(void) { const char *e = getenv("DM_NVN_CAPTURE"); if (e && *e) HVK_RED_ONCE("DM_NVN_CAPTURE: captures are written by the Metal backend only; nothing is captured"); }
+void nvn_cap_submit(int n, const uint64_t *handles) { (void)n; (void)handles; cap_red(); }
+void nvn_cap_present(const tex_t *t, const int crop[4]) { (void)t; (void)crop; }
+void nvn_cap_queue(uint64_t serial, int waits) { (void)serial; (void)waits; }
+
+int be_list_begin(void) { return 0; }
+int be_rec_pre(const uint8_t *rec, const op_hdr *h, int list) { (void)rec; (void)h; (void)list; return 0; }   // no look-ahead: every record reaches the decoder
+void be_state_dirty(uint32_t mask) { (void)mask; }   // the draw reads S itself; pipelines and descriptor sets are cached by content
+void be_end(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; (void)a; }
+void be_signal_event(const uint8_t *rec, const op_hdr *h, const void *a) {
+    (void)rec; (void)h;
+    volatile uint32_t *val; uint32_t m, v; memcpy(&val, a, 8); memcpy(&m, (const uint8_t *)a + 8, 4); memcpy(&v, (const uint8_t *)a + 12, 4);
+    if (hvk.on) { hvk_signal_event(val, m, v); return; }
+    NULLRED();   // the event's value as the GPU would leave it, at once: the replay is the GPU here
+    if (!val) return;
+    dm_guest_write_prepare((void *)(uintptr_t)val, 4);
+    if (m == NVN_EVENT_SIGNAL_MODE_ADD) *val += v; else *val = v;
+}
+void be_report_counter(const uint8_t *rec, const op_hdr *h, const void *a) {
+    (void)rec; (void)h; uint64_t t, ad; memcpy(&t, a, 8); memcpy(&ad, (const uint8_t *)a + 8, 8);
+    if (hvk.on) hvk_report_counter(t, ad); else NULLRED();
+}
+void be_render_cond(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; if (hvk.on) hvk_render_cond(a); else NULLRED(); }
+// The sync object is fenced with the submission that reaches it (the open one), as the Metal backend fences it
+void be_fence_sync(const uint8_t *rec, const op_hdr *h, const void *a) {
+    (void)rec; (void)h; sync_t *s; memcpy(&s, a, 8);
+    if (!s) return;
+    if (hvk.on) { uint64_t f = hvk_open_fence(); s->fence = f ? f : hvk_last() + 1; s->fenced = 1; return; }
+    NULLRED(); s->fence = atomic_load(&g_null_fence) + 1; s->fenced = 1;
+}
+void be_reset_counter(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; uint64_t t; memcpy(&t, a, 8); if (hvk.on) hvk_reset_counter(t); else NULLRED(); }
+void be_fill(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; const p_clear_buf *c = a; if (hvk.on) hvk_fill(c->addr, c->size, c->value); else NULLRED(); }
+void be_copy_b2b(const uint8_t *rec, const op_hdr *h, const void *a) {
+    (void)rec; (void)h; uint64_t s, d, n; memcpy(&s, a, 8); memcpy(&d, (const uint8_t *)a + 8, 8); memcpy(&n, (const uint8_t *)a + 16, 8);
+    if (hvk.on) hvk_copy_b2b(s, d, n); else NULLRED();
+}
+void be_update_ub(const uint8_t *rec, const op_hdr *h, const void *a) {
+    (void)rec; (void)h; uint64_t d, n; memcpy(&d, a, 8); memcpy(&n, (const uint8_t *)a + 8, 8);
+    if (hvk.on) hvk_update_ub((const uint8_t *)a + 16, d, n); else NULLRED();
+}
+void be_set_rt(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; if (hvk.on) hvk_set_rt(a); else { NULLRED(); R.rt = *(const p_set_rt *)a; R.has_rt = 1; } }
+void be_clear_color(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; if (hvk.on) hvk_clear_color(a); else NULLRED(); }
+void be_clear_ds(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; if (hvk.on) hvk_clear_ds(a); else NULLRED(); }
+void be_draw(const uint8_t *rec, const op_hdr *h, const void *a) { if (!hvk.on) { NULLRED(); return; } p_draw t; hvk_draw(draw_rec(a, h->size, &t), NULL, rec, h->size); }
+void be_draw_idx(const uint8_t *rec, const op_hdr *h, const void *a) { if (!hvk.on) { NULLRED(); return; } p_draw_idx t; hvk_draw(NULL, draw_idx_rec(a, h->size, &t), rec, h->size); }
+void be_bind_program(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; (void)a; }   // the program is resolved at the draw (S.prog, S.cprog)
+void be_tf_bind(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; (void)a; if (hvk.on) hvk_tf_bind_note(); }   // an open capture segment ends before its buffers change (vk_commands.c)
+void be_tf_state_note(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; (void)a; }
+void be_tf_state(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; if (hvk.on) hvk_tf_state(a); else NULLRED(); }
+void be_rast_discard(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; (void)a; }   // dynamic state: the next draw sets it from S
+void be_copy_b2t(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; if (hvk.on) hvk_copy_b2t(a, h->size, 0); else NULLRED(); }   // size: the record's strides (copy_strides)
+void be_copy_t2b(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; if (hvk.on) hvk_copy_b2t(a, h->size, 1); else NULLRED(); }
+void be_copy_t2t(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; if (hvk.on) hvk_copy_t2t(a); else NULLRED(); }
+void be_clear_tex(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; if (hvk.on) hvk_clear_tex(a); else NULLRED(); }
+void be_dispatch(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; if (hvk.on) hvk_dispatch(a); else NULLRED(); }
+// The records upstream 90edd532 added that the Vulkan backend does not replay yet: each declared once with a red line, and skipped (docs/design/vulkan-backend.md, "Merge of
+// upstream 90edd532"). OP_BIND_AS keeps the binding in S.acceleration for when acceleration structures come
+void be_multi_draw(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; (void)a; HVK_RED_ONCE("multi-draw indirect with a GPU count (OP_MULTI_DRAW) is not replayed: those draws are skipped"); }
+void be_draw_tex(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; (void)a; HVK_RED_ONCE("nvnCommandBufferDrawTexture (OP_DRAW_TEX) is not replayed: the texture is not drawn"); }
+void be_dlss(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; (void)a; HVK_RED_ONCE("NVN2 DLSS evaluation (OP_DLSS) is not replayed: its output is not written"); }
+void be_as_build(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; (void)a; HVK_RED_ONCE("NVN2 acceleration structure builds (OP_AS_BUILD) are not replayed"); }
+void be_as_copy(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; (void)a; HVK_RED_ONCE("NVN2 acceleration structure copies (OP_AS_COPY) are not replayed"); }
+void be_bind_as(const uint8_t *rec, const op_hdr *h, const void *a) {
+    (void)rec; (void)h; const p_bind_as *b = a;
+    if (b->stage < 9 && b->index < 32) S.acceleration[b->stage][b->index] = b->address;
+}
+void be_rt_dispatch(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; (void)a; HVK_RED_ONCE("NVN2 ray dispatches (OP_RT_DISPATCH) are not replayed: nothing is traced"); }
+void be_barrier(const uint8_t *rec, const op_hdr *h, const void *a) { (void)rec; (void)h; int32_t bits; memcpy(&bits, a, 4); if (hvk.on) hvk_barrier(bits); else NULLRED(); }
+
+// ---------- The frontend's hooks into its backend ----------
+uint64_t nvn_state_hook_compose(uint64_t old_serial, const prog_t *const bst[5]) { return hvk.on ? hvk_prog_compose(old_serial, bst) : nvn_new_serial(); }   // a combined program's serial
+void nvn_state_hook_bind(uint32_t op, const p_bind_handles *b) { (void)op; nvn_bind_fresh(b); }   // deferred handles are read again before the bind applies (BindTexturesDeferred)
+void nvn_state_hook_bind_bad(const void *rec, int n) { (void)rec; HVK_RED_ONCE("a texture bind record holds a handle count of %d (overwritten after it was recorded): skipped", n); }
+void nvn_state_hook_img_range(const p_bind_handles *b) { HVK_RED_ONCE("an image bind of slots %d + %d past the 32 image slots: skipped", b->first, b->n); }
+// The stages a program holds, for NVN's rule that a program with no vertex shader bound with the vertex bit keeps the vertex stage (nvn_state_bind_stages): the Metal backend
+// reads them from the shader map without loading a library (nvn_mtl.m prog_stage_mask); here not known at the bind (the modules load at the draw), so the rule does not apply
+uint8_t nvn_state_hook_stage_mask(const prog_t *p) { (void)p; return 0; }
+int nvn_state_hook_rt_program(const prog_t *p) { (void)p; return 0; }   // no ray tracing programs (be_rt_program_set)
+void nvn_state_hook_prog_keep(prog_t *copy, const prog_t *source) { be_prog_snapshot(copy, source); }   // the queue's copy of a program bound past its job (nvn_state_preserve)
+void nvn_state_hook_prog_drop(prog_t *p) { be_prog_unpin(p); }
+void nvn_state_hook_tex_keep(uint64_t serial, uint64_t old) { be_tex_pin(serial); be_tex_unpin(old); }
+int nvn_resolve_hook_ubo_copy(uint64_t a, size_t n, void *out) { (void)a; (void)n; (void)out; return 0; }   // no copies of inline updates: the ledger has them (nvn_gw_pend_read)
+void nvn_resolve_hook_ubo_stale(int stage, int reg, int off, int kind) {
+    HVK_RED_ONCE("the uniform buffer holding bindless handles (stage %d slot %d +%#x) has GPU-side writes in this submission (%s): the current value is read", stage, reg, off,
+                 kind == 2 ? "a buffer copy" : kind == 3 ? "a fill" : kind == 1 ? "an inline update covering part of it" : "more writes than the host tracks");
+}
+void nvn_resolve_hook_mem_read(uint64_t a, size_t n, void *out) {   // guest memory is host memory: read it where a pool holds it, as the GPU would
+    void *b; uint64_t off;
+    if (be_addr(a, n, &b, &off)) memcpy(out, (const void *)(uintptr_t)a, n);
+}

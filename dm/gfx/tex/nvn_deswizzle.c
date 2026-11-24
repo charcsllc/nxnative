@@ -43,6 +43,15 @@ uint64_t nvn_bl_offset(uint32_t x, uint32_t y, uint32_t z, uint32_t row_bytes, u
          + gob_off(x, y, switch2);
 }
 
+// nvn_bl_offset's row and slice terms for block row y of slice z (the block height and depth are powers of two: shifts and masks); the byte's terms are nvn_bl_row_at's, both in the
+// texture's GOB order (g_segments: the X1's piece offsets, or the Switch 2's)
+nvn_bl_row nvn_bl_row_of(uint32_t y, uint32_t z, uint32_t row_bytes, uint32_t rows, unsigned th, unsigned td, int switch2) {
+    const gob_segments *g = &g_segments[switch2 != 0];
+    const uint64_t block = 512ull << (th + td), gobs_x = ((uint64_t)row_bytes + 63) >> 6, blocks_y = ((uint64_t)rows + (8u << th) - 1) >> (3 + th);
+    return (nvn_bl_row){(uint64_t)(z >> td) * gobs_x * blocks_y * block + (uint64_t)(y >> (3 + th)) * gobs_x * block
+                        + ((uint64_t)(z & ((1u << td) - 1)) << th | (uint64_t)((y & ((8u << th) - 1)) >> 3)) * 512 + g->y[y & 7], block, g->x};
+}
+
 static uint32_t mip(uint32_t s, unsigned l) { s >>= l; return s ? s : 1; }
 
 // Geometry of this level: width-in-blocks byte count, block row count, slice count, and where this level and layer starts in storage; returns -1 for unsupported textures

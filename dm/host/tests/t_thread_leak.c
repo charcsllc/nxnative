@@ -7,16 +7,30 @@
 #include <stdlib.h>
 #include <stdio.h>
 #include <pthread.h>
+#if defined(__APPLE__)
 #include <malloc/malloc.h>
+#endif
 static _Atomic long g_live_blocks, g_live_bytes, g_total_bytes;
 static void *t_calloc(size_t n, size_t sz) { void *p = calloc(n, sz); atomic_fetch_add(&g_live_blocks, 1); atomic_fetch_add(&g_live_bytes, (long)(n * sz)); atomic_fetch_add(&g_total_bytes, (long)(n * sz)); return p; }
 static _Atomic long g_freed_req;   // number of frees
 static void t_free(void *p) { if (!p) return; atomic_fetch_sub(&g_live_blocks, 1); atomic_fetch_add(&g_freed_req, 1); free(p); }
 #define calloc t_calloc
 #define free t_free
+#if !defined(__APPLE__) || !defined(__aarch64__)
+// thread.c's form for the x86-64 engine takes the TLS block and the thread-local region from the engine's arena: counted here as the calloc / free they replace
+static void *t_guest_alloc(size_t n) { return t_calloc(1, n); }
+static void t_guest_free(void *p, size_t n) { (void)n; t_free(p); }
+#define dm_guest_alloc t_guest_alloc
+#define dm_guest_free t_guest_free
+#endif
 #include "../thread.c"
 #undef calloc
 #undef free
+#if !DM_NATIVE_EXEC
+#undef dm_guest_alloc
+#undef dm_guest_free
+void dm_aot_set_tls(uint64_t tpidr_el0, uint64_t tpidrro_el0) { (void)tpidr_el0; (void)tpidrro_el0; }   // the engine's state block: none here
+#endif
 
 pthread_key_t g_key18, g_keytls, g_keytlr, g_keygate;
 uint64_t dm_gate_top[1024]; const uint8_t dm_gate_stubs[16 * 1024];   // entry.S's gate tables (guest_gate_stack, which this test does not call)

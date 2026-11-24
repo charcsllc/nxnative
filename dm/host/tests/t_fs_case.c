@@ -3,16 +3,16 @@
 #ifndef HLE_FS_SOURCE
 #define HLE_FS_SOURCE "../hle_fs.c"
 #endif
-#include <sys/xattr.h>
+#include "../dm.h"   // the platform layer's plat_xattr_set (an extended attribute on Apple), before the substitution below
 #include <errno.h>
 static int fail_name_write;
-static int fake_setxattr(const char *p, const char *name, const void *v, size_t n, u_int32_t pos, int opt) {
+static int fake_xattr_set(const char *p, const char *name, const void *v, size_t n) {
     if (fail_name_write) { errno = ENOSPC; return -1; }
-    return setxattr(p, name, v, n, pos, opt);
+    return plat_xattr_set(p, name, v, n);
 }
-#define setxattr fake_setxattr
+#define plat_xattr_set fake_xattr_set
 #include HLE_FS_SOURCE
-#undef setxattr
+#undef plat_xattr_set
 struct dm_flags g_flag; uint64_t g_t0_ns;
 uint64_t now_ns(void) { return 0; }
 void dm_guest_write_prepare(void *a, size_t n) { (void)a; (void)n; }
@@ -40,6 +40,12 @@ static int entry_count(void) {
     h_fs_ReadDirectory(&n, e, h, 32); h_fs_CloseDirectory(h); return (int)n;
 }
 static void *create_race(void *p) { return (void *)(uintptr_t)h_fs_CreateFile(p, 0); }
+// Whether the platform layer finds a guest path's host entry under the same name the C runtime created it with: a missing attribute (ENOATTR / ENODATA, or no attribute support)
+// means the entry exists, ENOENT that it does not. On Windows the platform layer converts the UTF-8 path to UTF-16 itself while the C runtime takes the process code page
+static int on_host(const char *guest) {
+    char hp[1024], b[8]; if (!host_path(guest, hp, sizeof hp, NULL)) return 0;
+    errno = 0; return plat_xattr_get(hp, "org.nxnative.test-absent", b, sizeof b) < 0 && errno != ENOENT;
+}
 module_t *g_mod; int g_nmod;   // Module table (MountSave picks save fixes by main build ID): this unit test loads no modules
 int main(void) {
     char root[1024], save[1024], p[1100];
@@ -49,6 +55,9 @@ int main(void) {
     if (!mkdtemp(root)) { perror("mkdtemp"); return 2; }
     snprintf(save, sizeof save, "%s/save", root); mkdir(save, 0755);
     snprintf(p, sizeof p, "%s/Legacy", save); FILE *f = fopen(p, "w"); fputs("old", f); fclose(f);
+    // Whether the host file system folds case (APFS and NTFS by default): only there do two guest names collide on the host and take an alias with its metadata.
+    // On a case-sensitive one (Linux ext4, a case-sensitive APFS volume) every guest name is its own host name and no metadata is ever written
+    struct stat st; snprintf(p, sizeof p, "%s/legacy", save); int folds_case = !lstat(p, &st);
     setenv("DM_SAVE", save, 1); CHECK(h_fs_MountSave("save", NULL) == RES_OK, "mount the existing save");
     uint64_t h = 0; int32_t type = -1;
     CHECK(content("save:/Legacy", "old"), "the existing name with its case is readable");
@@ -108,13 +117,16 @@ int main(void) {
     CHECK(content("save:/.dm-case-1", "real") && content("save:/LEGACY", "old"), "a physical alias does not pose as a real guest name");
     CHECK(listed("save:/", ".dm-case-1", ENT_FILE), "a real guest name with the alias prefix is listed under its own name");
     CHECK(h_fs_CreateFile("save:/plain", 0) == RES_PATH_EXISTS, "creating an ordinary name twice is still refused");
-    int before = entry_count(); fail_name_write = 1;
-    CHECK(h_fs_CreateFile("save:/PLAIN", 0) == RES_FAIL, "disk full on alias metadata: create file returns failure");
-    CHECK(entry_count() == before && h_fs_GetEntryType(&type, "save:/PLAIN") == RES_PATH_NOT_FOUND, "a failed create leaves no file or guest name behind");
-    CHECK(h_fs_CreateDirectory("save:/trail") == RES_FAIL && entry_count() == before, "alias directory metadata fails: the new directory is removed");
-    CHECK(h_fs_RenameFile("save:/plain", "save:/PLAIN") == RES_FAIL, "rename metadata failure returns failure");
-    CHECK(content("save:/plain", "again") && h_fs_GetEntryType(&type, "save:/PLAIN") == RES_PATH_NOT_FOUND && entry_count() == before, "a failed rename fully restores the original name and content");
-    fail_name_write = 0;
+    int before = entry_count();
+    if (folds_case) {   // a failing alias metadata write: PLAIN, trail and the rename target collide with plain / Trail on the host
+        fail_name_write = 1;
+        CHECK(h_fs_CreateFile("save:/PLAIN", 0) == RES_FAIL, "disk full on alias metadata: create file returns failure");
+        CHECK(entry_count() == before && h_fs_GetEntryType(&type, "save:/PLAIN") == RES_PATH_NOT_FOUND, "a failed create leaves no file or guest name behind");
+        CHECK(h_fs_CreateDirectory("save:/trail") == RES_FAIL && entry_count() == before, "alias directory metadata fails: the new directory is removed");
+        CHECK(h_fs_RenameFile("save:/plain", "save:/PLAIN") == RES_FAIL, "rename metadata failure returns failure");
+        CHECK(content("save:/plain", "again") && h_fs_GetEntryType(&type, "save:/PLAIN") == RES_PATH_NOT_FOUND && entry_count() == before, "a failed rename fully restores the original name and content");
+        fail_name_write = 0;
+    } else printf("- the host file system is case-sensitive: guest names never collide there and no alias metadata is written, so the 5 alias metadata failure checks do not apply\n");
     CHECK(h_fs_CreateFile("save:/PLAIN", -1) == RES_FAIL && entry_count() == before, "a failed size set on an alias file leaves no physical name without metadata");
     CHECK(h_fs_CreateFile("save:/Ä", 0) == RES_OK && h_fs_CreateFile("save:/ä", 0) == RES_OK, "non-ASCII case variants coexist too");
     CHECK(write_text("save:/Ä", "upper") && write_text("save:/ä", "lower") && content("save:/Ä", "upper") && content("save:/ä", "lower"), "non-ASCII names have separate content");
@@ -122,6 +134,19 @@ int main(void) {
     pthread_create(&t[0], NULL, create_race, "save:/Race"); pthread_create(&t[1], NULL, create_race, "save:/race");
     pthread_join(t[0], &r0); pthread_join(t[1], &r1);
     CHECK(!r0 && !r1 && listed("save:/", "Race", ENT_FILE) && listed("save:/", "race", ENT_FILE), "concurrent creates of both case variants each publish separately");
+    // Non-ASCII names are UTF-8 on the host file system of every platform (Windows: the UTF-8 code page of plat/win32_utf8.manifest): a directory with a file in it, and a name
+    // with characters outside code page 1252, through Commit + remount. The test source keeps them as escapes
+    const char *nandu = "\xC3\x91" "and\xC3\xBA", *nihon = "\xE6\x97\xA5\xE6\x9C\xAC";   // U+00D1 "and" U+00FA (a Spanish word), U+65E5 U+672C (Japanese)
+    char gdir[64], gfile[80], gjp[64];
+    snprintf(gdir, sizeof gdir, "save:/%s", nandu); snprintf(gfile, sizeof gfile, "save:/%s/nido", nandu); snprintf(gjp, sizeof gjp, "save:/%s", nihon);
+    CHECK(h_fs_CreateDirectory(gdir) == RES_OK && h_fs_CreateFile(gfile, 0) == RES_OK && write_text(gfile, "huevo") && content(gfile, "huevo"), "a file in a non-ASCII directory is written and read back");
+    CHECK(listed("save:/", nandu, ENT_DIR) && listed(gdir, "nido", ENT_FILE), "the non-ASCII directory is listed under its exact UTF-8 name, with its file");
+    CHECK(on_host(gdir) && on_host(gfile), "the platform layer finds the non-ASCII directory and its file under the same names");
+    CHECK(h_fs_CreateFile(gjp, 0) == RES_OK && write_text(gjp, "sol") && content(gjp, "sol") && listed("save:/", nihon, ENT_FILE), "a name outside code page 1252 is created, listed and read back exactly");
+    CHECK(on_host(gjp), "the platform layer finds the name outside code page 1252 under the same name");
+    CHECK(h_fs_Commit("save") == RES_OK, "commit the non-ASCII names");
+    g_nmnt = 0; CHECK(h_fs_MountSave("save", NULL) == RES_OK, "remount after committing the non-ASCII names");
+    CHECK(content(gfile, "huevo") && content(gjp, "sol") && listed("save:/", nandu, ENT_DIR) && listed(gdir, "nido", ENT_FILE) && listed("save:/", nihon, ENT_FILE), "commit + remount keeps the non-ASCII directory, its file and the name outside code page 1252");
     rm_tree(root);
     printf("== case: %d checks, %d failed ==\n", checks, fails); return fails != 0;
 }

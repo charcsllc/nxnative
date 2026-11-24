@@ -8,6 +8,9 @@
 #include <sys/mman.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#ifndef MINCORE_INCORE
+#define MINCORE_INCORE 1   // Linux: bit 0 of each mincore byte is "resident", Apple's MINCORE_INCORE
+#endif
 
 static int memory_mprotect(void *addr, size_t size, int prot);
 static void *memory_mmap(void *addr, size_t size, int prot, int flags, int fd, off_t offset);
@@ -21,13 +24,37 @@ static int memory_getpagesize(void) {
     return getpagesize();
 #endif
 }
-#define getpagesize memory_getpagesize
+// The guest block reserved on a boundary of the emulated page, as a host with that page size reserves it (on 4 KiB hosts TEST_PAGE_16K needs 16 KiB alignment; with real 16 KiB pages it is the reservation itself)
+static void *memory_reserve(size_t n) {
+    size_t pg = (size_t)memory_getpagesize();
+    uint8_t *p = plat_vm_reserve(n + pg);
+    return p ? (void *)(((uintptr_t)p + pg - 1) & ~(uintptr_t)(pg - 1)) : NULL;
+}
+// hle_svc.c reaches the host through plat_page_size / plat_vm_protect / plat_vm_reserve (getpagesize / mprotect / mmap on POSIX)
+#define plat_page_size memory_getpagesize
+#define plat_vm_protect memory_mprotect
+#define plat_vm_reserve memory_reserve
+#if !DM_NATIVE_EXEC
+#define dm_guest_reserve memory_reserve   // the x86-64 engine's form of the same reservation (hle_svc.c mem_init_once)
+#endif
+#define getpagesize memory_getpagesize   // Apple's guest files and guest_release keep upstream's calls
 #define mprotect memory_mprotect
 #define mmap memory_mmap
 #define pthread_create memory_pthread_create
 #define abort memory_abort
 #include "../hle_svc.c"
 #undef abort
+#undef plat_vm_reserve
+#if !DM_NATIVE_EXEC
+#undef dm_guest_reserve
+// The rest of the x86-64 engine's side of hle_svc.c, which this fixture does not reach (no user exception context, no main-thread guest stack)
+void *dm_guest_alloc(size_t n) { (void)n; abort(); }
+int dm_aot_main_stack(uint64_t *lo, uint64_t *size) { (void)lo; (void)size; return 0; }
+void be_guest_map(void *mem, uint64_t size) { (void)mem; (void)size; }     // the graphics backend's view of guest memory (t_guest_map counts the calls)
+void be_guest_unmap(void *mem, uint64_t size) { (void)mem; (void)size; }
+#endif
+#undef plat_vm_protect
+#undef plat_page_size
 #undef pthread_create
 #undef mprotect
 #undef mmap
@@ -336,8 +363,15 @@ static void stack_pages_released(void) {
     } else {
         size_t native_pg = (size_t)getpagesize();
         for (uintptr_t p = stack + pg; p < stack + 2 * pg; p += native_pg) {
-            char resident;
+#if DM_NATIVE_EXEC
+            char resident;   // Apple's guest_release maps fresh anonymous pages over the range: nothing of it stays resident
             assert(!mincore((void *)p, native_pg, &resident) && !(resident & MINCORE_INCORE));
+#else
+            // The x86-64 engine's guest_release closes the range and lets the kernel drop its pages when it wants them (plat_vm_discard, MADV_FREE): resident until
+            // then, so what is checked is that the range is closed
+            uint8_t b; size_t got = 0;
+            assert(plat_mem_read(p, &b, 1, &got) && !got);
+#endif
         }
     }
     memset((void *)src, 0x7c, size);
@@ -372,7 +406,7 @@ static void ownership(void) {
     assert(!pages(0, alias, P) && !pages(1, alias, P));
     assert(*(uint8_t *)(alias + P) == 0x34);
     memset((void *)(stack + P), 0x76, 2 * P);
-    readonly_base = alias; readonly_size = memory_getpagesize();
+    readonly_base = (alias + P) & ~(uintptr_t)(memory_getpagesize() - 1); readonly_size = memory_getpagesize();   // the host page the copy back writes first (alias itself with 16 KiB pages)
     assert(!mprotect((void *)readonly_base, readonly_size, PROT_READ));
     assert(!unmap(stack + P, alias + P, 2 * P) && !readonly_size);
     for (size_t i = P; i < 3 * P; ++i) assert(((uint8_t *)alias)[i] == 0x76);
@@ -558,12 +592,12 @@ static void fragmented_queries(void) {
     assert(!pages(0, alias, N * P));
 }
 static void lazy_commit(void) {
-    size_t n = DM_GAME_APP_POOL - DM_GAME_MEM_USED, pg = memory_getpagesize();
-    char *resident = malloc(n / pg); assert(resident);
+    size_t n = DM_GAME_APP_POOL - DM_GAME_MEM_USED, pg = memory_getpagesize(), hp = (size_t)getpagesize();   // mincore reports real host pages (TEST_PAGE_16K on a 4 KiB host)
+    char *resident = malloc(n / hp); assert(resident);
     assert(!pages(1, alias, n));
-    assert(!mincore((void *)alias, n, resident));
+    assert(!mincore((void *)alias, n, (void *)resident));
     size_t count = 0;
-    for (size_t i = 0; i < n / pg; ++i) count += !!(resident[i] & MINCORE_INCORE);
+    for (size_t i = 0; i < n / hp; ++i) count += !!(resident[i] & MINCORE_INCORE);
     assert(count < 32); // metadata scans must not fault the anonymous backing in
     ((uint8_t *)alias)[0] = 0x98;
     assert(!pages(0, alias, pg) && !pages(1, alias, pg));
@@ -580,7 +614,9 @@ static void metadata_limit(void) {
     // Releasing one destination makes its metadata available again.
     assert(!unmap(stack + 123 * P, alias + 123 * P, P));
     assert(!map(stack + 123 * P, alias + MAX_MAP * P, P));
-    assert(protects == before + 1);
+    // The map opens the destination (one protection call). The unmap gave its page back when a host page is a guest page: Apple's guest_release maps fresh pages over it,
+    // with no protection call; the x86-64 engine's closes it (plat_vm_protect), one more
+    assert(protects == before + 1 + (!DM_NATIVE_EXEC && memory_getpagesize() == P));
     for (unsigned i = 0; i < MAX_MAP; ++i)
         assert(!unmap(stack + i * P, alias + (i == 123 ? MAX_MAP : i) * P, P));
     assert(!pages(0, alias, (MAX_MAP + 1) * P));
@@ -656,6 +692,8 @@ static void release_fallback(void) {
     fail_mmap = 0;
 }
 // A heap given back reads 0 when it grows again: a fresh mapping in anonymous memory, and SetHeapSize's zeroing with the guest in files (DM_GUEST_FILE), where the pages keep their bytes
+// The guest in files (DM_GUEST_FILE) is Apple's (hle_svc.c, under DM_NATIVE_EXEC): its rule and its sweep are checked there; the port's guest memory stays anonymous
+#if DM_NATIVE_EXEC
 // The rule that puts the guest in files: the switch when it is set, otherwise a pool and the host's margin over a known room to the memory limit
 static void file_rule(void) {
     unsetenv("DM_GUEST_FILE_HOST");
@@ -694,6 +732,7 @@ static void file_sweep(void) {
     assert(!pages(0, a, 8 * pg));
     guest_file_sweep(); guest_file_sweep();
 }
+#endif
 static void heap_regrow(void) {
     assert(!resize(4 * 1024 * 1024));
     memset((void *)(heap + 3 * 1024 * 1024), 0x5a, P);
@@ -778,13 +817,19 @@ int main(int argc, char **argv) {
     if (!getenv("DM_ALIAS_SIZE")) {
         size_t want_alias = dm_sdk_ounce() ? SWITCH2_ALIAS : SWITCH_ALIAS;
         assert(info(I_AliasSize) == want_alias);   // the Mac's alias region is the console's (64 GB Switch 1, 128 GB Switch 2), whatever the profile can give an iPhone; DM_ALIAS_SIZE=<mem_alias> runs these tests on an iPhone's
-#if !__has_feature(address_sanitizer)
+#if DM_NATIVE_EXEC && !__has_feature(address_sanitizer)
+        // Where the host's own reservation lands (hle_svc.c mmap). The x86-64 engine's guest block is the arena's (aot_arena.c dm_guest_reserve, below 2^39 by its
+        // own placement), which this fixture replaces with a plain reservation (memory_reserve) wherever the host puts it, so there is nothing of hle_svc.c's to check
         assert((uint64_t)(uintptr_t)g_as + g_reserve < UINT64_C(1) << 40);
 #endif
     }
 #endif
     layout_order(); readonly_shared_memory(); transfer_memory_setup();
-    lazy_commit(); alias_lifecycle(); device_shared_refused(); ownership(); stack_pages_released(); module_sources(); module_back_patch(); process_memory_walk(); failures(); release_fallback(); file_rule(); file_sweep(); heap_regrow(); concurrency(); fragmented_queries();
+    lazy_commit(); alias_lifecycle(); device_shared_refused(); ownership(); stack_pages_released(); module_sources(); module_back_patch(); process_memory_walk(); failures(); release_fallback();
+#if DM_NATIVE_EXEC
+    file_rule(); file_sweep();
+#endif
+    heap_regrow(); concurrency(); fragmented_queries();
     guest_helper();
     if (!mem_map_limit_on()) metadata_limit();
 #ifdef TEST_REAL_DIRTY

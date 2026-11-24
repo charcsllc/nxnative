@@ -9,10 +9,13 @@ endif
 GAME_DIR = ../../games/$(GAME)
 GAME_H = ../../host/gen/$(GAME)/game_profile.h
 
+# The frontend's shared replay files for the other backends (draw state, GPU-write ledger, handle resolution, pool table, decoder, pipeline rows): since the merge of upstream
+# 90edd532 the Metal backend keeps its own (nvn_mtl.m, upstream's text), so a Mac build links none of them; their own tests (t_state, t_gpuwrite, t_resolve, t_pools, t_replay, t_pipe) build them
+FRONT_ONLY = ../nvn/nvn_state.c ../nvn/nvn_gpuwrite.c ../nvn/nvn_resolve.c ../nvn/nvn_pools.c ../nvn/nvn_replay.c ../nvn/nvn_pipe.c
 # The host's shaders compiled for the Mac (host_msl_gen.h, made by the host Makefile from dm/gfx/msl; nvn/host_msl.m loads them)
 MSL_H = ../../host/gen/msl-macosx/host_msl_gen.h
 CFLAGS=-O1 -g -Wall -Wno-unused-function -I../nvn/include -I$(dir $(GAME_H)) -I$(dir $(MSL_H))
-GFX=$(filter-out ../nvn/hle_nvn.c,$(sort $(wildcard ../nvn/*.c ../nvn/*.m ../nvn/*.S ../tex/*.c ../tex/*.m)))
+GFX=$(filter-out ../nvn/hle_nvn.c ../nvn/nvn_null.c ../tex/nvn_fmt_vk.c $(FRONT_ONLY),$(sort $(wildcard ../nvn/*.c ../nvn/*.m ../nvn/*.S ../tex/*.c ../tex/*.m))) ../../third_party/cjson/cJSON.c ../../host/plat/plat_apple.c   # cJSON: the JSON reader of nvn_refl.c, as in the host Makefile; plat_apple.c: the platform layer (plat.h) hle_nvn.c and nvn_dirty.c call since step M6; nvn_null.c: the null backend of the hosts without Metal; nvn_fmt_vk.c: the Vulkan backend's format table (it includes the Vulkan headers, which need the include root CMake adds)
 GFX_H=$(wildcard ../nvn/*.h ../nvn/*.inc ../nvn/include/*.h ../tex/*.h) ../../host/hle.h ../../host/registration.h $(GAME_H) $(MSL_H)
 .DEFAULT_GOAL := t_nvn   # the profile header rule comes first, so keep the default goal as before
 # Regenerated on every make (host_msl_force), by the host Makefile: a header from an older game.py lacks newer defines; game.py writes it only when it changes, so an unchanged header rebuilds no test
@@ -49,8 +52,9 @@ check_t_rt_unbind: t_rt_unbind
 # target: ./t_x by default, with the environment its RUN_ENV gives it (check_t_x: RUN_ENV = MTL_DEBUG_LAYER=1, beside its build rule), or a check_t_x recipe of its own when it
 # runs several ways. A new test needs its source and its build rule; no list to add it to. NOT_RUN: helpers linked into other tests (t_host_stubs, t_present_rescue_focus, t_gpu_lost_front, t_link_ticks_screen),
 # fixtures test_image_atomic_bounds.py and test_global_memory.py build themselves (t_atomic_return, t_global_memory), t_geometry_primitive_id (the GPU half of test_dmsh_geometry.py, which gives it the directory of
-# its translated fixtures), t_compute_loops (test_dmsh_compute_loops.py supplies its rewritten fixtures), t_gpuprof, which CI's CPU subset runs (.github/workflows/tests.yml), and t_gpu_fault_kinds, whose cases fault the GPU on purpose
-NOT_RUN = t_host_stubs t_present_rescue_focus t_gpu_lost_front t_link_ticks_screen t_atomic_return t_global_memory t_geometry_primitive_id t_compute_loops t_gpuprof t_gpu_fault_kinds
+# its translated fixtures), t_compute_loops (test_dmsh_compute_loops.py supplies its rewritten fixtures), t_gpuprof, which CI's CPU subset runs (.github/workflows/tests.yml), and t_gpu_fault_kinds, whose cases fault the GPU on purpose,
+# and t_frontend, the NVN frontend over the null backend, which only dm/host/CMakeLists.txt builds (Linux and Windows; the Mac links the Metal backend)
+NOT_RUN = t_host_stubs t_present_rescue_focus t_gpu_lost_front t_link_ticks_screen t_atomic_return t_global_memory t_geometry_primitive_id t_compute_loops t_gpuprof t_gpu_fault_kinds t_frontend
 RUN_TESTS = $(filter-out $(NOT_RUN),$(basename $(sort $(wildcard t_*.c t_*.m))))
 check_t_%: t_%
 	$(RUN_ENV) ./$<
@@ -108,26 +112,26 @@ t_nvn_rt_state: t_nvn_rt_state.m $(MTL_T_DEP)
 check_t_nvn_rt_state: RUN_ENV = MTL_DEBUG_LAYER=1
 t_rt_comp: t_rt_comp.c ../nvn/hle_nvn.c ../nvn/nvn_rt.h ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(GFX_H)
 	clang $(CFLAGS) -fobjc-arc -o $@ t_rt_comp.c ../../host/crash.c ../../host/hle_bigstack.c t_host_stubs.c $(GFX) $(FW)
-t_dirty_slots: t_dirty_slots.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
-	clang $(CFLAGS) -o $@ t_dirty_slots.c ../../host/crash.c ../nvn/nvn_dirty.c
-t_dirty_race: t_dirty_race.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
-	clang $(CFLAGS) -o $@ t_dirty_race.c ../../host/crash.c
-t_dirty_init: t_dirty_init.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
-	clang $(CFLAGS) -o $@ t_dirty_init.c ../../host/crash.c ../nvn/nvn_dirty.c
-t_dirty_init_tsan: t_dirty_init.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
-	clang $(CFLAGS) -fsanitize=thread -o $@ t_dirty_init.c ../../host/crash.c ../nvn/nvn_dirty.c
+t_dirty_slots: t_dirty_slots.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h ../../host/plat/plat_apple.c $(GAME_H)
+	clang $(CFLAGS) -o $@ t_dirty_slots.c ../../host/crash.c ../../host/plat/plat_apple.c ../nvn/nvn_dirty.c
+t_dirty_race: t_dirty_race.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h ../../host/plat/plat_apple.c $(GAME_H)
+	clang $(CFLAGS) -o $@ t_dirty_race.c ../../host/crash.c ../../host/plat/plat_apple.c
+t_dirty_init: t_dirty_init.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h ../../host/plat/plat_apple.c $(GAME_H)
+	clang $(CFLAGS) -o $@ t_dirty_init.c ../../host/crash.c ../../host/plat/plat_apple.c ../nvn/nvn_dirty.c
+t_dirty_init_tsan: t_dirty_init.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h ../../host/plat/plat_apple.c $(GAME_H)
+	clang $(CFLAGS) -fsanitize=thread -o $@ t_dirty_init.c ../../host/crash.c ../../host/plat/plat_apple.c ../nvn/nvn_dirty.c
 .PHONY: tsan-dirty-init
 tsan-dirty-init: t_dirty_init_tsan
 	TSAN_OPTIONS=halt_on_error=1:abort_on_error=0 ./t_dirty_init_tsan   # exit, not abort: the crash handler this test installs would report the abort
-t_dirty_reuse: t_dirty_reuse.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
-	clang $(CFLAGS) -o $@ t_dirty_reuse.c ../../host/crash.c ../nvn/nvn_dirty.c
-t_dirty_reuse_tsan: t_dirty_reuse.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
-	clang $(CFLAGS) -fsanitize=thread -o $@ t_dirty_reuse.c ../../host/crash.c ../nvn/nvn_dirty.c
+t_dirty_reuse: t_dirty_reuse.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h ../../host/plat/plat_apple.c $(GAME_H)
+	clang $(CFLAGS) -o $@ t_dirty_reuse.c ../../host/crash.c ../../host/plat/plat_apple.c ../nvn/nvn_dirty.c
+t_dirty_reuse_tsan: t_dirty_reuse.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h ../../host/plat/plat_apple.c $(GAME_H)
+	clang $(CFLAGS) -fsanitize=thread -o $@ t_dirty_reuse.c ../../host/crash.c ../../host/plat/plat_apple.c ../nvn/nvn_dirty.c
 .PHONY: tsan-dirty-reuse
 tsan-dirty-reuse: t_dirty_reuse_tsan
 	TSAN_OPTIONS=halt_on_error=1:abort_on_error=0 ./t_dirty_reuse_tsan 2000   # exit, not abort: the crash handler this test installs would report the abort
-t_dirty_retire_race: t_dirty_retire_race.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h $(GAME_H)
-	clang $(CFLAGS) -o $@ t_dirty_retire_race.c ../../host/crash.c
+t_dirty_retire_race: t_dirty_retire_race.c ../nvn/nvn_dirty.c ../../host/crash.c ../nvn/nvn_dirty.h ../../host/plat/plat_apple.c $(GAME_H)
+	clang $(CFLAGS) -o $@ t_dirty_retire_race.c ../../host/crash.c ../../host/plat/plat_apple.c
 t_host_msl: t_host_msl.m ../nvn/host_msl.m ../nvn/host_msl.h $(MSL_H)
 	clang -O1 -g -Wall -I$(dir $(MSL_H)) -fobjc-arc -o $@ t_host_msl.m ../nvn/host_msl.m -framework Metal -framework Foundation
 t_builtin: t_builtin.m ../nvn/nvn_builtin.h ../nvn/host_msl.m $(MSL_H)
@@ -164,10 +168,28 @@ t_deswz_gpu: t_deswz_gpu.m ../tex/nvn_deswizzle.c ../tex/nvn_deswizzle_gpu.m ../
 	clang $(CFLAGS) -fobjc-arc -o $@ t_deswz_gpu.m ../tex/nvn_deswizzle.c ../tex/nvn_deswizzle_gpu.m ../nvn/nvn_tex.c ../nvn/host_msl.m -framework Metal -framework Foundation
 t_tex_layout: t_tex_layout.c ../nvn/nvn_tex.c ../nvn/nvn_tex.h
 	clang -O1 -Wall -o $@ t_tex_layout.c ../nvn/nvn_tex.c
-t_refl: t_refl.m ../nvn/nvn_refl.m ../nvn/nvn_refl.h
-	clang -O1 -g -Wall -I../nvn -fobjc-arc -o $@ t_refl.m ../nvn/nvn_refl.m -framework Metal -framework Foundation
+# The reflection parser in plain C, the only one since step M6 (every host; dm/host/CMakeLists.txt builds the same test for Linux and Windows)
+REFL_C_DEP=../nvn/nvn_refl.c ../nvn/nvn_refl.h ../nvn/nvn_refl_textype.h ../nvn/dmsh_abi.h ../../third_party/cjson/cJSON.c ../../third_party/cjson/cJSON.h
+t_refl_c: t_refl_c.c $(REFL_C_DEP)
+	clang -std=c11 -O1 -Wall -Wextra -I../nvn -I../../third_party/cjson -o $@ t_refl_c.c ../nvn/nvn_refl.c ../../third_party/cjson/cJSON.c
 t_hmap: t_hmap.c ../nvn/nvn_hmap.h
 	clang -O1 -Wall -o $@ t_hmap.c
+# The replay's draw and render-target state and its GPU-write ledger (plain C, every host): dm/host/CMakeLists.txt builds the same two for Linux and Windows
+t_state: t_state.c ../nvn/nvn_state.c ../nvn/nvn_state.h ../nvn/nvn_obj.h
+	clang -std=c11 -O1 -Wall -Wextra -I../nvn/include -o $@ t_state.c ../nvn/nvn_state.c
+t_gpuwrite: t_gpuwrite.c ../nvn/nvn_gpuwrite.c ../nvn/nvn_gpuwrite.h
+	clang -std=c11 -O1 -Wall -Wextra -o $@ t_gpuwrite.c ../nvn/nvn_gpuwrite.c
+# Its handle resolution and memory pool table (plain C, every host): built the same way for Linux and Windows
+t_resolve: t_resolve.c ../nvn/nvn_resolve.c ../nvn/nvn_resolve.h ../nvn/nvn_state.c ../nvn/nvn_state.h ../nvn/nvn_gpuwrite.c ../nvn/nvn_gpuwrite.h ../nvn/nvn_obj.h
+	clang -std=c11 -O1 -Wall -Wextra -I../nvn/include -o $@ t_resolve.c ../nvn/nvn_resolve.c ../nvn/nvn_state.c ../nvn/nvn_gpuwrite.c
+t_pools: t_pools.c ../nvn/nvn_pools.c ../nvn/nvn_pools.h
+	clang -std=c11 -O1 -Wall -Wextra -o $@ t_pools.c ../nvn/nvn_pools.c
+# Its decoder of command lists, over a stub backend (plain C, every host): built the same way for Linux and Windows
+t_replay: t_replay.c ../nvn/nvn_replay.c ../nvn/nvn_replay.h ../nvn/nvn_be.h ../nvn/nvn_state.c ../nvn/nvn_state.h ../nvn/nvn_obj.h
+	clang -std=c11 -O1 -Wall -Wextra -I../nvn/include -o $@ t_replay.c ../nvn/nvn_replay.c ../nvn/nvn_state.c
+# Its neutral pipeline description and the prewarm lists' pipeline rows, over every profile's pso_manifest.tsv (plain C, every host): built the same way for Linux and Windows
+t_pipe: t_pipe.c ../nvn/nvn_pipe.c ../nvn/nvn_pipe.h ../nvn/nvn_pso_skey.h ../nvn/nvn_state.h ../nvn/nvn_obj.h ../tex/nvn_fmt_mtl.c ../tex/nvn_fmt_mtl.h
+	clang -std=c11 -O1 -Wall -Wextra -I../nvn/include -o $@ t_pipe.c ../nvn/nvn_pipe.c ../tex/nvn_fmt_mtl.c
 t_pace: t_pace.c ../nvn/nvn_pace.h
 	clang -O1 -Wall -o $@ t_pace.c
 t_timestamp: t_timestamp.c ../nvn/nvn_timestamp.h

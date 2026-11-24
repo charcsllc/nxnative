@@ -2,7 +2,9 @@
 // input from a random-access picture so a replacement can reconstruct that
 // state without skipping pictures or returning substitutes to the player.
 #pragma once
+#if defined(__APPLE__)
 #include <VideoToolbox/VideoToolbox.h>
+#endif
 
 // Owned by a decoder's worker owner, so Stop / Flush / Finalize can cancel a
 // wait without touching codec state that is private to the worker thread.
@@ -12,6 +14,10 @@ void movie_vt_continue(movie_vt_control *control);
 int movie_vt_wait(movie_vt_control *control);
 int movie_vt_wait_unavailable(movie_vt_control *control);
 enum { MOVIE_VT_CANCELLED = 1 };
+
+// The session history below is VideoToolbox's (Apple). The control above is the movie decoder's cancellation (hle_movie.c), the same on every platform: the port's
+// decoders (the stopgap, Windows' Media Foundation) take it and never wait on it
+#if defined(__APPLE__)
 
 typedef struct {
     CMSampleBufferRef *samples;
@@ -60,3 +66,4 @@ static OSStatus movie_vt_replay(movie_vt_history *h, VTDecompressionSessionRef s
     h->replaying = 0;
     return status;
 }
+#endif

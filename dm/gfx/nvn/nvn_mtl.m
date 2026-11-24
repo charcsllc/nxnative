@@ -87,6 +87,19 @@ static uint64_t c2_handle(int stage, unsigned b);   // the handle c2 holds at by
 
 #define MLOG(...) dm_log("[dm] [nvn-mtl] " __VA_ARGS__)   // one line under one lock, written on the host stack when the caller is on a guest stack (dm.h dm_log): command recording runs on the game thread's stack
 #define MDIE(...) do { MLOG("FATAL " __VA_ARGS__); abort(); } while (0)
+
+// The reflection's dummy texture types (nvn_rbind.dtt) are the frontend's enum nvn_dtt (nvn_refl_textype.h, step M6), numbered as Metal numbers its texture types: this backend
+// takes them as MTLTextureType values, exactly the numbers the reflection carried before (each checked here)
+_Static_assert((int)NVN_DTT_1D == (int)MTLTextureType1D, "nvn_dtt: 1D");
+_Static_assert((int)NVN_DTT_1D_ARRAY == (int)MTLTextureType1DArray, "nvn_dtt: 1D array");
+_Static_assert((int)NVN_DTT_2D == (int)MTLTextureType2D, "nvn_dtt: 2D");
+_Static_assert((int)NVN_DTT_2D_ARRAY == (int)MTLTextureType2DArray, "nvn_dtt: 2D array");
+_Static_assert((int)NVN_DTT_2D_MULTISAMPLE == (int)MTLTextureType2DMultisample, "nvn_dtt: 2D multisample");
+_Static_assert((int)NVN_DTT_CUBE == (int)MTLTextureTypeCube, "nvn_dtt: cube");
+_Static_assert((int)NVN_DTT_CUBE_ARRAY == (int)MTLTextureTypeCubeArray, "nvn_dtt: cube array");
+_Static_assert((int)NVN_DTT_3D == (int)MTLTextureType3D, "nvn_dtt: 3D");
+_Static_assert((int)NVN_DTT_2D_MULTISAMPLE_ARRAY == (int)MTLTextureType2DMultisampleArray, "nvn_dtt: 2D multisample array");
+_Static_assert((int)NVN_DTT_BUFFER == (int)MTLTextureTypeTextureBuffer, "nvn_dtt: buffer");
 static void *realloc_or_die(void *p, size_t bytes, const char *what) {   // for a table the host cannot go on without: never NULL, so the caller cannot write through it or lose the old one
     void *grown = realloc(p, bytes); if (!grown) MDIE("no memory for %s (%zu bytes)", what, bytes);
     return grown;
@@ -1345,6 +1358,10 @@ void mtl_pool_replace(const void *const *del, int ndel, const void *const *add, 
     free(n);
     reg_bump(-1, REG_POOL);
 }
+// be_pool_add and be_pool_replace (nvn_be.h): the frontend gives each pool's NVN flags, for a backend that places memory by them (the Vulkan one); this backend's pool table
+// does not keep them, as before the port gave them (step M6)
+void mtl_pool_add_flags(const void *mem, uint64_t size, uint32_t nvn_flags) { (void)nvn_flags; mtl_pool_add(mem, size); }
+void mtl_pool_replace_flags(const void *const *del, int ndel, const void *const *add, const uint64_t *size, int nadd, uint32_t nvn_flags) { (void)nvn_flags; mtl_pool_replace(del, ndel, add, size, nadd); }
 
 // Address → pool: the last hit first, then a binary search over indices sorted by start address, and a full linear scan only when that fails (pools overlapping).
 // The Legend of Zelda: Breath of the Wild keeps about 1760 memory pools alive and every buffer binding of every draw looks one up; the old full scan took about 4% of the submit thread's samples (mtl_gpu_addr 222 / 6 s). Adding / removing pools invalidates the index, which is re-sorted when next used. Caller holds g_mu
@@ -7538,8 +7555,8 @@ static NvShader *shader_load(NSString *pc, int stage, int layer) {
     NvShader *o = [NvShader new]; o->gs_loc = o->lay_loc = -1;
     if (stage == NVN_RT_RESOURCE_STAGE && [j[@"rt"] isKindOfClass:NSDictionary.class]) o->rtMetadata = [j[@"rt"] copy];
     if (stage == 0 && [j[@"layer_from"] isKindOfClass:[NSDictionary class]]) { o->lay_loc = [j[@"layer_from"][@"loc"] intValue]; o->lay_comp = [[j[@"layer_from"][@"comp"] description] UTF8String][0]; }
-    char err[160];
-    if (nvn_refl_from_json(j, &o->rf, err, sizeof err)) { MLOG("[RED] shader %s reflection conversion failed: %s", pc.UTF8String, err); return nil; }
+    char err[160];   // the reflection from the file's text by the plain C parser (nvn_refl.c; step M6): the structs the Objective-C one made of the same document
+    if (nvn_refl_from_json_text((const char *)jd.bytes, (size_t)jd.length, &o->rf, err, sizeof err)) { MLOG("[RED] shader %s reflection conversion failed: %s", pc.UTF8String, err); return nil; }
     if (o->rf.dyn && !DM_GAME_TEX_DYN_SLOTS) {   // dynamic texture handles (TEXD / SAMPD) only where the profile says the game picks them from c2's tables, as before otherwise
         // (rf.c1 is freed by dealloc when o goes: freeing it here too was a double free, which aborted FINAL FANTASY RESONANCE at its first such shader)
         MLOG("[RED] shader %s reflection conversion failed: a texture handle the translator could not trace to one slot (profile key tex_dyn_slots off)", pc.UTF8String); return nil; }

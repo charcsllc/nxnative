@@ -6,7 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <TargetConditionals.h>
+#include "plat/plat.h"      // the host platform layer (macOS / iOS, Linux, Windows)
 #include <unistd.h>
 #include "game_profile.h"   // constants of the current game profile (generated from dm/games/<id>/game.tsv, chosen by the Makefile's GAME)
 
@@ -29,6 +29,7 @@ static inline int dm_host_thread_join(pthread_t thread, void **result) {
     return r;
 }
 
+#if DM_NATIVE_EXEC
 // One log line: the message and its newline under one stream lock (written apart, another thread's line could land between them and two messages share a log line).
 // The host's dm_log (hle_bigstack.c) writes it on the thread's big host stack when the caller is on a guest stack: formatting one line takes about 2.7 KB of stack, and a take-over
 // runs on the stack of the game thread that calls it, which can have less left (memory.md, Log lines on small guest stacks). The definition here is a weak one that writes on the
@@ -43,6 +44,12 @@ __attribute__((weak)) void dm_log(const char *fmt, ...) {
 }
 #endif
 #define LOG(...) dm_log("[dm] " __VA_ARGS__)
+#else
+// One log line, one stdio call. stderr is unbuffered: fprintf and then fputc('\n') were two writes, and a line another thread wrote between them (hle_svc.c's
+// "[guest] " lines of svcOutputDebugString) landed inside this one, followed by its lone newline; t_aot_host's pause test lost a guest line so (dm/tools/aot/README.md,
+// "Threads and safepoints"). Apple's form above is dm_log: the line under the stream lock, on the big host stack of native execution (hle_bigstack.c, which the port does not build)
+#define LOG(fmt, ...) do { fprintf(stderr, "[dm] " fmt "\n", ##__VA_ARGS__); } while (0)
+#endif
 #define die(...) do { LOG("FATAL " __VA_ARGS__); abort(); } while (0)
 
 #define DM_SWITCH_ALIAS  UINT64_C(0x1000000000)   // a Switch's alias region: 64 GB
@@ -107,6 +114,7 @@ typedef struct {
     uint64_t unity_qs_ptr;     // Unity's QualitySettings (main's offset of the global pointer); the current level's vSyncCount, an int32, is at
     uint32_t unity_qs_idx, unity_qs_arr, unity_qs_size, unity_qs_vsync;   // [obj + arr] + (int32)[obj + idx] * size + vsync; 0 = none
     uint64_t fps_state_off;    // frame step state page (patch_nso.py FRAME_STEP: Tears of the Kingdom 1.4.3 and Breath of the Wild 1.9.0 main); 0 = none
+    uint64_t aux_off, aux_len;   // the x86-64 engine's aux region (the manifest's aux row: the frame step's stubs), module offset and bytes; 0 = none. Apple never fills them
     uint32_t step_max;         // the largest step the frame step stubs give the game (the fixups table's STEP_MAX, patch_nso.py ctx.step_max); 0 = FSTEP_MAX
     uint32_t render_scale_max; // a render-scale stub's largest scale (the fixups table's RENDER_SCALE, patch_nso.py): DM_RENDER_SCALE is held to it; 0 = no such stub
     int fstep_t120;            // the frame step stub takes its step in ticks of 1/120 s (the FRAME_STEP_120 capability: state +0x38 120, and 40 fps)
@@ -181,12 +189,29 @@ uint64_t guest_ns_at_host_time(uint64_t host_ns);  // Host Mach-absolute ns proj
 int guest_clock_pinned(void);  // the guest clock is frozen or DM_DETCLOCK's: guest_ns_at_host_time maps every host time to one
 uint64_t guest_ticks(void);           // The guest's system counter on that clock: 19.2 MHz, or 31.25 MHz for the Switch 2 (hle_os.c)
 int dm_detclock_enabled(void);
+void dm_guest_clock_advanced(void);   // hle_thread.c: DM_DETCLOCK's clock runs again (the end of a freeze): the threads due wake, and blocked ones may jump it
+void dm_detclock_presented(uint64_t frame, int itv);   // hle_thread.c: a present under DM_DETCLOCK (which may have moved the clock): the threads due wake; the calling thread is the one that presents
+extern _Atomic int dm_detclock_tracing;   // hle_thread.c: DM_DETCLOCK_TRACE is open (docs/reference/threads.md)
+void dm_detclock_trace_read(void);        // hle_thread.c: the guest read the clock under the switch with the trace open (the first reading after host code let a thread go is traced)
+void dm_detclock_trace_input(char kind, uint64_t buttons, uint64_t axes);   // hle_thread.c: a scripted input change (I) or the game's first reading of one (K), traced
+// hle_thread.c: hle_os.c hands over DM_DETCLOCK's idle jump when the switch takes the clock over (the host's start), with the vsync times origin + k × step
+void dm_detclock_set_jump(uint64_t (*jump)(uint64_t to), uint64_t origin, uint64_t step);
+// hle_thread.c: under DM_DETCLOCK a host-owned guest thread (its ThreadType) runs on the guest clock from now on, counted as a game thread (the audio renderer's render thread,
+// hle_audren.c; the movie decoder's deferred events, hle_movie.c): it waits for each period's start with dm_detclock_period_wait (0 when it is not paced: it paces itself as
+// before), or until a time on the guest clock (0: none) or a wake with dm_detclock_paced_sleep / dm_detclock_paced_wake
+int dm_detclock_pace_thread(void *tt, uint64_t period);
+int dm_detclock_period_wait(void);
+void dm_detclock_paced_sleep(uint64_t at);
+void dm_detclock_paced_wake(void *tt);
+void dm_detclock_vsync_event(void *ev);   // hle_thread.c: vi's vsync event, bound: under DM_DETCLOCK the guest clock signals it at each vsync time (hle_sdk16.c)
+void dm_detclock_display_wait(uint64_t at);   // hle_thread.c: under DM_DETCLOCK the thread that presents waits for the display until guest time at (hle_nvn.c's acquire)
+void dm_detclock_present_paced(int itv);   // hle_os.c: the next present is NVN's at this interval, whose acquire waits for the display: under DM_DETCLOCK it moves no clock
 void guest_clock_freeze(int on);
 void dm_movie_active(int active);   // iOS movie decoder recovery waits for activation; Stop / Flush / Finalize cancel the wait
 void guest_clock_freeze_for(int reason, int on);   // Freeze by reason (0 tick hold, 1 background, 2 system keyboard, 3 NVN prepare, 4 NVN archive init); see hle_os.c
 void guest_clock_read_wait(void);     // A guest read of the system counter: counts it in dm_clock_reads and waits while backgrounded or preparing (hle_os.c)
 extern __thread uint64_t dm_clock_reads;   // the calling thread's guest reads of the system counter (hle_os.c; thr_yield tells clock waits by them)
-void dm_guest_frame_tick(void);        // Called on every present (hle_nvn.c): when DM_DETCLOCK is on, advances the guest clock by one fixed step
+void dm_guest_frame_tick(void);        // Called on every present (hle_nvn.c): under DM_DETCLOCK, moves the guest clock to at least the previous present's value plus one step, but for NVN's (dm_detclock_present_paced)
 uint64_t dm_nvn_frame_count(void);
 uint64_t dm_nvn_sub_cpu_ns(void);     // Cumulative CPU nanoseconds of submit (excluding present)
 void dm_backtrace(uint64_t fp);

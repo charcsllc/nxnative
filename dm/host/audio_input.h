@@ -1,7 +1,9 @@
 #ifndef DM_AUDIO_INPUT_H
 #define DM_AUDIO_INPUT_H
 
+#if defined(__APPLE__)
 #include <TargetConditionals.h>
+#endif
 #include <stdint.h>
 
 typedef struct dm_audio_input_stream dm_audio_input_stream;

@@ -1,10 +1,26 @@
 // nn::vi (display layer): on a real device, the vi service is used to open the display, create a layer and get the native window handle; the handle is passed to NVN's window builder.
 // Host: returns host static objects; when hooking up Metal, the native window corresponds to the front end's CAMetalLayer (front_metal_layer()).
+// Plain C, part of every host: the Apple one (dm/host/Makefile's dm/gfx wildcard) and the Linux and Windows one (dm/host/CMakeLists.txt, nxhost), whose guest Vulkan and GL
+// layers (dm/gfx/hostvk/guest_vk.c, guest_gl.c) read the layer crop and size from here as hle_vk.m and hle_gl.m do on Apple
 #include "../host/hle.h"
 #include <stdatomic.h>
+#include "nvn/nvn_be_ext.h"   // the graphics backend's present path: the layer's shape, the presents' progress and when each reached the screen
 
+#if DM_NATIVE_EXEC || defined(DM_TEST_GUEST_C)
 static struct { uint32_t magic; } g_display = {0x50534944}, g_layer = {0x5259414c};
 static struct { uint32_t magic; void *layer; } g_native = {0x4e49574e, 0};
+#else
+// The x86-64 engine: the game keeps these objects' addresses (and hands the native window to the NVN or Vulkan layer), so each is guest memory, a copy made once in the
+// arena of the host's initial object (docs/design/aot-recompiler.md 5.2; aot.h, "Host memory the guest sees")
+#include "../host/aot.h"
+typedef struct { uint32_t magic; } vi_obj; typedef struct { uint32_t magic; void *layer; } vi_native;
+static const vi_obj k_display = {0x50534944}, k_layer = {0x5259414c};
+static const vi_native k_native = {0x4e49574e, 0};
+static void *_Atomic g_display_guest, *_Atomic g_layer_guest, *_Atomic g_native_guest;
+#define g_display (*DM_GSTATIC(vi_obj, g_display_guest, &k_display))
+#define g_layer (*DM_GSTATIC(vi_obj, g_layer_guest, &k_layer))
+#define g_native (*DM_GSTATIC(vi_native, g_native_guest, &k_native))
+#endif
 
 HLE_FORCE("_ZN2nn2vi10InitializeEv", "display service init; the host has no vi service", void, h_vi_Init, void) {}
 // The Switch 2 SDKs' variant with low frame rate compensation for a variable refresh rate display: nn::vi::Initialize's work through vi2::InitializeWithVrrLfcEnabled, whose
@@ -26,13 +42,12 @@ HLE_FORCE("_ZN2nn2vi11CreateLayerEPPNS0_5LayerEPNS0_7DisplayE", "create layer; t
 // The overload with the layer's size (SDL3's Switch video driver, Absolum: 1920x1080 docked); the SDK's version calls through the vi service object the host never made (SIGSEGV at +0xe4).
 // An NVN or Vulkan window's textures decide what is presented; an EGL window surface takes the layer's size (dm/gfx/gl/hle_gl.m: Digimon Story Cyber Sleuth sizes its layer
 // itself and draws into the surface at that size)
-// The present shows the picture in the layer's shape (nvn_mtl.m present_shape)
-void mtl_present_layer(uint32_t w, uint32_t h);
+// The present shows the picture in the layer's shape (nvn_mtl.m present_shape; be_present_layer)
 static _Atomic uint32_t g_layer_wh;   // w | h << 16 of the last sized CreateLayer, 0 = none
 void dm_vi_layer_size(int *w, int *h) { uint32_t v = g_layer_wh; *w = (int)(v & 0xffff); *h = (int)(v >> 16); }
 HLE_FORCE("_ZN2nn2vi11CreateLayerEPPNS0_5LayerEPNS0_7DisplayEii", "create layer of a given size; the host returns a static object", Result, h_vi_CreateLayerWH, void **out, void *disp, int w, int h) {
     (void)disp; LOG("vi::CreateLayer %dx%d", w, h); *out = &g_layer;
-    if (w > 0 && h > 0 && w < 0x10000 && h < 0x10000) { g_layer_wh = (uint32_t)w | (uint32_t)h << 16; mtl_present_layer((uint32_t)w, (uint32_t)h); }
+    if (w > 0 && h > 0 && w < 0x10000 && h < 0x10000) { g_layer_wh = (uint32_t)w | (uint32_t)h << 16; be_present_layer((uint32_t)w, (uint32_t)h); }
     return RES_OK;
 }
 // SDK 22's overload with a LayerCreationSettings, which its constructor LayerCreationSettings(int w, int h) fills as {w, h, 2} (sdk+0x4526a0 in EA SPORTS FC 27; the SDK's own
@@ -45,7 +60,7 @@ HLE_FORCE("_ZN2nn2vi15GetNativeWindowEPPvPNS0_5LayerE", "native window handle, p
     (void)layer; *out = &g_native; return RES_OK;
 }
 // Link's Awakening also crops its layer and tears the display down on exit; the SDK's versions dereference the vi service objects the host never made (SetLayerCrop: SIGSEGV at +0x64).
-// The crop is kept for the present: the Vulkan present (hle_vk.m), where Super Mario Galaxy keeps a 1920x1080 swapchain in handheld mode, draws into its top-left 1280x720 and
+// The crop is kept for the present: the Vulkan present (hle_vk.m; guest_vk.c on Linux and Windows), where Super Mario Galaxy keeps a 1920x1080 swapchain in handheld mode, draws into its top-left 1280x720 and
 // crops the layer to that every frame; and the NVN present when the game sets no window crop of its own (nvnWindowSetCrop; present_crop in hle_nvn.c), where Link's Awakening
 // draws 1280x720 into its 1920x1080 window textures in handheld mode and crops the layer to that. It only picks texels: the present stretches them to the layer's shape, as the
 // Switch's compositor does (nvn_mtl.m present_shape). Logged only when it changes
@@ -80,24 +95,23 @@ HLE_FORCE("_ZN2nn2vi20GetLatestFrameNumberEPmPKNS0_5LayerE", "the layer's latest
 #define VFH 8
 typedef struct { uint64_t frame, ticket, queued_ns, seen_ns; } vfh_ent;
 static vfh_ent g_vfh[VFH]; static pthread_mutex_t g_vfh_mu = PTHREAD_MUTEX_INITIALIZER;
-void mtl_present_progress(uint64_t *queued, uint64_t *done);   // nvn_mtl.m
-double mtl_presented_time(uint64_t n);                         // nvn_mtl.m: CACurrentMediaTime seconds (the now_ns clock), 0 not yet, -1 dropped by the system
+// be_present_progress, be_presented_time (nvn_be_ext.h; nvn_mtl.m on Apple): CACurrentMediaTime seconds (the now_ns clock), 0 not yet, -1 dropped by the system
 void dm_vi_frame_queued(uint64_t frame) {   // hle_nvn.c, at each present the game queues: frame = GetLatestFrameNumber's count with it
-    uint64_t q, d; mtl_present_progress(&q, &d);
+    uint64_t q, d; be_present_progress(&q, &d);
     pthread_mutex_lock(&g_vfh_mu); g_vfh[frame % VFH] = (vfh_ent){frame, q, guest_ns(), 0}; pthread_mutex_unlock(&g_vfh_mu);
 }
 static uint64_t vfh_ticks(uint64_t ns) { return dm_sdk_ounce() ? ns / 32 : ns * 12 / 625; }   // as guest_ticks (hle_os.c)
 HLE_FORCE("_ZN2nn2vi16ListFrameHistoryEPNS0_9FrameInfoEiPKNS0_5LayerE", "the layer's frame history: the last 8 presents, newest first, shown once the present queue handed them on", int, h_vi_FrameHist, void *out, int n, const void *layer) {
     (void)layer;
     if (!out || n <= 0) return VFH;
-    uint64_t q, d; mtl_present_progress(&q, &d); (void)q;
+    uint64_t q, d; be_present_progress(&q, &d); (void)q;
     uint64_t gnow = guest_ns(), hnow = now_ns(), latest = dm_nvn_frame_count();
     int k = 0;
     pthread_mutex_lock(&g_vfh_mu);
     for (uint64_t f = latest; f > 0 && latest - f < VFH && k < n; f--) {
         vfh_ent *e = &g_vfh[f % VFH]; if (e->frame != f) continue;
         uint64_t *o = (uint64_t *)out + 5 * k++, shown = 0;
-        double pt = e->ticket <= d ? mtl_presented_time(e->ticket) : 0;
+        double pt = e->ticket <= d ? be_presented_time(e->ticket) : 0;
         if (pt > 0) { uint64_t ago = hnow > (uint64_t)(pt * 1e9) ? hnow - (uint64_t)(pt * 1e9) : 0; shown = gnow > ago ? gnow - ago : 1; }
         else if (e->ticket <= d) { if (!e->seen_ns) e->seen_ns = gnow; shown = e->seen_ns; }
         o[0] = shown ? 2 : 1; o[1] = f; o[2] = vfh_ticks(e->queued_ns); o[3] = o[4] = shown ? vfh_ticks(shown) : 0;

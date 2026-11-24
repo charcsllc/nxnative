@@ -6,7 +6,6 @@
 // Struct layout follows the public Horizon ABI: DirectoryEntry = {char name[0x301], pad[3], s8 type, pad[3], s64 size} (0x310 bytes).
 #include "hle.h"
 #include "account_users.h"
-#include <mach/mach.h>
 #include "front.h"
 #include <dirent.h>
 #include <errno.h>
@@ -15,10 +14,17 @@
 #include <unistd.h>
 #include <stdio.h>
 #include <stdatomic.h>
-#include <sys/clonefile.h>
-#include <sys/xattr.h>
 #include "romfs_image.h"
 #include "save_sync.h"
+// A guest function this file calls (the SDK's own file system, for mounts and handles only the SDK holds): the plain call where the guest's code runs natively (Apple), or
+// where a unit test supplies it as a C function (DM_TEST_GUEST_C); on the x86-64 engine a guest call on the calling thread (aot.h DM_GUEST_CALL: nested inside the host call
+// it is answering)
+#if DM_NATIVE_EXEC || defined(DM_TEST_GUEST_C)
+#define GUEST_CALL(f, ...) f(__VA_ARGS__)
+#else
+#include "aot.h"
+#define GUEST_CALL DM_GUEST_CALL
+#endif
 
 #define RES_PATH_NOT_FOUND 0x202u      // fs module 2, description 1
 #define RES_PATH_EXISTS    0x402u      // fs module 2, description 2
@@ -105,7 +111,38 @@ static void fslog_init(void) { static int done; if (done) return; done = 1; cons
 static const char *envdir(const char *var, const char *rel, char *buf, size_t n) {
     const char *v = getenv(var);
     if (v) return v;
-    snprintf(buf, n, "%s%s/%s", getenv("DM_ROOT") ?: getenv("HOME"), getenv("DM_ROOT") ? "" : "/dm-work", rel); return buf;
+    // The work folder: DM_ROOT, else the platform's default (plat_data_path; Apple $HOME/dm-work). Both are the snprintf this made before the platform layer,
+    // "%s%s/%s" with DM_ROOT, "", rel or with $HOME, "/dm-work", rel
+    const char *root = getenv("DM_ROOT");
+    if (root) snprintf(buf, n, "%s%s/%s", root, "", rel); else plat_data_path(buf, n, rel);
+    return buf;
+}
+// Whether a directory entry is a directory. Apple: d_type alone (e->d_type == DT_DIR), the test this file always made there. Linux: d_type, except that a file system
+// may leave it DT_UNKNOWN (XFS without ftype, some FUSE and network mounts), and Windows' C runtime has no d_type at all: an lstat of the entry's path decides there
+static int ent_dtype(const struct dirent *e) {   // 1 directory, 0 something else, -1 unknown
+#if defined(__APPLE__)
+    return e->d_type == DT_DIR;
+#elif defined(DT_DIR)
+    return e->d_type == DT_UNKNOWN ? -1 : e->d_type == DT_DIR;
+#else
+    (void)e; return -1;
+#endif
+}
+static int ent_isdir(const char *dir, const struct dirent *e) {
+#if defined(__APPLE__)
+    (void)dir; return e->d_type == DT_DIR;
+#else
+    int t = ent_dtype(e); if (t >= 0) return t;
+    char c[1280]; struct stat st; snprintf(c, sizeof c, "%s/%s", dir, e->d_name);
+    return !lstat(c, &st) && S_ISDIR(st.st_mode);
+#endif
+}
+static int ent_stat(DIR *d, const char *dir, const char *name, struct stat *st) {   // following links, as stat does
+#if defined(_WIN32)
+    (void)d; char c[1280]; snprintf(c, sizeof c, "%s/%s", dir, name); return stat(c, st);   // no dirfd / fstatat in mingw-w64
+#else
+    (void)dir; return fstatat(dirfd(d), name, st, 0);
+#endif
 }
 
 // Steps that end in a failed write: test injection DM_TEST_FS_FAILAT=<point>[:<count>][,...] -- in a save transaction, mountclone (clone the work directory at mount),
@@ -224,7 +261,7 @@ static Result mount_impl(const char *name, const char *dir, int ro, int txn, int
         const char *why = NULL;
         if (!access(work, F_OK) && rm_tree(work)) why = "cannot clear the work directory left over from last time";
         else if (!access(neu, F_OK) && rm_tree(neu)) why = "cannot clear the .new left over from last time";
-        else if (dm_fs_test_fail("mountclone") || clonefile(dir, work, 0))   // ENOTSUP: HFS+ and exFAT can neither clone nor swap directories (RENAME_SWAP), so no transaction can work on them
+        else if (dm_fs_test_fail("mountclone") || plat_clone_tree(dir, work))   // ENOTSUP: HFS+ and exFAT can neither clone nor swap directories (RENAME_SWAP), so no transaction can work on them
             why = errno == ENOTSUP ? "the save folder's filesystem cannot clone directories (save transactions need APFS: set DM_SAVE to a folder on an APFS volume)" : "cloning the work directory failed";
         if (why) { txn_err = errno ? errno : EIO; g_mnt[g_nmnt].ro = 1; strlcpy(g_mnt[g_nmnt].dir, dir, sizeof g_mnt[0].dir);
             LOG("[RED] save transaction: %s (%s, errno=%d) -- mounting the committed directory %s read-only instead: saves cannot be written this session, the committed version is unchanged", why, work, txn_err, dir); }
@@ -291,9 +328,9 @@ static int guest_name(const char *parent, const char *physical, char *out, size_
     // so no per-entry getxattr is needed -- that was one system call per entry when listing, seconds for the 216,000 entries Engage walks in RomFS at boot
     if (strncmp(physical, ".dm-case-", 9)) { strlcpy(out, physical, n); return 1; }
     char p[1280]; snprintf(p, sizeof p, "%s/%s", parent, physical);
-    ssize_t k = getxattr(p, FS_GUEST_NAME, out, n - 1, 0, XATTR_NOFOLLOW);
+    ssize_t k = plat_xattr_get(p, FS_GUEST_NAME, out, n - 1);
     if (k >= 0) { out[k] = 0; return 1; }
-    if (errno != ENOATTR) return 0;
+    if (errno != PLAT_ENOATTR) return 0;
     strlcpy(out, physical, n); return 1;
 }
 // The next entry of a directory, without . and ..: NULL at its end with errno 0, NULL with errno set when reading failed. readdir answers both with NULL and only errno tells them apart:
@@ -464,8 +501,8 @@ static int set_guest_name(const char *hp, const char *path) {
     if (k >= sizeof guest) { errno = ENAMETOOLONG; return -1; }
     memcpy(guest, start, k); guest[k] = 0;
     const char *physical = strrchr(hp, '/') + 1;
-    if (strcmp(physical, guest)) return setxattr(hp, FS_GUEST_NAME, guest, strlen(guest), 0, XATTR_NOFOLLOW);
-    if (!removexattr(hp, FS_GUEST_NAME, XATTR_NOFOLLOW) || errno == ENOATTR) return 0;
+    if (strcmp(physical, guest)) return plat_xattr_set(hp, FS_GUEST_NAME, guest, strlen(guest));
+    if (!plat_xattr_remove(hp, FS_GUEST_NAME) || errno == PLAT_ENOATTR) return 0;
     return -1;
 }
 // Hosts before fwd_slashes took a backslash in a save path as part of the name: save:\savedata0.bin is the file "\savedata0.bin", and save:\dir\f the file "\dir\f" in the save's root.
@@ -576,7 +613,7 @@ static void romfs_tables(const char *dir, size_t *ndir, size_t *dbytes, size_t *
     while ((e = readdir(d))) {
         if (!strcmp(e->d_name, ".") || !strcmp(e->d_name, "..") || !guest_name(dir, e->d_name, g, sizeof g)) continue;
         size_t name = (strlen(g) + 3) & ~(size_t)3;
-        if (e->d_type == DT_DIR) {
+        if (ent_isdir(dir, e)) {
             ++*ndir; *dbytes += 0x18 + name;
             if (depth < 64 && snprintf(hp, sizeof hp, "%s/%s", dir, e->d_name) < (int)sizeof hp) romfs_tables(hp, ndir, dbytes, nfile, fbytes, depth + 1);
         } else { ++*nfile; *fbytes += 0x20 + name; }
@@ -684,7 +721,15 @@ static void sdk_handle_forget(uint64_t h) {
 }
 static int sdk_mounted(const char *name) {
     int (*is_mounted)(const char *) = guest_sym("_ZN2nn2fs9IsMountedEPKc");
-    return name && is_mounted && is_mounted(name);
+    if (!name || !is_mounted) return 0;
+#if DM_NATIVE_EXEC || defined(DM_TEST_GUEST_C)
+    return is_mounted(name);
+#else
+    char *g = dm_garena_strdup(name);   // the SDK reads the name: guest memory (aot.h, "Host memory the guest sees"), as a copy of what may be a host buffer (sdk_path_call's)
+    if (!g) return 0;
+    int r = GUEST_CALL(is_mounted, g);
+    dm_garena_free(g); return r;
+#endif
 }
 static int path_mount_name(const char *path, char *name, size_t n) {   // the mount name, the part before ':' as in FindFileSystem; 0 without one
     const char *c = path ? strchr(path, ':') : NULL;
@@ -711,11 +756,11 @@ static Result sdk_opened(Result r, uint64_t *out, const char *close_sym) {
     if (r != RES_OK || sdk_handle_add(*out)) return r;
     LOG("[RED] fs: more than %d handles open on the SDK's own mounts, the open fails", SDK_HANDLES);
     void (*close_h)(uint64_t) = guest_sym(close_sym);
-    if (close_h) close_h(*out);
+    if (close_h) GUEST_CALL(close_h, *out);
     *out = 0; return RES_FAIL;
 }
-#define SDK_PATH(path, sym, type, ...) do { __typeof__(type) sdk_f = (__typeof__(type))sdk_path_call(path, sym); if (sdk_f) return sdk_f(__VA_ARGS__); } while (0)
-#define SDK_HANDLE(h, sym, type, fail, ...) do { if (sdk_handle_known(h)) { __typeof__(type) sdk_f = (__typeof__(type))sdk_handle_sym(h, sym); return sdk_f ? sdk_f(__VA_ARGS__) : (fail); } } while (0)
+#define SDK_PATH(path, sym, type, ...) do { __typeof__(type) sdk_f = (__typeof__(type))sdk_path_call(path, sym); if (sdk_f) return GUEST_CALL(sdk_f, __VA_ARGS__); } while (0)
+#define SDK_HANDLE(h, sym, type, fail, ...) do { if (sdk_handle_known(h)) { __typeof__(type) sdk_f = (__typeof__(type))sdk_handle_sym(h, sym); return sdk_f ? GUEST_CALL(sdk_f, __VA_ARGS__) : (fail); } } while (0)
 // IsMounted: the original SDK checks its own mount table, which the host's mounts never enter. Engage (IL2CPP) uses it to check whether "rom:" is mounted before opening a file; a "no" fails with an invalid-parameter error (0x57) and global-metadata.dat cannot be opened
 HLE_FORCE("_ZN2nn2fs9IsMountedEPKc", "fsp-srv; looks up the host mount table, then the SDK's own (a RAM disk)", int, h_fs_IsMounted, const char *name) { return host_mounted(name) || sdk_mounted(name); }   // bool in w0: 1 / 0
 // IsPathMounted / GetPathLengthMax: the SDK's C library (nnmusl) checks every path with them before it calls nn::fs (sdk+0x8ef50, under open / stat / opendir), and the original SDK answers from
@@ -768,7 +813,7 @@ static int cache_list_scan(uint16_t **out) {
         const char *s = e->d_name + pl; char *end; struct stat st;
         if (strncmp(e->d_name, prefix, pl) || *s < '0' || *s > '9' || (*s == '0' && s[1])) continue;
         unsigned long i = strtoul(s, &end, 10);
-        if (*end || i > 0xFFFF || fstatat(dirfd(d), e->d_name, &st, 0) || !S_ISDIR(st.st_mode)) continue;
+        if (*end || i > 0xFFFF || ent_stat(d, dir, e->d_name, &st) || !S_ISDIR(st.st_mode)) continue;   // fstatat on the directory (ent_stat: Windows has no dirfd)
         if (n == cap) { uint16_t *v = realloc(*out, (size_t)(cap = cap ? cap * 2 : 16) * sizeof **out); if (!v) break; *out = v; }
         (*out)[n++] = (uint16_t)i;
     }
@@ -957,7 +1002,7 @@ uint64_t dm_fs_commit_count(void) { return atomic_load(&g_save_commits); }
 // The cloud sender's copy of a committed save (save_sync.c): a Commit holds both locks for its clone and swap, so the clone taken under them is one whole committed version
 int dm_fs_clone_committed(const char *dir, const char *to) {
     PATH_LOCK(); pthread_mutex_lock(&g_lock);
-    int r = clonefile(dir, to, 0) ? -1 : 0, e = errno;
+    int r = plat_clone_tree(dir, to) ? -1 : 0, e = errno;
     pthread_mutex_unlock(&g_lock);
     errno = e; return r;
 }
@@ -969,7 +1014,7 @@ static Result commit_mount_locked(int i, int *notify_error) {
     pthread_once(&g_txn_lock_once, txn_locks_init);
     pthread_rwlock_wrlock(&g_txn_lock[txn]);
     pthread_rwlock_t *txn_guard __attribute__((cleanup(txn_unlock))) = &g_txn_lock[txn];
-    uint64_t tc1 = clock_gettime_nsec_np(CLOCK_MONOTONIC), tw0 = atomic_exchange(&g_mnt[txn].first_write_ns, 0);
+    uint64_t tc1 = plat_boot_ns(), tw0 = atomic_exchange(&g_mnt[txn].first_write_ns, 0);
     int perr = atomic_exchange(&g_mnt[txn].poison, 0);
     // Probe: files of this transaction still open at the commit. Horizon's fs client is believed to refuse a commit while a file is open for writing (WriteModeFileNotClosed;
     // not checked against the SDK); the host commits anyway. A refused commit below reclones the work directory, and a handle opened before it then points into the
@@ -992,8 +1037,8 @@ static Result commit_mount_locked(int i, int *notify_error) {
         // (the next commit is refused again and recloning is retried); the committed version is unchanged (before, the work directory was deleted first and then recloned, and a failed clone called die, so with a full disk the process exited and the work directory was gone)
         char re[1100]; snprintf(re, sizeof re, "%s.re", g_mnt[i].dir); int rerr = 0;
         if (!access(re, F_OK) && rm_tree(re)) rerr = errno ? errno : EIO;
-        else if (dm_fs_test_fail("reclone") || clonefile(g_mnt[i].commit, re, 0)) { rerr = errno ? errno : EIO; rm_tree(re); }
-        else if (renamex_np(re, g_mnt[i].dir, RENAME_SWAP)) { rerr = errno ? errno : EIO; rm_tree(re); }
+        else if (dm_fs_test_fail("reclone") || plat_clone_tree(g_mnt[i].commit, re)) { rerr = errno ? errno : EIO; rm_tree(re); }
+        else if (plat_rename_swap(re, g_mnt[i].dir)) { rerr = errno ? errno : EIO; rm_tree(re); }
         else rm_tree(re);                                               // the swapped-out tainted work directory
         if (rerr) { save_poison_txn(txn, perr); LOG("[RED] save transaction: recloning the work directory failed errno=%d -- the work directory is left as it is and stays tainted (the next commit is refused again and retries), the committed version is unchanged", rerr); }
         LOG("[RED] save commit refused: a save write failed in this transaction errno=%d (0-byte files in the work directory: %s); the committed version is unchanged, the work directory %s%s", perr, tl ? torn + 1 : "none", rerr ? "could not be recloned (see the previous line)" : "was recloned from the committed version",
@@ -1004,11 +1049,11 @@ static Result commit_mount_locked(int i, int *notify_error) {
     char neu[1100]; snprintf(neu, sizeof neu, "%s.new", g_mnt[i].commit);
     Result r = RES_OK;
     if (!access(neu, F_OK) && rm_tree(neu)) { LOG("[RED] save commit: cannot clear the %s left over errno=%d (committed version unchanged)", neu, errno); r = RES_FAIL; }
-    else if (clonefile(g_mnt[i].dir, neu, 0)) { LOG("[RED] save commit: clonefile %s failed errno=%d (committed version unchanged)", neu, errno); r = RES_FAIL; }
-    else if (renamex_np(neu, g_mnt[i].commit, RENAME_SWAP)) { LOG("[RED] save commit: atomic swap failed errno=%d (committed version unchanged)", errno); rm_tree(neu); r = RES_FAIL; }
+    else if (plat_clone_tree(g_mnt[i].dir, neu)) { LOG("[RED] save commit: clonefile %s failed errno=%d (committed version unchanged)", neu, errno); r = RES_FAIL; }
+    else if (plat_rename_swap(neu, g_mnt[i].commit)) { LOG("[RED] save commit: atomic swap failed errno=%d (committed version unchanged)", errno); rm_tree(neu); r = RES_FAIL; }
     else rm_tree(neu);                                                  // the old version that was swapped out
     // Timing readouts (integer microseconds, no floating point): how long the clone + atomic swap took; how long in total from this transaction's first save write to the end of the commit (the game writing files + the commit; 0 = no save write in this transaction)
-    static int n; if (r == RES_OK) { uint64_t tc2 = clock_gettime_nsec_np(CLOCK_MONOTONIC);
+    static int n; if (r == RES_OK) { uint64_t tc2 = plat_boot_ns();
         LOG("save commit #%d: %s swapped atomically into %s (%d save writes so far) (clone + swap %llu us, since this transaction's first write %llu us)", ++n, g_mnt[i].dir, g_mnt[i].commit, atomic_load(&g_save_writes),
             (unsigned long long)((tc2 - tc1) / 1000), (unsigned long long)(tw0 ? (tc2 - tw0) / 1000 : 0)); atomic_fetch_add(&g_save_commits, 1);
         save_sync_committed();   // wakes the cloud sender, which clones the committed save through dm_fs_clone_committed above (save_sync.h)
@@ -1064,15 +1109,15 @@ HLE_FORCE("_ZN2nn2fs7UnmountEPKc", "fsp-srv; host mounts are permanent, a no-op,
     if (!name || host_unmount(name)) return;
     int (*sdk_is_mounted)(const char *) = guest_sym("_ZN2nn2fs9IsMountedEPKc");
     void (*sdk_unmount)(const char *) = guest_sym("_ZN2nn2fs7UnmountEPKc");
-    if (!sdk_is_mounted || !sdk_unmount || !sdk_is_mounted(name)) return;
+    if (!sdk_is_mounted || !sdk_unmount || !GUEST_CALL(sdk_is_mounted, name)) return;
     LOG("fs unmount %s: in the SDK's own mount table, released there", name);
-    sdk_unmount(name);
+    GUEST_CALL(sdk_unmount, name);
 }
 
 // ---------- Files ----------
 HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Result, h_fs_OpenFile, uint64_t *out, const char *path, int mode) { dm_thread_service_request();
     Result (*sdk_open)(uint64_t *, const char *, int) = sdk_path_call(path, "_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci");
-    if (sdk_open) return sdk_opened(sdk_open(out, path, mode), out, "_ZN2nn2fs9CloseFileENS0_10FileHandleE");
+    if (sdk_open) return sdk_opened(GUEST_CALL(sdk_open, out, path, mode), out, "_ZN2nn2fs9CloseFileENS0_10FileHandleE");
     int mi; int64_t k;
     if (img_path(path, &mi, &k)) {
         if (k < 0) return err_res("open", path);
@@ -1101,6 +1146,10 @@ HLE_FORCE("_ZN2nn2fs8OpenFileEPNS0_10FileHandleEPKci", "fsp-srv → open(2)", Re
     if (g_flag.fs) LOG("fs open [%.2fs] %s mode=%d → fd %d", (now_ns() - g_t0_ns) / 1e9, path, mode, fd);
     return RES_OK;
 }
+// The game's file reads so far: bytes and the time in pread (dm_fs_read_stats: the per-frame table's @fs_mb and @fs_ms, hle_nvn.c, which a stutter is matched against)
+static _Atomic uint64_t g_rd_bytes, g_rd_ns;
+void dm_fs_read_stats(uint64_t *bytes, uint64_t *ns);
+void dm_fs_read_stats(uint64_t *bytes, uint64_t *ns) { *bytes = atomic_load(&g_rd_bytes); *ns = atomic_load(&g_rd_ns); }
 HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", Result, h_fs_ReadFile, size_t *out, uint64_t h, int64_t off, void *buf, size_t sz) { dm_thread_service_request();
     SDK_HANDLE(h, "_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", Result (*)(size_t *, uint64_t, int64_t, void *, size_t), RES_FAIL, out, h, off, buf, sz);
     h = FH_IN(h);
@@ -1112,6 +1161,7 @@ HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", 
         sz = off < 0 || (uint64_t)off >= x->b ? 0 : (size_t)(x->b - off) < sz ? (size_t)(x->b - off) : sz;
     }
     dm_guest_write_prepare(buf, sz);   // The destination may be a texture pool page write-protected by the graphics layer: a kernel write to a read-only page returns EFAULT instead of page-faulting, so unprotect and mark dirty first
+    const uint64_t rd0 = now_ns();
     while (got < sz) {
         ssize_t r = pread(fd, (uint8_t *)buf + got, sz - got, base + off + got);
         if (r < 0) { if (errno == EINTR) continue;
@@ -1122,15 +1172,16 @@ HLE_FORCE("_ZN2nn2fs8ReadFileEPmNS0_10FileHandleElPvm", "fsp-srv → pread(2)", 
                 static _Atomic int once; if (!once++) LOG("[fs] ReadFile into %p+%#zx: the destination was write-protected again during the read, prepared again at +%#zx (first case)", buf, sz, got);
                 dm_guest_write_prepare((uint8_t *)buf + got, sz - got); continue; }
             if (errno == EFAULT) {   // the destination is not writable host memory: say where, with the protection of its VM region
-                int e = errno; vm_address_t ra = (vm_address_t)((uint8_t *)buf + got); vm_size_t rs = 0; vm_region_basic_info_data_64_t vi; mach_msg_type_number_t cnt = VM_REGION_BASIC_INFO_COUNT_64; mach_port_t obj = MACH_PORT_NULL;
-                kern_return_t kr = vm_region_64(mach_task_self(), &ra, &rs, VM_REGION_BASIC_INFO_64, (vm_region_info_t)&vi, &cnt, &obj);
-                LOG("[RED] fs ReadFile into %p+%#zx failed at +%#zx (EFAULT): VM region %#lx+%#lx protection %d%s", buf, sz, got, (unsigned long)ra, (unsigned long)rs, kr == KERN_SUCCESS ? vi.protection : -1, kr == KERN_SUCCESS ? "" : " (none)");
+                int e = errno; uint64_t ra = 0, rs = 0; int prot = 0;
+                int kr = plat_vm_query((uint64_t)(uintptr_t)((uint8_t *)buf + got), &ra, &rs, &prot);
+                LOG("[RED] fs ReadFile into %p+%#zx failed at +%#zx (EFAULT): VM region %#lx+%#lx protection %d%s", buf, sz, got, (unsigned long)ra, (unsigned long)rs, !kr ? prot : -1, !kr ? "" : " (none)");
                 errno = e; }
             return err_res("pread", "fd"); }
         if (r == 0) break;
         got += r;
     }
     *out = got;
+    atomic_fetch_add_explicit(&g_rd_bytes, got, memory_order_relaxed); atomic_fetch_add_explicit(&g_rd_ns, now_ns() - rd0, memory_order_relaxed);
     if (g_fslog) { pthread_mutex_lock(&g_fslog_lock);
         static int hash_on = -1; if (hash_on < 0) hash_on = getenv("DM_FSLOG_HASH") != NULL;   // DM_FSLOG_HASH=1: append a column with the FNV-1a 64 of the content read (to compare whether the bytes read from two resource packs match)
         uint64_t fh = 0xcbf29ce484222325ull; if (hash_on) for (size_t i = 0; i < got; i++) fh = (fh ^ ((uint8_t *)buf)[i]) * 0x100000001b3ull;
@@ -1156,7 +1207,7 @@ HLE_FORCE("_ZN2nn2fs9WriteFileENS0_10FileHandleElPKvmRKNS0_11WriteOptionE", "fsp
     if (txn >= 0) {                                                     // Save write injection point (for deterministic regression; only writes on the save mount are counted)
         pthread_once(&g_save_test_once, save_test_init);
         int n = atomic_fetch_add(&g_save_writes, 1) + 1;
-        { uint64_t z = 0; atomic_compare_exchange_strong(&g_mnt[txn].first_write_ns, &z, clock_gettime_nsec_np(CLOCK_MONOTONIC)); }
+        { uint64_t z = 0; atomic_compare_exchange_strong(&g_mnt[txn].first_write_ns, &z, plat_boot_ns()); }
         if (g_save_kill_n && n == g_save_kill_n) { LOG("DM_TEST_KILL_AT: save write #%d, calling _exit (simulates being killed mid-write)", n); _exit(9); }
         if (g_save_fail_n && n == g_save_fail_n) { LOG("DM_TEST_FS_FAIL: save write #%d returns failure errno=%d", n, g_save_fail_e); errno = g_save_fail_e; save_poison_txn(txn, g_save_fail_e); return err_res("pwrite (injected)", "fd"); }
     }
@@ -1194,7 +1245,7 @@ HLE_FORCE("_ZN2nn2fs9CloseFileENS0_10FileHandleE", "fsp-srv → close(2)", void,
     if (sdk_handle_known(h)) {   // forgotten first: the SDK frees the accessor, and its address may come back from the next open
         sdk_handle_forget(h);
         void (*sdk_close)(uint64_t) = sdk_handle_sym(h, "_ZN2nn2fs9CloseFileENS0_10FileHandleE");
-        if (sdk_close) sdk_close(h);
+        if (sdk_close) GUEST_CALL(sdk_close, h);
         return;
     }
     h = FH_IN(h);
@@ -1378,7 +1429,7 @@ done:
 }
 HLE_FORCE("_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci", "fsp-srv → opendir(3)", Result, h_fs_OpenDirectory, uint64_t *out, const char *path, int mode) { dm_thread_service_request();
     Result (*sdk_open)(uint64_t *, const char *, int) = sdk_path_call(path, "_ZN2nn2fs13OpenDirectoryEPNS0_15DirectoryHandleEPKci");
-    if (sdk_open) return sdk_opened(sdk_open(out, path, mode), out, "_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE");
+    if (sdk_open) return sdk_opened(GUEST_CALL(sdk_open, out, path, mode), out, "_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE");
     int mi; int64_t k;
     if (img_path(path, &mi, &k)) {   // an image directory: its children are one run of entries, listed from a snapshot like the overlay's
         if (k >= 0 && g_mnt[mi].img->e[k].type) errno = ENOTDIR, k = -1;
@@ -1410,13 +1461,12 @@ HLE_FORCE("_ZN2nn2fs13ReadDirectoryEPlPNS0_14DirectoryEntryENS0_15DirectoryHandl
     if (!hh) { *count = 0; return RES_FAIL; }
     PATH_LOCK(); dirh_t *h = (dirh_t *)hh; int64_t n = 0; struct dirent *e;
     if (h->snap) { while (n < max && h->psnap < h->nsnap) { DirectoryEntry *src = &h->snap[h->psnap++]; if (!(h->mode & (src->type == ENT_DIR ? DIRMODE_DIR : DIRMODE_FILE))) continue; ents[n++] = *src; } *count = n; return RES_OK; }
-    int dfd = dirfd(h->d);
     while (n < max) {
         if (!(e = dir_next(h->d))) { if (errno) { *count = n; return err_res("readdir", h->path); } break; }
         // a directory's type comes from d_type without stat; files need a size, taken with fstatat relative to the directory fd (following links, like the old stat)
         struct stat st; int isdir;
-        if (e->d_type == DT_DIR) isdir = 1;
-        else { if (fstatat(dfd, e->d_name, &st, 0)) continue; isdir = S_ISDIR(st.st_mode); }
+        if (ent_dtype(e) == 1) isdir = 1;
+        else { if (ent_stat(h->d, h->path, e->d_name, &st)) continue; isdir = S_ISDIR(st.st_mode); }
         if (!(h->mode & (isdir ? DIRMODE_DIR : DIRMODE_FILE))) continue;
         DirectoryEntry *o = &ents[n++]; memset(o, 0, sizeof *o);
         if (!guest_name(h->path, e->d_name, o->name, sizeof o->name)) { char c[1280]; snprintf(c, sizeof c, "%s/%s", h->path, e->d_name); *count = n - 1; return err_res("directory name", c); }
@@ -1428,7 +1478,7 @@ HLE_FORCE("_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE", "fsp-srv → close
     if (sdk_handle_known(hh)) {   // forgotten first, as in CloseFile
         sdk_handle_forget(hh);
         void (*sdk_close)(uint64_t) = sdk_handle_sym(hh, "_ZN2nn2fs14CloseDirectoryENS0_15DirectoryHandleE");
-        if (sdk_close) sdk_close(hh);
+        if (sdk_close) GUEST_CALL(sdk_close, hh);
         return;
     }
     if (!hh) return;   // the game also closes after a failed open (handle 0): nothing to do in the original either

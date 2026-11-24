@@ -91,13 +91,14 @@ Binding conventions followed during translation (the NVN driver's layout, the sa
 | `nvn/nvn_entry.S`, `nvn/nvn_thunks.S` | Entries for the unimplemented stub and the timing wrapper, per-function thunks |
 | `nvn/nvn_tex.c`, `nvn/nvn_tex.h` | Storage size, alignment and per-level offsets of block-linear textures (ported from deko3d) |
 | `nvn/nvn_dirty.c`, `nvn/nvn_dirty.h` | Tracks dirty pages of game memory with write protection, to decide whether texture contents have changed and need re-uploading |
-| `nvn/nvn_refl.m`, `nvn/nvn_refl.h` | Converts shader reflection json into fixed-length C arrays, so that drawing only walks arrays |
+| `nvn/nvn_refl.c`, `nvn/nvn_refl.h` (over cJSON) | Converts shader reflection json into fixed-length C arrays, so that drawing only walks arrays |
 | `nvn/nvn_hmap.h`, `nvn/nvn_pace.h`, `nvn/nvn_pso_skey.h`, `nvn/nvn_primitive.h` | Hash table, presentation pacer, pipeline manifest key, indexed triangle fans and quads as triangle lists (primitive restart kept) |
 | `nvn/nvn_builtin.h` | Hand-written MSL for the 4 compute shaders embedded in the main program |
 | `nvn/include/nvn.h` | NVN interface declarations (third party; for the license see the file header) |
 | `nvn/names.txt` | The NVN API name list. The per-game tables described above live in the game profile `dm/games/<id>/` (named after the base game's title ID; tools pick it with `DM_GAME`, make with `GAME`; there is no default game) |
 | `tex/` | Texture format mapping, deswizzling, BC decompression, see [tex/README.md](tex/README.md) |
 | `vk/hle_vk.m` | Vulkan on Metal, for games that render with Vulkan (Hades, Super Mario Galaxy); their SPIR-V shaders are translated by `tools/vk_shaders.py` |
+| `hostvk/` | The Vulkan backend of the Windows and Linux port behind `nvn/nvn_be.h`, headless for now (phase P3, tested on lavapipe by `tests/vk/`), see [hostvk/README.md](hostvk/README.md) |
 | `gl/hle_gl.m` | OpenGL through EGL on Metal, for games that render with NVIDIA's GL driver (Digimon Story Cyber Sleuth: Complete Edition; Balatro, LÖVE on its core-profile paths); their GLSL sources are translated by `tools/gl_shaders.py` (glslang, then SPIRV-Cross) |
 | `metal/` | A standalone minimal Metal offscreen example, not compiled into the host, see [metal/README.md](metal/README.md) |
 | `tools/` | Offline tools, see below |
@@ -111,6 +112,10 @@ The scripts in `tools/`; usage is written in each file's header:
 | `dmsh_xlate/` | The shader translation tool (C#), which references the translation library in `dm/third_party/ryujinx` |
 | `dmsh_build.py` | Drives the whole translation chain to produce the shader libraries; when the environment variable `IOSOUT=directory` is set, it also produces the iOS version |
 | `dmsh_chain.py`, `dmsh_chain.lock` | Translation chain version and tool fingerprints |
+| `dmsh_xlate_vk/` | The shader translation tool for the Vulkan target (C#, the same translation library; the accessor answers for Vulkan: four descriptor sets by resource class and NVN slot, native transform feedback and FP64, depth clip control); built in the chain image, not committed ([docker/README.md](../../docker/README.md#the-shader-chain-for-vulkan)) |
+| `dmsh_build_vk.py` | Drives the Vulkan target of the chain: SPIR-V libraries and reflection in `vk-<V>/`, the integer-input, integer-output and padding decisions taken by `dmsh_build.py`'s own code on an MSL rendering made for analysis, `c1_full_vk.tsv` and `cb_extent_vk.tsv`; `--census` lists integer or stencil reads through float declarations |
+| `dmsh_spv.py` | The SPIR-V passes of the Vulkan target (NaN-exact min / max / clamp, invariant position, output defaults and padding, shadow inputs, the integer-output entry points) and the reads of a module its reflection is made from |
+| `dmsh_chain_vk.py`, `dmsh_chain_vk.lock` | The Vulkan chain's version `DMSH_CHAIN_VK` (`nvn/dmsh_chain_vk.h`) and tool fingerprints, apart from the Metal ones |
 | `dmsh_facts.py` | Reads the answer table `shader_facts.tsv` (which `shader_split.py` writes) |
 | `dmsh_fetch.py` | Generates the "readable tile" versions of fragment shaders |
 | `c1_guard.py` | Generates `c1_full.tsv` |

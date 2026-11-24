@@ -7,9 +7,11 @@
 // The operation mode is runtime state (the front end can change it: iOS overheat downgrade switches to handheld): the single source is here, taken once from DM_OPMODE at startup, the environment variable is not read again afterwards
 #include <stdatomic.h>
 #include <errno.h>
+#if defined(__APPLE__)
 #include <TargetConditionals.h>
+#endif
 #include <unistd.h>
-#if !TARGET_OS_IPHONE
+#if defined(__APPLE__) && !TARGET_OS_IPHONE   // the Mac's execve of its own host (_NSGetExecutablePath, _NSGetArgv); elsewhere the path the iPhone takes
 #include <crt_externs.h>
 #include <mach-o/dyld.h>
 #endif
@@ -32,7 +34,13 @@ static _Atomic int g_ntf_opmode, g_ntf_perfmode;          // only pushed after t
 // which does not clear it, then pops until the queue is empty; when the event was only ever signalled, the first focus change on iOS left it set and the thread spun on a core
 // (995 ms/s, 5-6 W on an iPhone). The count is read and the event set or cleared under g_mq_lock, so a push racing a pop cannot leave it cleared over a queued notification
 // (lock order g_mq_lock → G → g_se_lock; nothing takes g_mq_lock while holding G)
+#if DM_NATIVE_EXEC || defined(DM_TEST_GUEST_C)
 static uint8_t g_mq_ev[0x80] __attribute__((aligned(16)));
+#else   // the x86-64 engine: guest memory, made once in the arena (the SDK's event code works on it and the game keeps its address: aot.h, "Host memory the guest sees")
+#include "aot.h"
+static void *_Atomic g_mq_ev_guest;
+#define g_mq_ev ((uint8_t *)dm_garena_static(&g_mq_ev_guest, NULL, 0x80))
+#endif
 static _Atomic int g_mq_ev_on;
 static void mq_ev_sync(void) {
     if (!atomic_load(&g_mq_ev_on)) return;
@@ -137,7 +145,7 @@ HLE_FORCE("_ZN2nn6applet23GetAppletResourceUserIdEv", "applet resource user ID; 
 // Launch parameter (present only when another program launched this one with one; returns bool): DM_LAUNCH_PARAM=<file>, written by oe::ExecuteProgram on the way here (below), else what
 // the profile's launch_param describes, for a program of a multi-program application run by itself: Super Mario 3D All-Stars' games quit without the launcher's language and two volumes
 // (fields: lang8, the language code GetDesiredLanguage gives; f32:<value>; u32:<value>; hex:<bytes>). Handed over once, as a popped parameter
-static uint64_t h_oe_GetLang(void);
+HLE_LINKAGE uint64_t h_oe_GetLang(void);   // HLE_LINKAGE as its entry (hle.h: static on Apple, external for the x86-64 engine's thunk)
 HLE_FORCE("_ZN2nn2oe21TryPopLaunchParameterEPmPvm", "launch parameter: what the program that started this one handed over, else the profile's launch_param; once", unsigned, h_oe_PopLaunchParam, size_t *out, uint8_t *buf, size_t n) {
     static _Atomic int popped; if (out) *out = 0;
     const char *f = getenv("DM_LAUNCH_PARAM");
@@ -181,7 +189,7 @@ HLE_FORCE("_ZN2nn2oe23GetPreviousProgramIndexEv", "previous program index: the p
 // The iPhone cannot start a process: with DM_EXEC_OUT=<file> (main.m, an app holding several programs) the program index (4 bytes) and the parameters go to that file, the front end names the next
 // program and schedules a notification that opens the app (front_program_handoff), the app ends, and its next start reads the file and runs that program. A program the app lacks: its first
 // program, with no parameters. An app of one program cannot start itself again: the front end asks the player to open the app again (front_program_handoff with no DM_EXEC_OUT), and the app ends.
-#if !TARGET_OS_IPHONE
+#if defined(__APPLE__) && !TARGET_OS_IPHONE   // the Mac's execve of its own host (_NSGetExecutablePath, _NSGetArgv); elsewhere the path the iPhone takes
 // cwd NULL: stay in this folder. The plan owns what it allocates (prog_plan_free): env (its entries point into environ, tsv or own), the table tsv that exe, cwd and arg point into,
 // and own, the two start keys. The host makes one plan and replaces itself with it (execve); a caller that makes another frees the first
 typedef struct { const char *exe, *cwd; char **argv, **env; char *argv2[3]; char self[4096]; char *tsv, *own[2]; } prog_plan;
@@ -289,7 +297,7 @@ static void oe_start(int index, const void *param, size_t n, int relaunch) {
     if (relaunch) snprintf(call, sizeof call, "%s", what); else snprintf(call, sizeof call, "%s(%d, %zu bytes of parameters:%s)", what, index, n, hex);
     int cur = (int)(DM_GAME_PROGRAM_ID & 0xf);
     dm_gfx_quit_begin();   // this program ends: the pipeline archive starts writing now, beside the iPhone's notice (front_program_handoff, 1.5-3 s), and the exit waits for the rest
-#if !TARGET_OS_IPHONE
+#if defined(__APPLE__) && !TARGET_OS_IPHONE   // the Mac's execve of its own host (_NSGetExecutablePath, _NSGetArgv); elsewhere the path the iPhone takes
     static prog_plan P;
     if (oe_plan(index, param, n, relaunch, &P, call)) { dm_host_shutdown_then(what, prog_exec, &P); for (;;) pause(); }
 #endif

@@ -79,9 +79,13 @@ void dm_input_peek(uint64_t *buttons, int32_t axes[4]) {
     *buttons = b & 0xffffull;
 }
 void dm_pad_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry) { dm_pad_set_player(0, buttons, lx, ly, rx, ry); }
+// DM_DETCLOCK_TRACE (hle_thread.c): a scripted input change, and the game's first reading of it (fill); the host's trace stands in where a unit test includes this file alone
+__attribute__((weak)) void dm_detclock_trace_input(char kind, uint64_t buttons, uint64_t axes) { (void)kind; (void)buttons; (void)axes; }
+static _Atomic uint64_t g_sc_seq, g_sc_seen;   // scripted changes so far, and the count the game's last reading saw
 static void script_set(uint64_t buttons, int32_t lx, int32_t ly, int32_t rx, int32_t ry) {
     uint64_t old = atomic_exchange(&g_sc_btn, buttons); atomic_fetch_or(&g_sc_latch, buttons & ~old); atomic_fetch_or(&g_peek_latch, buttons & ~old); atomic_store(&g_sc_axes, pack(lx, ly, rx, ry));
     shake_note();
+    atomic_fetch_add(&g_sc_seq, 1); dm_detclock_trace_input('I', buttons, pack(lx, ly, rx, ry));
 }
 uint64_t dm_input_samples(void) { return (uint64_t)atomic_load(&g_sampling); }
 // DM_KEYS scripted input (for tests): "seconds:key[+key][~hold seconds][*count/interval seconds],...", e.g. "8:A,12:A,15:Down~0.5,16:A+B,40:A*80/2" (A every 2 s from 40 s on, 80 times). Key names A B X Y LS RS L R ZL ZR (plus the sticks LLeft LUp LRight LDown and RLeft RUp RRight RDown) Plus Minus Left Up Right Down, left stick LLeft LUp LRight LDown,
@@ -99,25 +103,41 @@ static int step_add(const key_step *st) {
     if (g_nsteps == g_cap_steps) { int cap = g_cap_steps ? g_cap_steps * 2 : 64; key_step *n = realloc(g_steps, (size_t)cap * sizeof *n); if (!n) return 0; g_steps = n; g_cap_steps = cap; }
     g_steps[g_nsteps++] = *st; return 1;
 }
+// Under DM_DETCLOCK a frame's changes are made where the guest is quiescent after that frame's present, held there until the next frame to wait for is set (hle_thread.c
+// dm_detclock_frame_wait; docs/reference/threads.md, "Two runs under DM_DETCLOCK part from the boot"): the game reads each change at the same guest time in every run. The host's
+// hle_thread.c gives both; these stand in where a unit test includes this file alone (the waits below poll then, as without the switch)
+__attribute__((weak)) int dm_detclock_frame_wait(uint64_t frame) { (void)frame; return 0; }
+__attribute__((weak)) void dm_detclock_frame_release(void) {}
+// A DM_CTL line's hold: its seconds, or until that many more frames have been presented (~f<frames>: where the frame time moves by a factor between runs or scenes, a
+// software rasteriser's level frame from 85 ms to 2 s, a hold in seconds covers a different number of the game's steps each time, and a walk ends somewhere else)
+static void ctl_hold(const key_step *st) {
+    if (!st->fhold) { dm_detclock_frame_release(); usleep((useconds_t)(st->hold * 1e6)); return; }
+    uint64_t until = dm_guest_frame() + (uint64_t)st->hold;
+    if (dm_detclock_frame_wait(until)) return;
+    while (dm_guest_frame() < until) usleep(1000);
+}
 static void *keys_main(void *arg) {
     // touching: the previous step handed its finger over to this one; released: the frame the previous step released in (a frame step presses in a later frame, so the game reads the
     // release between two presses even when the replay runs late and the next step is already due: two taps of A stay two presses, not one long one)
     (void)arg; struct timespec t0; clock_gettime(CLOCK_MONOTONIC, &t0); int touching = 0; int64_t released = -1;
     for (int i = 0; i < g_nsteps; i++) {
         const key_step *s = &g_steps[i];
+        if (s->frame && (double)dm_guest_frame() < s->at) dm_detclock_frame_wait((uint64_t)s->at);   // DM_DETCLOCK: at that frame's quiescent point
+        else if (!s->frame) dm_detclock_frame_release();
         for (;;) { struct timespec t; clock_gettime(CLOCK_MONOTONIC, &t); double el = (t.tv_sec - t0.tv_sec) + (t.tv_nsec - t0.tv_nsec) / 1e9;
                    if (s->frame ? (double)dm_guest_frame() >= s->at && (int64_t)dm_guest_frame() > released : el >= s->at) break; usleep(5000); }
         LOG("DM_KEYS: %s%.2f press %#llx (hold %.2f %s)", s->frame ? "frame " : "", s->at, (unsigned long long)s->btn, s->hold, s->fhold ? "frames" : "s");
         if (s->tap) { dm_touch t = {0, s->tx, s->ty}; dm_touch_script(&t, 1); } else if (touching) dm_touch_script(NULL, 0);
         script_set(s->btn, s->lx, s->ly, s->rx, s->ry);
         uint64_t end = 0;
-        if (s->fhold) { end = (s->frame ? (uint64_t)s->at : dm_guest_frame()) + (uint64_t)s->hold; while (dm_guest_frame() < end) usleep(5000); }
-        else usleep((useconds_t)(s->hold * 1e6));
+        if (s->fhold) { end = (s->frame ? (uint64_t)s->at : dm_guest_frame()) + (uint64_t)s->hold; if (!dm_detclock_frame_wait(end)) while (dm_guest_frame() < end) usleep(5000); }   // DM_DETCLOCK: held at that frame's quiescent point
+        else { dm_detclock_frame_release(); usleep((useconds_t)(s->hold * 1e6)); }
         // Hand over without a release only to a step that begins where this hold ends (DM_REC's consecutive states), not to one that is merely due by now: a gap in the list is a release
         int next = s->fhold && i + 1 < g_nsteps && g_steps[i + 1].frame && g_steps[i + 1].at <= (double)end;
         touching = next && s->tap;
         if (!next) { script_set(0, 0, 0, 0, 0); if (s->tap) dm_touch_script(NULL, 0); released = (int64_t)dm_guest_frame(); }
     }
+    dm_detclock_frame_release();
     return NULL;
 }
 // A list of frame steps that are all held in frames (what DM_REC writes) is not played by keys_main, whose thread presses within 5 ms after a present, before or after the game's read
@@ -193,7 +213,25 @@ static void keys_parse(const char *spec) {
     // other, and a group listed after a long repeat waited for all of it. A stable sort keeps the listed order of steps at the same time; times and frame numbers are not comparable, so a list
     // that mixes them keeps its listed order
     int mixed = 0; for (int i = 1; i < g_nsteps; i++) mixed |= g_steps[i].frame != g_steps[0].frame;
+#if defined(__APPLE__)
     if (!mixed && g_nsteps > 1) mergesort(g_steps, (size_t)g_nsteps, sizeof *g_steps, step_cmp);   // stable (BSD libc), and not quadratic for long interleaved repeats
+#else   // no mergesort outside BSD's C library: the same stable merge sort, bottom up
+    if (!mixed && g_nsteps > 1) {
+        key_step *tmp = malloc((size_t)g_nsteps * sizeof *tmp), *a = g_steps, *b = tmp;
+        if (!tmp) die("DM_KEYS: no memory to sort %d steps", g_nsteps);
+        for (int w = 1; w < g_nsteps; w *= 2) {
+            for (int lo = 0; lo < g_nsteps; lo += 2 * w) {
+                int mid = lo + w < g_nsteps ? lo + w : g_nsteps, hi = lo + 2 * w < g_nsteps ? lo + 2 * w : g_nsteps, i = lo, j = mid, k = lo;
+                while (i < mid && j < hi) b[k++] = step_cmp(&a[j], &a[i]) < 0 ? a[j++] : a[i++];   // the left run first on a tie: stable
+                while (i < mid) b[k++] = a[i++];
+                while (j < hi) b[k++] = a[j++];
+            }
+            key_step *t = a; a = b; b = t;
+        }
+        if (a != g_steps) memcpy(g_steps, a, (size_t)g_nsteps * sizeof *g_steps);
+        free(tmp);
+    }
+#endif
 }
 // DM_KEYS=@<file>: the steps are read from the file (a DM_REC recording as it is). An environment value is capped by ARG_MAX (1 MiB for arguments and environment together on macOS,
 // about 40,000 recorded steps), and iOS's env.txt takes one line per switch; a relative path is from the working directory (Documents on iOS)
@@ -228,7 +266,8 @@ void hid_keys_init(void) {
 //   saves a host texture's level 0 raw, every slice (a cube's six faces, a 3D texture's depth slices) (nvn_mtl.m dm_gfx_texraw), "addr <hex address>" logs what the host knows of a guest
 //   address (nvn_mtl.m dm_gfx_addr_note: its memory pool, a texture's storage, a recorded GPU write, the raw memory table, a sparse pool's page), "drag <x0> <y0> <x1> <y1> [seconds=0.3]" moves one finger in a straight line between the two normalized picture
 //   points over that time and lifts it (the touch screen's pans and swipes, hle_touch.c gesture_sample), "dump" logs what each guest thread waits on and the graphics wait points
-//   (crash_dump_now, as the iOS app's DM_LOG_PORT dump; scripts/regress.py asks for it before stopping a hung game), "program <n>" makes oe::ExecuteProgram(n) with no parameters (a multi-program application's way between its programs, headless), "webshot <path>" saves the offline page shown as a PNG, "#…" is ignored.
+//   (crash_dump_now, as the iOS app's DM_LOG_PORT dump; scripts/regress.py asks for it before stopping a hung game), "program <n>" makes oe::ExecuteProgram(n) with no parameters (a multi-program application's way between its programs, headless), "webshot <path>" saves the offline page shown as a PNG, "profmark <path>" writes the x86-64 engine's sampled threads' totals so far and the host's samples by pc to path
+//   (aot_profile.c dm_aot_profile_mark: DM_AOT_PROFILE, DM_AOT_PROFILE_HOST), "#…" is ignored.
 //   Look at a screen, decide, press, look again: menus whose timing moves from run to run (loading) need no blind timed script
 static void *ctl_main(void *arg) {
     const char *path = arg; long off = 0; char line[1100];
@@ -247,6 +286,7 @@ static void *ctl_main(void *arg) {
                 if (!strncmp(line, "program ", 8)) { void dm_oe_execute(int index, const void *param, size_t n); LOG("DM_CTL: oe::ExecuteProgram(%d)", atoi(line + 8)); dm_oe_execute(atoi(line + 8), NULL, 0); continue; }
                 if (!strncmp(line, "webshot ", 8)) { void front_web_shot(const char *path); front_web_shot(line + 8); continue; }
                 if (!strncmp(line, "shot ", 5)) { dm_gfx_shot_at(1, line + 5); LOG("DM_CTL: screenshot of the next frame → %s", line + 5); continue; }
+                if (!strcmp(line, "threads")) { crash_dump_now("DM_CTL threads"); continue; }   // every guest thread's wait, pc and frames, and the graphics wait points: where a game that still draws is stuck
                 if (!strncmp(line, "texlist ", 8)) { void dm_gfx_texlist(int target); dm_gfx_texlist(atoi(line + 8)); continue; }
                 if (!strcmp(line, "restop")) { void dm_gfx_restop(void); dm_gfx_restop(); continue; }   // what the residency set holds (nvn_mtl.m res_top)
                 if (!strcmp(line, "memtrim")) { void dm_gfx_memtrim(void); dm_gfx_memtrim(); continue; }   // a memory pressure trim at the next submission, as a warn asks on iOS (nvn_mtl.m mem_trim)
@@ -261,18 +301,31 @@ static void *ctl_main(void *arg) {
                                                      while (*e3 == ' ') e3++; dm_ctl_memdump(a, n, e3); continue; }
                 if (!strncmp(line, "cvari ", 6)) { void dm_ctl_cvar_i32(uint64_t off, int32_t v); char *e2; uint64_t off = strtoull(line + 6, &e2, 16); dm_ctl_cvar_i32(off, (int32_t)strtol(e2, NULL, 0)); continue; }
                 if (!strncmp(line, "cvarf ", 6)) { void dm_ctl_cvar_f32(uint64_t off, float v); char *e2; uint64_t off = strtoull(line + 6, &e2, 16); dm_ctl_cvar_f32(off, strtof(e2, NULL)); continue; }
-                if (!strncmp(line, "env ", 4)) { char *eq = strchr(line + 4, '='); if (eq) { *eq = 0; setenv(line + 4, eq + 1, 1); LOG("DM_CTL: env %s=%s", line + 4, eq + 1);
-                                                     if (!strncmp(line + 4, "DM_IMU_", 7) || !strcmp(line + 4, "DM_SIX_DELAY")) { void imu_env_reread(void); imu_env_reread(); } } continue; }   // the IMU's switches are read again
+                if (!strncmp(line, "env ", 4)) {   // env NAME=VALUE; an empty value unsets it (plat.h: an empty value is unset on every platform)
+                    char *eq = strchr(line + 4, '=');
+                    if (eq) { *eq = 0; if (eq[1]) setenv(line + 4, eq + 1, 1); else unsetenv(line + 4); LOG("DM_CTL: env %s=%s", line + 4, eq + 1);
+                              if (!strncmp(line + 4, "DM_IMU_", 7) || !strcmp(line + 4, "DM_SIX_DELAY")) { void imu_env_reread(void); imu_env_reread(); } }
+                    continue;
+                }
                 if (!strncmp(line, "texdump ", 8)) { void dm_gfx_texdump_next(const char *path); dm_gfx_texdump_next(line + 8); LOG("DM_CTL: colour targets of the next frame → %s (as DM_NVN_TEXDUMP)", line + 8); continue; }
+                if (!strncmp(line, "profmark ", 9)) {   // the x86-64 engine's sampler (aot_profile.c dm_aot_profile_mark; DM_AOT_PROFILE, DM_AOT_PROFILE_HOST)
+#if !DM_NATIVE_EXEC
+                    int dm_aot_profile_mark(const char *path); dm_aot_profile_mark(line + 9);
+#else
+                    LOG("[RED] DM_CTL profmark: the x86-64 engine's sampler only (DM_AOT_PROFILE)");
+#endif
+                    continue;
+                }
                 if (!strncmp(line, "passdump ", 9)) { void dm_gfx_passdump_next(long n); dm_gfx_passdump_next(atol(line + 9)); LOG("DM_CTL: passes of the next %ld frames (as DM_NVN_PASSDUMP)", atol(line + 9)); continue; }
                 if (!strncmp(line, "drag ", 5)) {   // one finger, a step every 8 ms
                     float x0, y0, x1, y1, s = 0.3f; if (sscanf(line + 5, "%f %f %f %f %f", &x0, &y0, &x1, &y1, &s) < 4) { LOG("[RED] DM_CTL drag wants x0 y0 x1 y1 [seconds]"); continue; }
                     int n = (int)(s / 0.008f); if (n < 2) n = 2;
+                    dm_detclock_frame_release();   // a drag runs in seconds of wall time
                     LOG("DM_CTL: drag (%.3f,%.3f) → (%.3f,%.3f) over %.2f s", x0, y0, x1, y1, s);
                     for (int i = 0; i <= n; i++) { dm_touch t = {0, x0 + (x1 - x0) * (float)i / (float)n, y0 + (y1 - y0) * (float)i / (float)n}; dm_touch_script(&t, 1); usleep((useconds_t)(s * 1e6f / (float)n)); }
                     dm_touch_script(NULL, 0); continue;
                 }
-                key_step st = {0, 0.15, 0}; char *h = strchr(line, '~'); if (h) { *h = 0; st.hold = atof(h + 1); }
+                key_step st = {0, 0.15, 0}; char *h = strchr(line, '~'); if (h) { *h = 0; st.fhold = h[1] == 'f' || h[1] == 'F'; st.hold = atof(h + 1 + st.fhold); }
                 if (line[0] == 'P' && line[1] >= '2' && line[1] <= '0' + DM_PLAYERS && line[2] == ' ') {   // P<n> <keys>: player n's controller, for games that need a second player (Orbitals)
                     void dm_pad_script_player(int p); int p = line[1] - '1'; dm_pad_script_player(p);
                     parse_keys(line + 3, &st);
@@ -280,14 +333,15 @@ static void *ctl_main(void *arg) {
                     dm_pad_set_player(p, st.btn, st.lx, st.ly, st.rx, st.ry); usleep((useconds_t)(st.hold * 1e6)); dm_pad_set_player(p, 0, 0, 0, 0, 0);
                     continue;
                 }
-                parse_keys(line, &st);
-                LOG("DM_CTL: press %#llx (hold %.2f s)", (unsigned long long)st.btn, st.hold);
+                parse_keys(line, &st);   // no key ("~f2") is a wait of that hold: lines run one after another, so it spaces the lines around it by frames
+                LOG("DM_CTL: press %#llx (hold %.2f %s)", (unsigned long long)st.btn, st.hold, st.fhold ? "frames" : "s");
                 if (st.tap) { dm_touch t = {0, st.tx, st.ty}; dm_touch_script(&t, 1); }
-                script_set(st.btn, st.lx, st.ly, st.rx, st.ry); usleep((useconds_t)(st.hold * 1e6)); script_set(0, 0, 0, 0, 0);
+                script_set(st.btn, st.lx, st.ly, st.rx, st.ry); ctl_hold(&st); script_set(0, 0, 0, 0, 0);
                 if (st.tap) dm_touch_script(NULL, 0);
             }
         }
         if (f) fclose(f);
+        dm_detclock_frame_release();   // DM_DETCLOCK: no line left, the guest goes on (ctl_hold held it at the last frame)
         usleep(100000);
     }
     return NULL;
@@ -322,9 +376,42 @@ static uint32_t pad_sources(int p) {
     if (p == 0) return 1u | merged_players();
     return (unsigned)p < DM_PLAYERS ? 1u << p : 0;
 }
-static int player_of(uint32_t id) {   // the reported player on npad id; -1 when none
+static int seated(uint32_t id) {   // the player whose controller sits on npad id; -1 when none
     if (id == connected_id()) return 0;
     return id > 0 && id < DM_PLAYERS && reported((int)id) ? (int)id : -1;
+}
+// nn::hid::DisconnectNpad: on Horizon the controller on that npad is disconnected, and the npad has none (style set 0, no state) until a controller connects again: the
+// player presses a button on it (a disconnected controller wakes and connects, which takes on the order of a second) or connects it in the controller applet
+// (ShowControllerSupport). The host's controllers stay with their players, so the disconnect is kept per npad (g_gone, bit n = No n+1; Handheld is the console's own
+// controls and cannot be disconnected): the npad reports no controller until its player presses a button that was not down at the disconnect, no sooner than
+// RECONNECT_NS after it, or until the controller applet runs. Games disconnect a controller to make the player register it again: Mario vs. Donkey Kong's
+// "Change controllers?" disconnects all eight npads and then waits for its controller check to find player 1's gone before it opens the applet (main+0x31296c,
+// main+0xe304bc, main+0xe2eb34 of its 1.0.0); with the disconnect ignored the check passed every frame and the menu took no input again.
+enum { RECONNECT_NS = 500000000 };
+static _Atomic uint32_t g_gone;
+static _Atomic uint64_t g_gone_held[DM_PLAYERS], g_gone_at[DM_PLAYERS];
+static void styles_sync(void);   // the style of each npad again, and the events of those that changed (below)
+static uint64_t buttons_down(int pl) {   // what the player holds now, latches left for the state read
+    uint32_t src = pl ? 1u << pl : 1u | merged_players();
+    uint64_t b = pl ? 0 : atomic_load(&g_btn) | atomic_load(&g_latch) | atomic_load(&g_sc_btn) | atomic_load(&g_sc_latch);
+    for (int p = 0; p < DM_PLAYERS; p++) if (src >> p & 1) b |= atomic_load(&g_pad_btn[p]) | atomic_load(&g_pad_latch[p]);
+    return b & 0xffffull;
+}
+static void npad_back(uint32_t id, const char *how) {
+    if (!(atomic_fetch_and(&g_gone, ~(1u << id)) >> id & 1)) return;
+    LOG("hid: npad %u has its controller again (%s)", id, how);
+    styles_sync();
+}
+static int npad_gone(uint32_t id, int pl) {
+    if (id >= DM_PLAYERS || !(atomic_load(&g_gone) >> id & 1)) return 0;
+    uint64_t now = buttons_down(pl), held = atomic_fetch_and(&g_gone_held[id], now) & now;
+    if (!(now & ~held) || now_ns() - atomic_load(&g_gone_at[id]) < RECONNECT_NS) return 1;
+    npad_back(id, "a button pressed on it");
+    return 0;
+}
+static int player_of(uint32_t id) {   // the reported player on npad id; -1 when none, or when the game disconnected the npad
+    int pl = seated(id);
+    return pl >= 0 && npad_gone(id, pl) ? -1 : pl;
 }
 // Joy-Cons as devices (dm_joy_attach, dm_joy_set): a pad that holds Joy-Cons is shown to the game in the way the game asked for. Docked (console mode): both Joy-Cons of a pad make one dual npad
 // (JoyDual: both buttons and both sticks, two six-axis sensors) unless the game asked for single assignment on that npad (SetNpadJoyAssignmentModeSingle), when the left Joy-Con stays there
@@ -656,8 +743,10 @@ static void fill(NpadState *s, uint32_t id, uint32_t style) {
     }
     if (!pl) {   // the physical sources so far (DM_REC records them, DM_BTN_SHAKE only from player 1's own controller and the keyboard, as shake_note), then the scripted path
         if (atomic_load_explicit(&g_rec_on, memory_order_relaxed)) rec_read((b & 0xffffull) | ((atomic_load(&g_btn) | atomic_load(&g_pad_btn[0])) & DM_BTN_SHAKE), a);
+        uint64_t sq = atomic_load(&g_sc_seq);
         b |= atomic_load(&g_sc_btn) | atomic_exchange(&g_sc_latch, 0);
         uint64_t c = atomic_load(&g_sc_axes); for (int i = 0; i < 4; i++) a[i] = pick(a[i], ax(c, i));
+        if (sq != atomic_load(&g_sc_seen) && atomic_exchange(&g_sc_seen, sq) != sq) dm_detclock_trace_input('K', b, c);   // DM_DETCLOCK_TRACE: the first reading of a scripted change
     }
     if (atomic_load(&g_hold)) { b = 0; memset(a, 0, sizeof a); }   // an applet is in front: the game reads nothing (the latches were taken all the same)
     b &= 0xffffull;
@@ -731,7 +820,20 @@ HLE_FORCE("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadHandheldStateEiRKj", "handheld c
 HLE_FORCE("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyDualStateEiRKj", "dual Joy-Con states (not connected on the host)", int, h_hid_StatesJoyDual, NpadState *s, int n, const uint32_t *id) { return states(s, n, *id, STYLE_JOYDUAL); }
 HLE_FORCE("_ZN2nn3hid13GetNpadStatesEPNS0_16NpadJoyLeftStateEiRKj", "left Joy-Con states (not connected on the host)", int, h_hid_StatesJoyLeft, NpadState *s, int n, const uint32_t *id) { return states(s, n, *id, STYLE_JOYLEFT); }
 HLE_FORCE("_ZN2nn3hid13GetNpadStatesEPNS0_17NpadJoyRightStateEiRKj", "right Joy-Con states (not connected on the host)", int, h_hid_StatesJoyRight, NpadState *s, int n, const uint32_t *id) { return states(s, n, *id, STYLE_JOYRIGHT); }
-HLE_FORCE("_ZN2nn3hid14DisconnectNpadERKj", "disconnect a controller; ignored by the host", void, h_hid_Disconnect, const uint32_t *id) { (void)id; }
+// Apple's hosts still ignore the call, as before: the disconnect was found and run on the Linux port only, and no Mac run has checked the games there
+// (docs/reference/services.md, "DisconnectNpad leaves the npad without a controller": Open). Taking this guard out is the whole change for them
+HLE_FORCE("_ZN2nn3hid14DisconnectNpadERKj", "disconnect a controller: the npad has none until a button is pressed on it or the controller applet connects it; ignored on Apple", void, h_hid_Disconnect, const uint32_t *id) {
+#if defined(__APPLE__)
+    (void)id;
+#else
+    uint32_t i = id ? *id : NPAD_HANDHELD; int pl = i < DM_PLAYERS ? seated(i) : -1;
+    if (pl < 0 || atomic_load(&g_gone) >> i & 1) return;   // Handheld, an npad without a controller, or one already disconnected (games disconnect unused npads every frame)
+    atomic_store(&g_gone_held[i], buttons_down(pl)); atomic_store(&g_gone_at[i], now_ns());
+    atomic_fetch_or(&g_gone, 1u << i);
+    LOG("hid: the game disconnected npad %u (DisconnectNpad): no controller there until a button is pressed on it or the controller applet connects it", i);
+    styles_sync();
+#endif
+}
 static uint32_t g_hold_type;
 HLE_FORCE("_ZN2nn3hid18SetNpadJoyHoldTypeENS0_15NpadJoyHoldTypeE", "Joy-Con hold orientation; the host only records it", void, h_hid_HoldType, int t) { g_hold_type = (uint32_t)t; }
 // The game's choice of how the Joy-Cons of a pad are used (npad_resolve): single, left or right staying on the npad, or dual. NpadJoyDeviceType: Left 0, Right 1; NpadJoyAssignmentMode: Dual 0, Single 1
@@ -785,7 +887,9 @@ int dm_players_reported(void) {   // a pair of Joy-Cons split into two npads is 
     int n = 0; for (int p = 0; p < DM_PLAYERS; p++) n += reported(p) + (reported(p) && joy_active(p) && joy_split(p) && split_target(p) >= 0);
     return n;
 }
+// The applet is where the player connects controllers, so the npads the game disconnected (DisconnectNpad, g_gone above) have theirs again when it runs
 static Result ctrl_support(int32_t *info, const int8_t *arg) {
+    for (uint32_t id = 0; id < DM_PLAYERS; id++) npad_back(id, "the controller applet");
     int count = dm_players_reported(), canceled = 0;
     uint32_t bench_was = atomic_load(&g_benched);
     // The game takes more players than it sees: those left out before count again, the lowest first
